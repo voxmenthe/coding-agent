@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 import json
 from creds import all_creds
-
+import subprocess
 
 # Choose your Gemini model
 MODEL_NAME = "gemini-2.0-flash"  # Or "gemini-2.5-pro-preview-03-25"
@@ -59,6 +59,58 @@ def edit_file(path: str, content: str) -> str:
     except Exception as e:
         return f"Error writing file: {e}"
 
+def execute_bash_command(command: str) -> str:
+    """Executes a whitelisted bash command in the project's root directory.
+
+    Allowed commands (including arguments):
+    - ls ...
+    - cat ...
+    - git add ...
+    - git status ...
+    - git commit ...
+    - git push ...
+
+    Args:
+        command: The full bash command string to execute.
+
+    Returns:
+        The standard output and standard error of the command, or an error message.
+    """
+    print(f"\n\u2692\ufe0f Tool: Executing bash command: {command}")
+
+    whitelist = ["ls", "cat", "git add", "git status", "git commit", "git push"]
+
+    # Check if the command starts with any whitelisted prefix
+    is_whitelisted = False
+    for prefix in whitelist:
+        if command.strip().startswith(prefix):
+            is_whitelisted = True
+            break
+
+    if not is_whitelisted:
+        return f"Error: Command '{command}' is not allowed. Only specific commands (ls, cat, git add/status/commit/push) are permitted."
+
+    try:
+        # Execute the command in the project root directory
+        # Use shell=True cautiously, but it's simpler for handling complex commands/args here.
+        # The whitelist check provides the primary security boundary.
+        result = subprocess.run(
+            command, 
+            shell=True, 
+            capture_output=True, 
+            text=True, 
+            cwd=project_root, # Ensure command runs in project root
+            check=False # Don't raise exception on non-zero exit code, handle manually
+        )
+        output = f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        if result.returncode != 0:
+            output += f"\n--- Command exited with code: {result.returncode} ---"
+        return output.strip()
+
+    except Exception as e:
+        return f"Error executing command '{command}': {e}"
+
+
 # --- Code Agent Class ---
 class CodeAgent:
     """A simple coding agent using Google Gemini (google-genai SDK)."""
@@ -67,7 +119,7 @@ class CodeAgent:
         """Initializes the agent with API key and model name."""
         self.api_key = api_key
         self.model_name = f'models/{model_name}' # Add 'models/' prefix
-        self.tool_functions = [read_file, list_files, edit_file]
+        self.tool_functions = [read_file, list_files, edit_file, execute_bash_command]
         self.client = None
         # self.chat = None # No longer maintaining a persistent chat object
         self._configure_client()
@@ -89,7 +141,7 @@ class CodeAgent:
             print("\n\u274c Client not configured. Exiting.")
             return
 
-        print("\n\u2692\ufe0f Agent ready. Ask me anything involving file operations (read, list, edit). Type 'exit' to quit.")
+        print("\n\u2692\ufe0f Agent ready. Ask me anything involving file operations (read, list, edit) or allowed bash commands (ls, cat, git...). Type 'exit' to quit.")
 
         # Define the tool configuration once
         tool_config = types.GenerateContentConfig(
