@@ -32,7 +32,8 @@ class CodeAgent:
         ]
         self.client = None
         self.chat = None
-        self.conversation_history = [] # Add manual history tracking
+        self.conversation_history = [] # Manual history for token counting ONLY
+        self.current_token_count = 0 # Store token count for the next prompt
         self._configure_client()
 
     def _configure_client(self):
@@ -70,48 +71,53 @@ class CodeAgent:
 
         while True:
             try:
-                user_input = input("\n🔵 \x1b[94mYou:\x1b[0m ").strip()
+                # Display token count from *previous* turn in the prompt
+                prompt_text = f"\n🔵 You ({self.current_token_count}): "
+                user_input = input(prompt_text).strip()
+
                 if user_input.lower() in ["exit", "quit"]:
                     print("\n👋 Goodbye!")
                     break
-
                 if not user_input:
                     continue
 
+                # --- Update manual history (for token counting ONLY) --- 
+                # Add user message BEFORE sending to model
+                new_user_content = types.Content(parts=[types.Part(text=user_input)], role="user")
+                self.conversation_history.append(new_user_content)
 
-                # --- Calculate and print token count ---
-                try:
-                    # Combine history and the new user input for counting
-                    # Note: Ensure 'types' is imported: from google.genai import types
-                    new_user_content = types.Content(parts=[types.Part(text=user_input)], role="user")
-                    # Append user message *before* counting
-                    self.conversation_history.append(new_user_content)
+                # --- Keep existing Tool Config and Send Message call --- 
+                print("\n⏳ Sending message and processing...")
+                # Prepare tool configuration (Assuming this structure is correct based on earlier state/memory)
+                tool_config = types.GenerateContentConfig(tools=self.tool_functions)
 
-                    # Use the manually tracked history for counting
-                    token_count_response = self.client.models.count_tokens(
-                        model=self.model_name,
-                        contents=self.conversation_history # Use the list we manage
-                    )
-                    print(f"\n💡 \x1b[94mContext Tokens (for next call): {token_count_response.total_tokens}\x1b[0m")
-                except Exception as count_error:
-                    # Don't block interaction if counting fails, just report it
-                    print(f"\n⚠️ \x1b[93mCould not count tokens: {count_error}\x1b[0m")
-                # --- End token count ---
-
-                print("\n\u23f3 Sending message and processing...")
-                # Use chat.send_message, passing the tool config
+                # Send message using the chat object's send_message method
                 response = self.chat.send_message(
-                    message=user_input,
-                    config=tool_config # Pass tools here for potential automatic function calling
+                    message=user_input, # Pass only the new user input here
+                    config=tool_config # Use 'config' kwarg with GenerateContentConfig
                 )
 
-                # Append agent's response to history *after* successful call
+                # --- Update manual history and calculate new token count AFTER response --- 
+                agent_response_content = None
                 if response.candidates and response.candidates[0].content:
-                    self.conversation_history.append(response.candidates[0].content)
+                    agent_response_content = response.candidates[0].content
+                    self.conversation_history.append(agent_response_content)
+                else:
+                    print("\n⚠️ Agent response did not contain content for history/counting.")
 
-                # Access the final text response (assuming response structure is similar)
-                # Check the actual response object structure if this causes errors
+                # Print agent's response text to user
                 print(f"\n🟢 \x1b[92mAgent:\x1b[0m {response.text}")
+
+                # Calculate and store token count for the *next* prompt
+                try:
+                    token_count_response = self.client.models.count_tokens(
+                        model=self.model_name,
+                        contents=self.conversation_history # Use the updated manual history
+                    )
+                    self.current_token_count = token_count_response.total_tokens
+                except Exception as count_error:
+                    # Don't block interaction if counting fails, just report it and keep old count
+                    print(f"\n⚠️ \x1b[93mCould not update token count: {count_error}\x1b[0m")
 
             except KeyboardInterrupt:
                 print("\n👋 Goodbye!")
