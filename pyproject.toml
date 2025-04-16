@@ -2,7 +2,7 @@
 name = "coding-agent"
 version = "0.0.1"
 description = "Coding Agent"
-authors = ["Jeff Coggshall <jcoggshall@forhims.com>"]
+authors = ["Jeff Coggshall <alocalminina@gmail.com>"]
 readme = "README.md"
 packages = [
     { include = "src" }
@@ -10,9 +10,6 @@ packages = [
 
 [tool.poetry.dependencies]
 anthropic = {version = "^0.42.0", extras = ["vertex"]}
-amplitude-analytics = "1.1.5"
-amplitude-experiment = "1.8.1"
-datadog-api-client = "^2.20.0"
 db-dtypes = "^1.2.0"
 docker = "^7.1.0"
 fastapi = "^0.111.0"
@@ -20,7 +17,6 @@ gunicorn = "^22.0.0"
 google-cloud-aiplatform = ">=1.71.0,<2.0.0"
 google-genai = "^1.10.0"
 googlemaps = "^4.10.0"
-growthbook = "^1.0.0"
 instructor = ">=1.4.3,<2.0.0"
 ipykernel = ">=6.29,<7.0"
 markdown = "^3.7.0"
