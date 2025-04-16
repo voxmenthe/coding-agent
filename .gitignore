@@ -1,0 +1,7 @@
+.qodo
+.env*
+src/creds.py
+**/creds.py
+creds.py
+**/__pycache__
+__pycache__
