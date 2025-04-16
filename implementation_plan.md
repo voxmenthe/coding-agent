@@ -1,7 +1,3 @@
-Okay, let's rewrite and significantly enhance that blog post, switching from Go/Anthropic to Python/Gemini, adding more detail, and incorporating step-by-step testing.
-
----
-
 ## How to Build a Code-Editing Agent in Python with Gemini
 
 **(or: It's Easier Than You Think!)**
@@ -621,3 +617,98 @@ But the core mechanism? You just built it. It's an LLM, a loop, and tools. The r
 These models are powerful. Go experiment! See how far you can push this simple agent. Ask it to refactor code, add features, write tests. You might be surprised by how capable it already is. The landscape of software development *is* changing, and you now have a foundational understanding of how these agents work under the hood.
 
 Congratulations on building a Python agent!
+
+## Bonus Section: Adding Bash Command Execution
+
+Want to give your agent the ability to run shell commands? You can add another tool, but be **extremely careful** about security. Only allow specific, safe commands.
+
+Here's how we added a tool to execute a restricted set of bash commands:
+
+**1. The Tool Function (`execute_bash_command`)**
+
+We need the `subprocess` module. The function checks a command against a hardcoded whitelist before executing it using `subprocess.run` in the project's root directory.
+
+```python
+# main.py
+import subprocess
+
+def execute_bash_command(command: str) -> str:
+    """Executes a whitelisted bash command in the project's root directory.
+
+    Allowed commands (including arguments):
+    - ls ...
+    - cat ...
+    - git add ...
+    - git status ...
+    - git commit ...
+    - git push ...
+
+    Args:
+        command: The full bash command string to execute.
+
+    Returns:
+        The standard output and standard error of the command, or an error message.
+    """
+    print(f"\n\u2692\ufe0f Tool: Executing bash command: {command}")
+
+    # Define the whitelist of allowed command *prefixes*
+    whitelist = ["ls", "cat", "git add", "git status", "git commit", "git push"]
+
+    is_whitelisted = False
+    for prefix in whitelist:
+        if command.strip().startswith(prefix):
+            is_whitelisted = True
+            break
+
+    if not is_whitelisted:
+        return f"Error: Command '{command}' is not allowed. Only specific commands (ls, cat, git add/status/commit/push) are permitted."
+
+    try:
+        # Execute in project root, capture output, don't check exit code directly
+        result = subprocess.run(
+            command, 
+            shell=True, 
+            capture_output=True, 
+            text=True, 
+            cwd=project_root, # project_root should be defined globally
+            check=False 
+        )
+        output = f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        if result.returncode != 0:
+            output += f"\n--- Command exited with code: {result.returncode} ---"
+        return output.strip()
+
+    except Exception as e:
+        return f"Error executing command '{command}': {e}"
+```
+
+**2. Register the Tool**
+
+Add the new function to the `self.tool_functions` list in `CodeAgent.__init__`:
+
+```python
+# In CodeAgent.__init__
+self.tool_functions = [read_file, list_files, edit_file, execute_bash_command]
+```
+
+**3. Example Interaction**
+
+Now you can ask the agent to run allowed commands:
+
+```text
+🔵 You: show the git status using bash
+
+⏳ Sending message and processing...
+
+⚒️ Tool: Executing bash command: git status
+
+🟢 Agent: --- stdout ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+--- stderr ---
+
+```
+
+This adds significant power, but also risk. Expand the whitelist cautiously!
