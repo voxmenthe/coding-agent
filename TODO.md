@@ -10,3 +10,4 @@
 * Add a "create a task" tool (maybe integration with a task management service like Trello / Monday.com / Asana ??)
 * Add a git worktree and joint memory workflow
 * Add a "debugging" tool
+* Tools to spawn other llm agents to go off and do things
