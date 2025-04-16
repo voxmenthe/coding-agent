@@ -8,8 +8,8 @@ from creds import all_creds
 from src.tools import read_file, list_files, edit_file, execute_bash_command, run_in_sandbox
 import traceback
 
-# Choose your Gemini model
-MODEL_NAME = "gemini-2.0-flash" # Using latest flash model which is currently 2.0 NOT 1.5
+# Choose your Gemini model - flash models are currently 2.0 NOT 1.5 - 1.5 is deprecated!!
+MODEL_NAME = "gemini-2.0-flash" 
 
 # Define project root - needed here for agent initialization
 project_root = Path(__file__).resolve().parents[1]
@@ -28,10 +28,11 @@ class CodeAgent:
             list_files,
             edit_file,
             execute_bash_command,
-            run_in_sandbox # Add the new sandbox tool
+            run_in_sandbox
         ]
         self.client = None
         self.chat = None
+        self.conversation_history = [] # Add manual history tracking
         self._configure_client()
 
     def _configure_client(self):
@@ -77,12 +78,36 @@ class CodeAgent:
                 if not user_input:
                     continue
 
+
+                # --- Calculate and print token count ---
+                try:
+                    # Combine history and the new user input for counting
+                    # Note: Ensure 'types' is imported: from google.genai import types
+                    new_user_content = types.Content(parts=[types.Part(text=user_input)], role="user")
+                    # Append user message *before* counting
+                    self.conversation_history.append(new_user_content)
+
+                    # Use the manually tracked history for counting
+                    token_count_response = self.client.models.count_tokens(
+                        model=self.model_name,
+                        contents=self.conversation_history # Use the list we manage
+                    )
+                    print(f"\n💡 \x1b[94mContext Tokens (for next call): {token_count_response.total_tokens}\x1b[0m")
+                except Exception as count_error:
+                    # Don't block interaction if counting fails, just report it
+                    print(f"\n⚠️ \x1b[93mCould not count tokens: {count_error}\x1b[0m")
+                # --- End token count ---
+
                 print("\n\u23f3 Sending message and processing...")
                 # Use chat.send_message, passing the tool config
                 response = self.chat.send_message(
                     message=user_input,
                     config=tool_config # Pass tools here for potential automatic function calling
                 )
+
+                # Append agent's response to history *after* successful call
+                if response.candidates and response.candidates[0].content:
+                    self.conversation_history.append(response.candidates[0].content)
 
                 # Access the final text response (assuming response structure is similar)
                 # Check the actual response object structure if this causes errors
