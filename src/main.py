@@ -1,6 +1,6 @@
 # main.py
-import google.generativeai as genai
-from google.generativeai.types import FunctionDeclaration, Tool, ToolConfig
+from google import genai
+from google.genai import types
 import os
 import sys
 from pathlib import Path
@@ -8,129 +8,124 @@ import json
 from creds import all_creds
 
 
-# --- Configuration ---
-# Load the API key
-genai.configure(api_key=all_creds['GEMINI_HIMS_API_KEY_mlproj_V1'])
-
 # Choose your Gemini model
 MODEL_NAME = "gemini-2.0-flash"  # Or "gemini-2.5-pro-preview-03-25"
 
 
-# --- Agent Class ---
-class Agent:
-    def __init__(self, model_name: str):
-        print(f"✨ Initializing Agent with model: {model_name}")
-        # We'll initialize the model later, when we know about tools
-        self.model_name = model_name
-        self.model = None # Placeholder
-        self.chat = None # Placeholder for the chat session
-        # Store tool functions and their definitions
-        self.tools = {
-            "read_file": read_file
-            # Add more tools here later
-        }
-        self.tool_definitions = [
-            READ_FILE_TOOL
-            # Add more tool definitions here later
-        ]
+# --- Tool Functions ---
+def read_file(path: str) -> str:
+    """Reads the content of a file at the given path."""
+    print(f"\n\u2692\ufe0f Tool: Reading file: {path}")
+    try:
+        # Security check: Ensure path is within the project directory
+        target_path = (project_root / path).resolve()
+        if not target_path.is_relative_to(project_root):
+            return "Error: Access denied. Path is outside the project directory."
+        if not target_path.is_file():
+            return f"Error: File not found at {path}"
+        return target_path.read_text()
+    except Exception as e:
+        return f"Error reading file: {e}"
 
-    def _initialize_chat(self):
-        """Initializes or re-initializes the model and chat session."""
-        print(f"🔄 Initializing model and chat (Tools: {'Yes' if self.tool_definitions else 'No'})...")
+def list_files(directory: str) -> str:
+    """Lists files in the specified directory relative to the project root."""
+    print(f"\n\u2692\ufe0f Tool: Listing files in directory: {directory}")
+    try:
+        target_dir = (project_root / directory).resolve()
+        # Security check: Ensure path is within the project directory
+        if not target_dir.is_relative_to(project_root):
+            return "Error: Access denied. Path is outside the project directory."
+        if not target_dir.is_dir():
+            return f"Error: Directory not found at {directory}"
 
-        self.model = genai.GenerativeModel(
-            self.model_name,
-            # system_instruction="You are a helpful coding assistant.", # Optional: Add system instructions
-            tools=self.tool_definitions  # Use the agent's tool definitions
+        files = [f.name for f in target_dir.iterdir()]
+        return "\n".join(files) if files else "No files found."
+    except Exception as e:
+        return f"Error listing files: {e}"
+
+def edit_file(path: str, content: str) -> str:
+    """Writes or overwrites content to a file at the given path."""
+    print(f"\n\u2692\ufe0f Tool: Editing file: {path}")
+    try:
+        # Security check: Ensure path is within the project directory
+        target_path = (project_root / path).resolve()
+        if not target_path.is_relative_to(project_root):
+            return "Error: Access denied. Path is outside the project directory."
+
+        # Create parent directories if they don't exist
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(content)
+        return f"File '{path}' saved successfully."
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+# --- Code Agent Class ---
+class CodeAgent:
+    """A simple coding agent using Google Gemini (google-genai SDK)."""
+
+    def __init__(self, api_key: str, model_name: str = "gemini-2.0-flash"):
+        """Initializes the agent with API key and model name."""
+        self.api_key = api_key
+        self.model_name = f'models/{model_name}' # Add 'models/' prefix
+        self.tool_functions = [read_file, list_files, edit_file]
+        self.client = None
+        # self.chat = None # No longer maintaining a persistent chat object
+        self._configure_client()
+
+    def _configure_client(self):
+        """Configures the Google Generative AI client."""
+        print("\n\u2692\ufe0f Configuring genai client...")
+        try:
+            # Client likely picks up GOOGLE_API_KEY from env
+            self.client = genai.Client(api_key=self.api_key)
+            print("\u2705 Client configured successfully.")
+        except Exception as e:
+            print(f"\u274c Error configuring genai client: {e}")
+            sys.exit(1)
+
+    def start_interaction(self):
+        """Starts the main interaction loop using generate_content."""
+        if not self.client:
+            print("\n\u274c Client not configured. Exiting.")
+            return
+
+        print("\n\u2692\ufe0f Agent ready. Ask me anything involving file operations (read, list, edit). Type 'exit' to quit.")
+
+        # Define the tool configuration once
+        tool_config = types.GenerateContentConfig(
+            tools=self.tool_functions
         )
-        self.chat = self.model.start_chat(enable_automatic_function_calling=True)
-        print("✅ Model and chat initialized.")
-
-    def run(self):
-        """Starts the main interaction loop."""
-        self._initialize_chat() # Initialize without tools first
-
-        print("\n💬 Chat with Gemini (type 'quit' or 'exit' to end)")
-        print("-" * 30)
 
         while True:
             try:
-                user_input = input("🔵 \x1b[94mYou:\x1b[0m ") # Blue text for user
-                if user_input.lower() in ["quit", "exit", "q"]:
-                    print("👋 Goodbye!")
+                user_input = input("\n🔵 \x1b[94mYou:\x1b[0m ").strip()
+                if user_input.lower() in ["exit", "quit"]:
+                    print("\n👋 Goodbye!")
                     break
 
-                if not user_input:
-                    continue
+                print("\n\u23f3 Sending message and processing...")
+                # Use generate_content for each message, enabling automatic function calling via config
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=user_input,
+                    config=tool_config,
+                )
 
-                # Send message to Gemini
-                print("🧠 Thinking...")
-                response = self.chat.send_message(user_input)
+                # The SDK should handle the function call automatically and return the final text
+                print(f"\n🟢 \x1b[92mAgent:\x1b[0m {response.text}")
 
-                # Print Gemini's response
-                # Note: Automatic function calling handles tool calls implicitly here!
-                # We'll need to adjust this later when we manually handle tools.
-                text_response = response.text # Simplified for now
-                print(f"🟠 \x1b[93mGemini:\x1b[0m {text_response}") # Orange text for Gemini
-
-            except KeyboardInterrupt:
-                print("\n👋 Interrupted. Goodbye!")
-                break
             except Exception as e:
-                print(f"🛑 An error occurred: {e}")
-                # Consider whether to break or continue on error
+                print(f"\n🔴 \x1b[91mAn error occurred during interaction: {e}\x1b[0m")
+                # Optionally add more specific error handling, e.g., for API errors
                 # break
-
-
-# --- Tool Functions ---
-
-def read_file(path: str) -> str:
-    """
-    Reads the content of a file at the given relative path.
-
-    Args:
-        path: The relative path to the file.
-
-    Returns:
-        The content of the file as a string, or an error message.
-    """
-    print(f"🛠️ Executing read_file tool with path: {path}")
-    try:
-        file_path = Path(path).resolve() # Resolve to absolute path for security/clarity
-        # Basic security check: ensure file is within the project directory
-        if not file_path.is_relative_to(Path.cwd()):
-            raise SecurityError(f"Access denied: Path '{path}' is outside the project directory.")
-
-        if not file_path.is_file():
-            return f"Error: Path '{path}' is not a file or does not exist."
-        content = file_path.read_text(encoding='utf-8')
-        print(f"✅ read_file successful for: {path}")
-        return content
-    except SecurityError as e:
-        print(f"🚨 Security Error in read_file: {e}")
-        return f"Error: {e}"
-
-class SecurityError(Exception):
-    """Custom exception for security violations."""
-    pass
-
-# Tool Definitions (using FunctionDeclaration)
-READ_FILE_TOOL = FunctionDeclaration(
-    name="read_file",
-    description="Read the contents of a specified file path relative to the current working directory. Use this to examine file contents.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "The relative path of the file to read (e.g., 'src/main.py', 'README.md')."
-            }
-        },
-        "required": ["path"]
-    }
-)
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    agent = Agent(MODEL_NAME)
-    agent.run()
+    print("🚀 Starting Code Agent...")
+    api_key = all_creds['GEMINI_HIMS_API_KEY_mlproj_V1']
+
+    project_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(project_root))
+
+    agent = CodeAgent(api_key=api_key, model_name=MODEL_NAME)
+    agent.start_interaction()

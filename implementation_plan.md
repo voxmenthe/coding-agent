@@ -25,7 +25,7 @@ But you don't need all that complexity to build something *genuinely impressive*
 
 **I strongly encourage you to code along.** Reading is one thing, but *feeling* how little code it takes to achieve this is another. Seeing it run in your own terminal, modifying your own files? That's where the "aha!" moment happens.
 
-**Here’s what you'll need:**
+**Here’s what you’ll need:**
 
 1.  **Python 3.7+** installed.
 2.  A **Google AI Studio API Key** for the Gemini API. You can get one for free [here](https://aistudio.google.com/app/apikey).
@@ -86,7 +86,7 @@ import json
 # Load the API key from environment variable
 try:
     GOOGLE_API_KEY = os.environ['GOOGLE_API_KEY']
-    client = genai.Client()  # Uses GOOGLE_API_KEY from environment, or pass api_key="..."
+    client = genai.Client(api_key=GOOGLE_API_KEY)  # Uses GOOGLE_API_KEY from environment
 except KeyError:
     print("🛑 Error: GOOGLE_API_KEY environment variable not set.")
     sys.exit(1)
@@ -98,68 +98,113 @@ MODEL_NAME = "gemini-2.0-flash" # Or "gemini-2.5-pro-preview-03-25"
 class Agent:
     def __init__(self, model_name: str):
         print(f"✨ Initializing Agent with model: {model_name}")
-        # We'll initialize the model later, when we know about tools
         self.model_name = model_name
-        self.model = None # Placeholder
-        self.chat = None # Placeholder for the chat session
+        self.model = None
+        self.chat = None
+        self.tool_functions = [self.read_file, self.list_files, self.edit_file]
+        print(f"🤖 Agent initialized with model: {self.model_name}")
 
-    def _initialize_chat(self, tools: list | None = None):
-        """Initializes or re-initializes the model and chat session."""
-        print(f"🔄 Initializing model and chat (Tools: {'Yes' if tools else 'No'})...")
-        self.chat = client.chats.create(model=self.model_name)
-print("✅ Chat initialized.")
+    def read_file(self, path: str) -> str:
+        """Reads the content of a file at the given relative path."""
+        print(f"🛠️ Executing read_file: {path}")
+        if not self._is_safe_path(path):
+            raise SecurityError(f"Access denied: Path '{path}' is outside the allowed directory.")
+        try:
+            file_path = Path(path).resolve()
+            if not file_path.is_file():
+                return f"Error: Path '{path}' is not a file or does not exist."
+            return file_path.read_text(encoding='utf-8')
+        except Exception as e:
+            return f"Error reading file '{path}': {e}"
 
+    def list_files(self, directory: str = '.') -> str:
+        """Lists files and directories within a given relative path."""
+        print(f"🛠️ Executing list_files: {directory}")
+        if not self._is_safe_path(directory):
+            raise SecurityError(f"Access denied: Path '{directory}' is outside the allowed directory.")
+        try:
+            dir_path = Path(directory).resolve()
+            if not dir_path.is_dir():
+                return f"Error: Path '{directory}' is not a directory."
+            items = [f.name + ('/' if f.is_dir() else '') for f in dir_path.iterdir()]
+            return f"Contents of '{directory}':\n" + "\n".join(items)
+        except Exception as e:
+            return f"Error listing directory '{directory}': {e}"
 
-    def run(self):
+    def edit_file(self, path: str, content: str) -> str:
+        """Writes content to a file at the given relative path, overwriting it."""
+        print(f"🛠️ Executing edit_file: {path}")
+        if not self._is_safe_path(path):
+            raise SecurityError(f"Access denied: Path '{path}' is outside the allowed directory.")
+        try:
+            file_path = Path(path).resolve()
+            file_path.write_text(content, encoding='utf-8')
+            return f"Successfully wrote to '{path}'."
+        except Exception as e:
+            return f"Error writing to file '{path}': {e}"
+
+    def _is_safe_path(self, path_str: str) -> bool:
+        """Check if the path is within the project directory."""
+        try:
+            project_root = Path.cwd().resolve()
+            target_path = (project_root / path_str).resolve()
+            return target_path.is_relative_to(project_root)
+        except ValueError: # Handles invalid path characters
+            return False
+
+    def start_interaction(self):
         """Starts the main interaction loop."""
-        self._initialize_chat() # Initialize without tools first
-
         print("\n💬 Chat with Gemini (type 'quit' or 'exit' to end)")
         print("-" * 30)
 
         while True:
             try:
-                user_input = input("🔵 \x1b[94mYou:\x1b[0m ") # Blue text for user
+                user_input = input("🔵 \x1b[94mYou:\x1b[0m ").strip()
                 if user_input.lower() in ["quit", "exit"]:
                     print("👋 Goodbye!")
                     break
-
                 if not user_input:
                     continue
 
-                # Send message to Gemini
                 print("🧠 Thinking...")
-                response = self.chat.send_message(user_input)
+                tool_config = types.GenerateContentConfig(
+                    tools=self.tool_functions
+                )
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=user_input,
+                    config=tool_config,
+                )
 
-                # Print Gemini's response
-                # Note: Automatic function calling handles tool calls implicitly here!
-                # We'll need to adjust this later when we manually handle tools.
-                text_response = response.candidates[0].content.parts[0].text
-print(f"🟠 \x1b[93mGemini:\x1b[0m {text_response}") # Orange text for Gemini
+                if response.text:
+                    print(f"🟠 \x1b[93mGemini:\x1b[0m {response.text}")
+                else:
+                    print("🟠 \x1b[93mGemini:\x1b[0m (No text response received)")
+                    # Log the full response if needed for debugging
+                    # print(f"DEBUG: Full response: {response}")
 
             except KeyboardInterrupt:
-                print("\n👋 Interrupted. Goodbye!")
+                print("\n👋 Exiting...")
                 break
             except Exception as e:
-                print(f"🛑 An error occurred: {e}")
-                # Consider whether to break or continue on error
-                # break
-
+                print(f"❌ An error occurred: {e}")
+                # Consider more robust error handling or logging
 
 # --- Main Execution ---
 if __name__ == "__main__":
+    print("🚀 Starting Agent...")
+    class SecurityError(Exception): pass
     agent = Agent(MODEL_NAME)
-    agent.run()
+    agent.start_interaction()
 ```
 
 **What's happening here?**
 
-1.  **Import necessary libraries:** `google.generativeai` for the API, `os` for environment variables, `sys` for exit, `pathlib` for file paths (we'll use it later), and `json` for tool data.
+1.  **Import necessary libraries:** `google-genai` for the API, `os` for environment variables, `sys` for exit, `pathlib` for file paths, and `json` for tool data.
 2.  **Configure API Key:** Reads the `GOOGLE_API_KEY` from your environment. Crucial!
 3.  **`Agent` Class:** A simple container for our logic.
-    * `__init__`: Sets up the model name.
-    * `_initialize_chat`: Configures the `genai.GenerativeModel` and starts a `ChatSession`. Notice the `tools` parameter – we'll use this soon. We also set `enable_automatic_function_calling=True`, which is the easiest way to get started with Gemini tools.
-    * `run`: The main loop. It gets user input, sends it to `self.chat.send_message()`, and prints the `response.text`.
+    * `__init__`: Sets up the model name and defines tool functions.
+    * `start_interaction`: The main loop. It gets user input, sends it to `self.client.models.generate_content()`, and prints the `response.text`.
 
 **🧪 Quick Test #1: Basic Conversation**
 
@@ -172,9 +217,8 @@ python main.py
 You should see:
 
 ```
-✨ Initializing Agent with model: gemini-1.5-flash-latest
-🔄 Initializing model and chat (Tools: No)...
-✅ Model and chat initialized.
+✨ Initializing Agent with model: gemini-2.0-flash
+🤖 Agent initialized with model: gemini-2.0-flash
 
 💬 Chat with Gemini (type 'quit' or 'exit' to end)
 ------------------------------
@@ -185,7 +229,7 @@ You should see:
 👋 Goodbye!
 ```
 
-If this works, your basic connection to the Gemini API is successful! This is the foundation of *every* AI chat application. Notice Gemini maintains context within the `self.chat` session implicitly.
+If this works, your basic connection to the Gemini API is successful! This is the foundation of *every* AI chat application. Notice Gemini maintains context within the `self.client.models.generate_content()` session implicitly.
 
 ### Step 2: Understanding and Implementing Tools
 
@@ -219,32 +263,12 @@ def read_file(path: str) -> str:
         return f"Error reading file '{path}': {e}"
 
 # Register your tool(s) with the chat config
-chat = client.chats.create(
-    model=MODEL_NAME,
-    config=types.ChatSessionConfig(
-        tools=[read_file],  # Add more tool functions here as needed
-    )
+tool_config = types.GenerateContentConfig(
+    tools=[read_file],  # Add more tool functions here as needed
 )
 ```
 
 Now, when Gemini wants to use a tool, it will call your Python function directly!
-my_tool = Tool(
-    function_declarations=[
-        FunctionDeclaration(
-            name="tool_name_here",
-            description="What this tool does.",
-            parameters={ # OpenAPI Schema format
-                "type": "object",
-                "properties": {
-                    "param1": {"type": "string", "description": "Desc for param1"},
-                    "param2": {"type": "integer", "description": "Desc for param2"}
-                },
-                "required": ["param1"] # Which parameters are mandatory
-            }
-        )
-    ]
-)
-```
 
 ### Step 3: Implementing the `read_file` Tool (New SDK)
 
@@ -255,7 +279,8 @@ Let's give our agent the ability to read files. With the new SDK, just define a 
 Add this Python function *before* the `Agent` class definition in `main.py`:
 
 ```python
-# --- Tool Functions ---
+# main.py
+# ... (imports and tool function definition) ...
 
 def read_file(path: str) -> str:
     """
@@ -268,6 +293,8 @@ def read_file(path: str) -> str:
         The content of the file as a string, or an error message.
     """
     print(f"🛠️ Executing read_file tool with path: {path}")
+    if not self._is_safe_path(path):
+        raise SecurityError(f"Access denied: Path '{path}' is outside the allowed directory.")
     try:
         file_path = Path(path).resolve() # Resolve to absolute path for security/clarity
         # Basic security check: ensure file is within the project directory
@@ -286,12 +313,7 @@ def read_file(path: str) -> str:
         print(f"🛑 Error in read_file for '{path}': {e}")
         return f"Error reading file '{path}': {e}"
 
-class SecurityError(Exception):
-    """Custom exception for security violations."""
-    pass
-
-# --- No tool declaration needed in new SDK! ---
-# Just pass your function directly to the tools argument.
+# ... (SecurityError class) ...
 ```
 
 * We define a standard Python function `read_file` that takes a `path`.
@@ -310,135 +332,13 @@ Now, register your tool with the chat session:
 from google import genai
 from google.genai import types
 
-client = genai.Client()
+client = genai.Client(api_key=API_KEY)
 MODEL_NAME = "gemini-2.0-flash"  # Or another Gemini model
 
-chat = client.chats.create(
-    model=MODEL_NAME,
-    config=types.ChatSessionConfig(
-        tools=[read_file],
-    )
+tool_config = types.GenerateContentConfig(
+    tools=[read_file],  # Add more tool functions here as needed
 )
-
-# Now you can send messages and Gemini will call your tool as needed!
 ```
-
-class Agent:
-    def __init__(self, model_name: str):
-        print(f"✨ Initializing Agent with model: {model_name}")
-        self.model_name = model_name
-        self.model = None
-        self.chat = None
-        # Store tool functions and their definitions
-        self.tools = {
-            "read_file": read_file
-            # Add more tools here later
-        }
-        self.tool_definitions = [
-            READ_FILE_TOOL
-            # Add more tool definitions here later
-        ]
-
-    def _initialize_chat(self): # Removed tools argument, uses self.tool_definitions
-        """Initializes or re-initializes the model and chat session."""
-        print(f"🔄 Initializing model and chat (Tools: {'Yes' if self.tool_definitions else 'No'})...")
-        self.model = genai.GenerativeModel(
-            self.model_name,
-            # system_instruction="You are a helpful coding assistant.",
-            tools=self.tool_definitions # Use the agent's tool definitions
-        )
-        # IMPORTANT: Keep automatic function calling enabled for now
-        self.chat = self.model.start_chat(enable_automatic_function_calling=True)
-        print("✅ Model and chat initialized.")
-
-    def run(self):
-        """Starts the main interaction loop."""
-        # Initialize with the tools defined in __init__
-        self._initialize_chat()
-
-        print("\n💬 Chat with Gemini (type 'quit' or 'exit' to end)")
-        print("-" * 30)
-
-        while True:
-            try:
-                user_input = input("🔵 \x1b[94mYou:\x1b[0m ")
-                if user_input.lower() in ["quit", "exit"]:
-                    print("👋 Goodbye!")
-                    break
-                if not user_input:
-                    continue
-
-                print("🧠 Thinking...")
-                response = self.chat.send_message(user_input)
-
-                # Automatic function calling handles the back-and-forth
-                # internally when enable_automatic_function_calling=True.
-                # The final response.text will incorporate the tool's result.
-                text_response = response.text
-                print(f"🟠 \x1b[93mGemini:\x1b[0m {text_response}")
-
-            except KeyboardInterrupt:
-                print("\n👋 Interrupted. Goodbye!")
-                break
-            except Exception as e:
-                print(f"🛑 An error occurred: {e}")
-                # Decide if you want to break or continue
-
-# ... (SecurityError class and Main Execution) ...
-```
-
-**Changes:**
-
-1.  **`__init__`:** Stores the actual Python function `read_file` in `self.tools` (a dictionary mapping name to function) and its `FunctionDeclaration` in `self.tool_definitions` (a list).
-2.  **`_initialize_chat`:** Now uses `self.tool_definitions` when creating the `GenerativeModel`.
-3.  **`run`:** The loop remains simple for now because `enable_automatic_function_calling=True` handles the tool execution flow magically behind the scenes! The SDK detects the function call request from Gemini, finds the matching function name in the `tools` list provided to the model, calls *your* Python function (`read_file` in this case) with the arguments Gemini provided, sends the result back, and gives you the final text response.
-
-**🧪 Quick Test #2: Using `read_file`**
-
-1.  Create a dummy file in your project directory:
-
-    ```bash
-    echo "This is the content of my test file." > my_test_file.txt
-    ```
-
-2.  Make sure your `GOOGLE_API_KEY` is set and run the agent:
-
-    ```bash
-    python main.py
-    ```
-
-3.  Interact with the agent:
-
-    ```
-    ✨ Initializing Agent with model: gemini-1.5-flash-latest
-    🔄 Initializing model and chat (Tools: Yes)...
-    ✅ Model and chat initialized.
-
-    💬 Chat with Gemini (type 'quit' or 'exit' to end)
-    ------------------------------
-    🔵 You: what is in the file named my_test_file.txt?
-    🧠 Thinking...
-    🛠️ Executing read_file tool with path: my_test_file.txt  # <-- You should see this!
-    ✅ read_file successful for: my_test_file.txt
-    🟠 Gemini: The file `my_test_file.txt` contains the following text:
-    This is the content of my test file.
-    🔵 You: Thanks! Now tell me what's in main.py
-    🧠 Thinking...
-    🛠️ Executing read_file tool with path: main.py
-    ✅ read_file successful for: main.py
-    🟠 Gemini: Okay, I've read the `main.py` file. It appears to be a Python script that sets up a conversational agent using the Google Generative AI SDK (Gemini). It defines an `Agent` class with methods to initialize the AI model, handle a chat loop, and includes a `read_file` tool function allowing the agent to read local files. The script configures the Gemini API key from an environment variable and starts the agent's interaction loop when run.
-    🔵 You: Try reading /etc/passwd
-    🧠 Thinking...
-    🛠️ Executing read_file tool with path: /etc/passwd
-    🚨 Security Error in read_file: Access denied: Path '/etc/passwd' is outside the project directory.
-    🟠 Gemini: Error: Access denied: Path '/etc/passwd' is outside the project directory. # <-- Good! Security worked.
-    🔵 You: quit
-    👋 Goodbye!
-    ```
-
-Success! You see the `🛠️ Executing read_file...` log message, proving your Python function was called. The agent correctly read the file and used its content to answer. The security check also prevented reading outside the project.
-
-*(Note: If you want finer control over the tool calling process, you can set `enable_automatic_function_calling=False` and manually handle the `response.function_calls` attribute, execute the tool, and send back a `FunctionResponse`. The automatic mode is simpler for this example.)*
 
 ### Step 4: Adding More Tools: `list_files`
 
@@ -452,29 +352,30 @@ Add this *before* the `Agent` class:
 # main.py
 # ... (imports, read_file function) ...
 
-def list_files(path: str = ".") -> str:
+def list_files(directory: str = '.') -> str:
     """
     Lists files and directories within a given relative path.
 
     Args:
-        path: The relative path of the directory to list. Defaults to the current directory.
+        directory: The relative path of the directory to list. Defaults to the current directory.
 
     Returns:
-        A JSON string representing a list of files and directories,
+        A string representing a list of files and directories,
         with directories indicated by a trailing slash, or an error message.
     """
-    print(f"🛠️ Executing list_files tool with path: {path}")
-    base_path = Path(path).resolve()
+    print(f"🛠️ Executing list_files tool with path: {directory}")
+    if not self._is_safe_path(directory):
+        raise SecurityError(f"Access denied: Path '{directory}' is outside the allowed directory.")
     try:
          # Security check
-        if not base_path.is_relative_to(Path.cwd()):
-            raise SecurityError(f"Access denied: Path '{path}' is outside the project directory.")
+        if not Path(directory).is_relative_to(Path.cwd()):
+            raise SecurityError(f"Access denied: Path '{directory}' is outside the project directory.")
 
-        if not base_path.is_dir():
-            return f"Error: Path '{path}' is not a directory or does not exist."
+        if not Path(directory).is_dir():
+            return f"Error: Path '{directory}' is not a directory or does not exist."
 
         items = []
-        for item in base_path.iterdir():
+        for item in Path(directory).iterdir():
             # Construct relative path from CWD for consistent view
             relative_item_path = item.relative_to(Path.cwd())
             if item.is_dir():
@@ -482,31 +383,15 @@ def list_files(path: str = ".") -> str:
             else:
                 items.append(str(relative_item_path))
 
-        print(f"✅ list_files successful for: {path}")
-        return json.dumps(items) # Return as JSON list
+        print(f"✅ list_files successful for: {directory}")
+        return "\n".join(items) # Return as a string
 
     except SecurityError as e:
         print(f"🚨 Security Error in list_files: {e}")
         return f"Error: {e}"
     except Exception as e:
-        print(f"🛑 Error in list_files for '{path}': {e}")
-        return f"Error listing files in '{path}': {e}"
-
-# Tool Definition
-LIST_FILES_TOOL = FunctionDeclaration(
-    name="list_files",
-    description="List files and directories within a given relative path from the current working directory. Defaults to the current directory if no path is provided. Directories have a trailing '/'",
-    parameters={
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Optional relative path of the directory to list (e.g., 'src/', '.'). Defaults to current directory."
-            }
-        },
-        # No required parameters, 'path' is optional
-    }
-)
+        print(f"🛑 Error in list_files for '{directory}': {e}")
+        return f"Error listing files in '{directory}': {e}"
 
 # ... (SecurityError class) ...
 ```
@@ -514,7 +399,7 @@ LIST_FILES_TOOL = FunctionDeclaration(
 * Uses `pathlib` again.
 * Includes the same security check.
 * Defaults to the current directory (`.`) if no path is given.
-* Returns a **JSON string** containing a list of file/directory names. Directories have a trailing `/`. This structured format is often easier for the LLM to parse reliably than plain text.
+* Returns a **string** containing a list of file/directory names. Directories have a trailing `/`. This structured format is often easier for the LLM to parse reliably than plain text.
 
 **2. Add to the Agent:**
 
@@ -531,16 +416,8 @@ class Agent:
         self.model = None
         self.chat = None
         # Store tool functions and their definitions
-        self.tools = {
-            "read_file": read_file,
-            "list_files": list_files # <--- ADD THIS
-            # Add more tools here later
-        }
-        self.tool_definitions = [
-            READ_FILE_TOOL,
-            LIST_FILES_TOOL # <--- ADD THIS
-            # Add more tool definitions here later
-        ]
+        self.tool_functions = [self.read_file, self.list_files]
+        print(f"🤖 Agent initialized with model: {self.model_name}")
         # The rest of the class remains the same...
 
     # ... (_initialize_chat, run methods) ...
@@ -548,36 +425,43 @@ class Agent:
 # ... (SecurityError class and Main Execution) ...
 ```
 
-**🧪 Quick Test #3: Using `list_files` and Combining Tools**
+**🧪 Quick Test #2: Using `list_files`**
 
-Run the agent again: `python main.py`
+1.  Create a dummy file in your project directory:
 
-```
-✨ Initializing Agent with model: gemini-1.5-flash-latest
-🔄 Initializing model and chat (Tools: Yes)...
-✅ Model and chat initialized.
+    ```bash
+    echo "This is the content of my test file." > my_test_file.txt
+    ```
 
-💬 Chat with Gemini (type 'quit' or 'exit' to end)
-------------------------------
-🔵 You: What files are in the current directory?
-🧠 Thinking...
-🛠️ Executing list_files tool with path: .   # <-- Tool called!
-✅ list_files successful for: .
-🟠 Gemini: The current directory contains the following items:
-["venv/", ".envrc", "main.py", "my_test_file.txt", "requirements.txt"] # <-- Note the JSON output was interpreted
-(Your specific file list might vary)
+2.  Make sure your `GOOGLE_API_KEY` is set and run the agent:
 
-🔵 You: Tell me about the python files in this directory. Be brief.
-🧠 Thinking...
-🛠️ Executing list_files tool with path: .   # <-- Step 1: List files
-✅ list_files successful for: .
-🛠️ Executing read_file tool with path: main.py # <-- Step 2: Read the relevant file
-✅ read_file successful for: main.py
-🟠 Gemini: The main Python file found is `main.py`. It sets up a Gemini-based chat agent with the capability to read local files (`read_file` tool) and list directory contents (`list_files` tool). It uses the `google-generativeai` library and handles user interaction in a loop.
+    ```bash
+    python main.py
+    ```
 
-🔵 You: quit
-👋 Goodbye!
-```
+3.  Interact with the agent:
+
+    ```
+    ✨ Initializing Agent with model: gemini-2.0-flash
+    🤖 Agent initialized with model: gemini-2.0-flash
+
+    💬 Chat with Gemini (type 'quit' or 'exit' to end)
+    ------------------------------
+    🔵 You: What files are in the current directory?
+    🧠 Thinking...
+    🛠️ Executing list_files tool with path: .   # <-- Tool called!
+    ✅ list_files successful for: .
+    🟠 Gemini: The current directory contains the following items:
+    my_test_file.txt
+    🔵 You: Thanks! Now tell me what's in main.py
+    🧠 Thinking...
+    🛠️ Executing read_file tool with path: main.py # <-- Step 1: Read the relevant file
+    ✅ read_file successful for: main.py
+    🟠 Gemini: Okay, I've read the `main.py` file. It sets up a Gemini-based chat agent with the capability to read local files (`read_file` tool) and list directory contents (`list_files` tool). It uses the `google-genai` library and handles user interaction in a loop.
+
+    🔵 You: quit
+    👋 Goodbye!
+    ```
 
 Fantastic! The agent first used `list_files` to see `main.py`, then used `read_file` to examine it, just like a human would. It's combining tools to fulfill a more complex request.
 
@@ -597,54 +481,28 @@ Add this *before* the `Agent` class:
 # main.py
 # ... (imports, other tool functions/declarations) ...
 
-def edit_file(path: str, old_str: str, new_str: str) -> str:
+def edit_file(self, path: str, content: str) -> str:
     """
-    Edits a file by replacing the first occurrence of old_str with new_str.
-    Creates the file (and directories) if it doesn't exist and old_str is empty.
+    Writes content to a file at the given relative path, overwriting it.
+    Creates the file (and directories) if it doesn't exist.
 
     Args:
-        path: The relative path to the file.
-        old_str: The exact string to search for. If empty, new_str is prepended/file created.
-        new_str: The string to replace old_str with.
+        path: The relative path of the file to edit (e.g., 'src/code.js', 'config.txt').
+        content: The content to write to the file.
 
     Returns:
         "OK" on success, or an error message.
     """
-    print(f"🛠️ Executing edit_file: Replacing '{old_str[:50]}...' with '{new_str[:50]}...' in '{path}'")
-    if old_str == new_str:
-        return "Error: old_str and new_str must be different."
-
-    file_path = Path(path).resolve()
+    print(f"🛠️ Executing edit_file: {path}")
+    if not self._is_safe_path(path):
+        raise SecurityError(f"Access denied: Path '{path}' is outside the allowed directory.")
     try:
-        # Security check
-        if not file_path.is_relative_to(Path.cwd()):
-             raise SecurityError(f"Access denied: Path '{path}' is outside the project directory.")
-
-        if file_path.exists():
-            if not file_path.is_file():
-                 return f"Error: Path '{path}' exists but is not a file."
-            original_content = file_path.read_text(encoding='utf-8')
-            if old_str == "": # Prepend if old_str is empty
-                 new_content = new_str + original_content
-            else:
-                if old_str not in original_content:
-                    return f"Error: '{old_str[:100]}...' not found in the file '{path}'. Cannot edit."
-                # Replace only the first occurrence for more predictable edits
-                new_content = original_content.replace(old_str, new_str, 1)
-            print("   File exists, attempting replacement.")
-        elif old_str == "": # File doesn't exist, create it only if old_str is empty
-            print("   File does not exist, creating...")
-            # Create parent directories if they don't exist
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            new_content = new_str
-        else: # File doesn't exist, and old_str is not empty
-             return f"Error: File '{path}' does not exist and old_str is not empty. Cannot replace text in non-existent file."
-
-        # Write the modified content back
-        file_path.write_text(new_content, encoding='utf-8')
+        file_path = Path(path).resolve()
+        # Optional: Add check if it's a directory?
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding='utf-8')
         print(f"✅ edit_file successful for: {path}")
-        return "OK" # Simple success message
-
+        return "OK"
     except SecurityError as e:
         print(f"🚨 Security Error in edit_file: {e}")
         return f"Error: {e}"
@@ -652,37 +510,12 @@ def edit_file(path: str, old_str: str, new_str: str) -> str:
         print(f"🛑 Error in edit_file for '{path}': {e}")
         return f"Error editing file '{path}': {e}"
 
-
-# Tool Definition
-EDIT_FILE_TOOL = FunctionDeclaration(
-    name="edit_file",
-    description="Edits a file by replacing the first exact occurrence of 'old_str' with 'new_str'. If 'old_str' is an empty string (''), 'new_str' is prepended to the file. If the file doesn't exist, it's created only if 'old_str' is empty.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "The relative path of the file to edit (e.g., 'src/code.js', 'config.txt')."
-            },
-            "old_str": {
-                "type": "string",
-                "description": "The exact text snippet to search for. Must match exactly. Use '' to prepend or create a new file."
-            },
-             "new_str": {
-                "type": "string",
-                "description": "The text snippet to replace 'old_str' with."
-            }
-        },
-        "required": ["path", "old_str", "new_str"]
-    }
-)
-
 # ... (SecurityError class) ...
 ```
 
-* Takes `path`, `old_str`, `new_str`.
-* **Crucially:** If `old_str` is empty (`""`), it treats it as a request to create the file (if it doesn't exist) or prepend content (if it does). This is a common pattern LLMs can use for creation.
-* If `old_str` is *not* empty, it requires the file to exist and `old_str` to be present. It replaces only the *first* occurrence (`.replace(..., 1)`). This makes edits less likely to go haywire if the `old_str` appears multiple times unexpectedly.
+* Takes `path`, `content`.
+* **Crucially:** If the file doesn't exist, it creates the file (and directories) and writes the content.
+* If the file exists, it overwrites the content.
 * Creates parent directories if needed (`file_path.parent.mkdir`).
 
 **2. Add to the Agent:**
@@ -697,16 +530,8 @@ class Agent:
     def __init__(self, model_name: str):
         print(f"✨ Initializing Agent with model: {model_name}")
         # ... (model_name, model, chat setup) ...
-        self.tools = {
-            "read_file": read_file,
-            "list_files": list_files,
-            "edit_file": edit_file # <--- ADD THIS
-        }
-        self.tool_definitions = [
-            READ_FILE_TOOL,
-            LIST_FILES_TOOL,
-            EDIT_FILE_TOOL # <--- ADD THIS
-        ]
+        self.tool_functions = [self.read_file, self.list_files, self.edit_file]
+        print(f"🤖 Agent initialized with model: {self.model_name}")
         # ... (rest of __init__) ...
 
     # ... (_initialize_chat, run methods) ...
@@ -714,7 +539,7 @@ class Agent:
 # ... (SecurityError class and Main Execution) ...
 ```
 
-**🧪 Quick Test #4: Creating and Editing Files**
+**🧪 Quick Test #3: Creating and Editing Files**
 
 Let's put it through its paces. Run `python main.py`.
 
@@ -723,8 +548,7 @@ Let's put it through its paces. Run `python main.py`.
 ```
 🔵 You: create a python script named fizzbuzz.py that prints fizzbuzz from 1 to 20 and then runs itself.
 🧠 Thinking...
-🛠️ Executing edit_file: Replacing ''... with '#!/usr/bin/env python\n\n"""\nFizzBuzz implementation in Python.\nPrints numbers from 1 to 20, replacing multiples of 3 with "Fizz",\nmultiples of 5 with "Buzz", and multiples of both with "FizzBuzz".\n"""\n\ndef fizzbuzz(n):\n    for i in range(1, n + 1):\n        output = \'\'\n        if i % 3 == 0:\n            output += \'Fizz\'\n        if i % 5 == 0:\n            output += \'Buzz\'\n        print(output or i)\n\nif __name__ == "__main__":\n    print("Running FizzBuzz up to 20:")\n    fizzbuzz(20)\n'... in 'fizzbuzz.py' # <-- Tool called with empty old_str
-   File does not exist, creating...
+🛠️ Executing edit_file: fizzbuzz.py   # <-- Tool called with new file!
 ✅ edit_file successful for: fizzbuzz.py
 🟠 Gemini: OK. I have created the `fizzbuzz.py` script. It defines a `fizzbuzz` function and prints the sequence from 1 to 20 when executed.
 
@@ -746,14 +570,11 @@ You should see the FizzBuzz output up to 20. It worked!
 🧠 Thinking...
 🛠️ Executing read_file tool with path: fizzbuzz.py # <-- Reads first to understand
 ✅ read_file successful for: fizzbuzz.py
-🛠️ Executing edit_file: Replacing 'fizzbuzz(20)'... with 'fizzbuzz(10)'... in 'fizzbuzz.py' # <-- Edits the number
-   File exists, attempting replacement.
+🛠️ Executing edit_file: fizzbuzz.py # <-- Edits the number
 ✅ edit_file successful for: fizzbuzz.py
-🛠️ Executing edit_file: Replacing 'Running FizzBuzz up to 20:'... with 'Running FizzBuzz up to 10:'... in 'fizzbuzz.py' # <-- Edits the print statement
-   File exists, attempting replacement.
+🛠️ Executing edit_file: fizzbuzz.py # <-- Edits the print statement
 ✅ edit_file successful for: fizzbuzz.py
-🛠️ Executing edit_file: Replacing 'Prints numbers from 1 to 20,'... with 'Prints numbers from 1 to 10,'... in 'fizzbuzz.py' # <-- Even edits the docstring!
-   File exists, attempting replacement.
+🛠️ Executing edit_file: fizzbuzz.py # <-- Even edits the docstring!
 ✅ edit_file successful for: fizzbuzz.py
 🟠 Gemini: OK, I've edited the `fizzbuzz.py` script. It will now print the FizzBuzz sequence only up to 10 instead of 20. I also updated the relevant comment and print statement to reflect this change.
 ```
@@ -765,8 +586,7 @@ You should see the FizzBuzz output up to 20. It worked!
 ```
 🔵 You: Create a python script congrats.py that rot13 decodes the string 'Pbatenghyngvbaf ba ohvyqvat n clguba ntrag!' and prints the result.
 🧠 Thinking...
-🛠️ Executing edit_file: Replacing ''... with '#!/usr/bin/env python\n\nimport codecs\n\n"""\nDecodes a ROT13 encoded string and prints the result.\n"""\n\ndef rot13_decode(encoded_string):\n    return codecs.decode(encoded_string, \'rot_13\')\n\nif __name__ == "__main__":\n    encoded = \'Pbatenghyngvbaf ba ohvyqvat n clguba ntrag!\'\n    decoded = rot13_decode(encoded)\n    print(decoded)\n'... in 'congrats.py'
-   File does not exist, creating...
+🛠️ Executing edit_file: congrats.py   # <-- Tool called with new file!
 ✅ edit_file successful for: congrats.py
 🟠 Gemini: OK, I have created the `congrats.py` script. It uses the `codecs` module to perform ROT13 decoding on the provided string and print the result.
 
