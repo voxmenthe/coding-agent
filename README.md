@@ -2,6 +2,8 @@
 
 This project implements a Python-based interactive coding agent powered by Google's Gemini models (using the newer `google-genai` SDK).
 
+*Adapted from Thorsten Ball's "How to Build an Agent"* https://ampcode.com/how-to-build-an-agent
+
 The agent can:
 - Understand and respond to natural language prompts.
 - Interact with your local file system (read, list, edit files).
