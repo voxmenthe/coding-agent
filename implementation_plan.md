@@ -673,6 +673,10 @@ def execute_bash_command(command: str) -> str:
             cwd=project_root, # project_root should be defined globally
             check=False 
         )
+        # --- Print stdout directly to console for visibility ---
+        if result.stdout:
+            print(f"\n\u25b6\ufe0f Command Output (stdout):\n{result.stdout.strip()}")
+        # --- Format output for LLM --- 
         output = f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
         if result.returncode != 0:
             output += f"\n--- Command exited with code: {result.returncode} ---"
@@ -684,7 +688,7 @@ def execute_bash_command(command: str) -> str:
 
 **2. Register the Tool**
 
-Add the new function to the `self.tool_functions` list in `CodeAgent.__init__`:
+Add the new function to the `self.tool_functions` list in `CodeAgent.__init__`.
 
 ```python
 # In CodeAgent.__init__
@@ -702,13 +706,182 @@ Now you can ask the agent to run allowed commands:
 
 ⚒️ Tool: Executing bash command: git status
 
+▶️ Command Output (stdout):
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   implementation_plan.md
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+
 🟢 Agent: --- stdout ---
 On branch main
 Your branch is up to date with 'origin/main'.
 
-nothing to commit, working tree clean
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   implementation_plan.md
+
+no changes added to commit (use "git add" and/or "git commit -a")
 --- stderr ---
 
 ```
 
 This adds significant power, but also risk. Expand the whitelist cautiously!
+
+### Advanced: Sandboxed Execution with Docker
+
+For running potentially complex or less trusted commands (like test suites or code generation checks), simple whitelisting isn't enough. Sandboxing provides better isolation.
+
+**Prerequisites:**
+
+*   **Docker Desktop (or daemon):** Must be installed and running on your system.
+*   **`docker` Python Library:** Add `docker = "^7.0.0"` (or latest) to your `pyproject.toml` and run `poetry install`.
+
+**1. Checking Docker Status**
+
+First, a helper function to see if Docker is ready:
+
+```python
+# main.py
+import docker
+from docker.errors import DockerException
+
+def _check_docker_running() -> tuple[bool, docker.DockerClient | None, str]:
+    """Checks if the Docker daemon is running and returns client or error."""
+    try:
+        client = docker.from_env()
+        client.ping() # Verify connection
+        return True, client, "Docker daemon is running."
+    except DockerException as e:
+        error_msg = (
+            f"Docker connection failed: {e}\n"
+            "Please ensure Docker Desktop (or docker daemon) is running."
+        )
+        return False, None, error_msg
+    except Exception as e:
+        # Catch other potential issues like docker library not installed
+        return False, None, f"Error checking Docker status: {e}"
+```
+
+**2. The Tool Function (`run_in_sandbox`)**
+
+This function takes a command and an optional image name. It checks Docker status, then attempts to run the command inside a container with specific security settings (no network, resource limits).
+
+```python
+# main.py
+def run_in_sandbox(command: str, image: str = "python:3.11-slim") -> str:
+    """Executes a command inside a sandboxed Docker container.
+
+    Uses a specified image (defaulting to python:3.11-slim).
+    The project directory is mounted at /app.
+    Network access is disabled for security.
+    Resource limits (CPU, memory) are applied.
+
+    Args:
+        command: The command string to execute inside the container's /app directory.
+        image: The Docker image to use (e.g., 'python:3.11', 'node:18').
+
+    Returns:
+        The combined stdout/stderr from the container, or an error message.
+    """
+    print(f"\n\u2692\ufe0f Tool: Running in sandbox (Image: {image}): {command}")
+
+    is_running, client, message = _check_docker_running()
+    if not is_running:
+        return f"Error: Cannot run sandbox. {message}"
+
+    try:
+        print(f"\n\u23f3 Starting Docker container (image: {image})...")
+        # Note: project_root must be defined globally
+        container_output = client.containers.run(
+            image=image,
+            command=f"sh -c '{command}'", 
+            working_dir="/app",
+            volumes={str(project_root): {'bind': '/app', 'mode': 'rw'}},
+            remove=True,        
+            network_mode='none',
+            mem_limit='512m',   
+            cpus=1,             
+            detach=False,       
+            stdout=True,        
+            stderr=True         
+        )
+        output_str = container_output.decode('utf-8').strip()
+        print(f"\n\u25b6\ufe0f Sandbox Output:\n{output_str}")
+        return f"--- Container Output ---\n{output_str}"
+
+    except DockerException as e:
+        error_msg = f"Docker error during sandbox execution: {e}"
+        print(f"\n\u274c {error_msg}")
+        if "not found" in str(e).lower() or "no such image" in str(e).lower():
+             error_msg += f"\nPlease ensure the image '{image}' exists locally or can be pulled."
+        return f"Error: {error_msg}"
+    except Exception as e:
+        error_msg = f"Unexpected error during sandbox execution: {e}"
+        print(f"\n\u274c {error_msg}")
+        return f"Error: {error_msg}"
+
+```
+
+**3. Register the Tool**
+
+Add `run_in_sandbox` to the `self.tool_functions` list in `CodeAgent.__init__`.
+
+```python
+# In CodeAgent.__init__
+self.tool_functions = [
+    read_file, list_files, edit_file, 
+    execute_bash_command, run_in_sandbox
+]
+```
+
+**4. Example Interaction**
+
+Assuming you have `pytest` installed within your project environment (and thus available in the mounted `/app` directory within the container):
+
+```text
+🔵 You: run pytest using the sandbox
+
+⏳ Sending message and processing...
+
+⚒️ Tool: Running in sandbox (Image: python:3.11-slim): pytest
+
+⏳ Starting Docker container (image: python:3.11-slim)...
+
+▶️ Sandbox Output:
+============================= test session starts ==============================
+platform linux -- Python 3.11.7, pytest-7.4.3, pluggy-1.3.0
+rootdir: /app
+plugins: anyio-4.2.0
+collected 1 item
+
+tests/test_example.py .                                                [100%]
+
+============================== 1 passed in 0.01s ===============================
+
+
+🟢 Agent: --- Container Output ---
+============================= test session starts ==============================
+platform linux -- Python 3.11.7, pytest-7.4.3, pluggy-1.3.0
+rootdir: /app
+plugins: anyio-4.2.0
+collected 1 item
+
+tests/test_example.py .                                                [100%]
+
+============================== 1 passed in 0.01s ===============================
+```
+
+**Security Considerations:**
+
+*   This provides significantly better isolation than the simple bash tool.
+*   Disabling the network (`network_mode='none'`) is a major security enhancement.
+*   Resource limits (`mem_limit`, `cpus`) prevent denial-of-service.
+*   **Risk:** The project directory is mounted read-write (`'mode': 'rw'`). A malicious command *could still modify or delete files within your project directory* inside the container. For higher security, explore mounting read-only (`'mode': 'ro'`) where possible, or mounting only specific subdirectories needed by the command.
+*   This assumes the Docker daemon itself is secure.
