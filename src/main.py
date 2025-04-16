@@ -129,7 +129,7 @@ class CodeAgent:
 # --- Main Execution ---
 if __name__ == "__main__":
     print("🚀 Starting Code Agent...")
-    api_key = all_creds['GEMINI_HIMS_API_KEY_mlproj_V1']
+    api_key = all_creds['GEMINI_API_KEY']
 
     # Add project root to sys.path
     sys.path.insert(0, str(project_root))

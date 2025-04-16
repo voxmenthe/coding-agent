@@ -542,7 +542,7 @@ Let's put it through its paces. Run `python main.py`.
 **Scenario 1: Create a FizzBuzz script**
 
 ```
-🔵 You: create a python script named fizzbuzz.py that prints fizzbuzz from 1 to 20 and then runs itself.
+🔵 You: create a python script named fizzbuzz.py that prints fizzbuzz from 1 to 20 and then runs itself. make sure it exits when done.
 🧠 Thinking...
 🛠️ Executing edit_file: fizzbuzz.py   # <-- Tool called with new file!
 ✅ edit_file successful for: fizzbuzz.py
