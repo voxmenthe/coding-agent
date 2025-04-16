@@ -885,3 +885,97 @@ tests/test_example.py .                                                [100%]
 *   Resource limits (`mem_limit`, `cpus`) prevent denial-of-service.
 *   **Risk:** The project directory is mounted read-write (`'mode': 'rw'`). A malicious command *could still modify or delete files within your project directory* inside the container. For higher security, explore mounting read-only (`'mode': 'ro'`) where possible, or mounting only specific subdirectories needed by the command.
 *   This assumes the Docker daemon itself is secure.
+```
+
+## ✨ Next Steps: Persistent History & Token Counting
+
+Right now, our agent is stateless. Each time you send a message, it only sees *that message*. It has no memory of the previous turns. While the `google-genai` SDK offers a `ChatSession` object (`client.chats.create()`) that handles history automatically for conversation context, the basic `client.models.generate_content` method we used here doesn't.
+
+Let's add a feature we implemented in our main project: displaying the token count of the conversation history in the prompt. This requires us to *manually* track the history *just for counting purposes*.
+
+1.  **Add History Tracking to `__init__`:**
+
+    Modify the `Agent.__init__` method to include a list to store the conversation and a variable for the current count:
+
+    ```python
+    # Inside Agent class
+    def __init__(self, model_name: str):
+        # ... (existing code) ...
+        self.tool_functions = [self.read_file, self.list_files, self.edit_file]
+        self.conversation_history = [] # Manual history for token counting ONLY
+        self.current_token_count = 0 # Store token count for the next prompt
+        print(f"🤖 Agent initialized with model: {self.model_name}")
+    ```
+
+2.  **Modify `start_interaction`:**
+
+    Update the loop to manage the history, count tokens, and display the count:
+
+    ```python
+    # Inside Agent class
+    def start_interaction(self):
+        """Starts the main interaction loop."""
+        print("\n💬 Chat with Gemini (type 'quit' or 'exit' to end)")
+        print("-" * 30)
+
+        while True:
+            try:
+                # Display token count from *previous* turn
+                prompt_text = f"\n🔵 You ({self.current_token_count}): "
+                user_input = input(prompt_text).strip()
+
+                if user_input.lower() in ["quit", "exit"]:
+                    print("👋 Goodbye!")
+                    break
+                if not user_input:
+                    continue
+
+                # Add user message to manual history BEFORE sending
+                new_user_content = types.Content(parts=[types.Part(text=user_input)], role="user")
+                self.conversation_history.append(new_user_content)
+
+                print("🧠 Thinking...")
+                tool_config = types.GenerateContentConfig(
+                    tools=self.tool_functions
+                )
+
+                # IMPORTANT: Still sending only the LATEST input to generate_content
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=user_input, # This remains unchanged!
+                    config=tool_config,
+                )
+
+                # Add agent response to manual history AFTER getting it
+                agent_response_content = None
+                if response.candidates and response.candidates[0].content:
+                    agent_response_content = response.candidates[0].content
+                    self.conversation_history.append(agent_response_content)
+
+                # Print response
+                if response.text:
+                    print(f"🟠 \x1b[93mGemini:\x1b[0m {response.text}")
+                else:
+                    print("🟠 \x1b[93mGemini:\x1b[0m (No text response received)")
+
+                # Calculate and store token count for the *next* prompt
+                try:
+                    token_count_response = self.client.models.count_tokens(
+                        model=self.model_name,
+                        contents=self.conversation_history # Use the updated manual history
+                    )
+                    self.current_token_count = token_count_response.total_tokens
+                except Exception as count_error:
+                    # Don't block interaction if counting fails
+                    print(f"\n⚠️ Could not update token count: {count_error}")
+
+            except KeyboardInterrupt:
+                print("\n👋 Exiting...")
+                break
+            except Exception as e:
+                print(f"❌ An error occurred: {e}")
+    ```
+
+With these changes, your tutorial agent will now show the running token count based on the manually tracked history, making it behave more like the final version we built!
+
+Remember, this manual history (`self.conversation_history`) is *only* used for the `count_tokens` call. The actual `generate_content` call still only sends the single, latest `user_input`. For true conversational context within the LLM itself using this SDK, you'd typically use `client.chats.create()` and `chat.send_message()`.
