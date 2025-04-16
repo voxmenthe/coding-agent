@@ -31,32 +31,41 @@ class CodeAgent:
             run_in_sandbox # Add the new sandbox tool
         ]
         self.client = None
-        # self.chat = None # No longer maintaining a persistent chat object
+        self.chat = None
         self._configure_client()
 
     def _configure_client(self):
         """Configures the Google Generative AI client."""
         print("\n\u2692\ufe0f Configuring genai client...")
         try:
-            # Client likely picks up GOOGLE_API_KEY from env
+
             self.client = genai.Client(api_key=self.api_key)
             print("\u2705 Client configured successfully.")
         except Exception as e:
             print(f"\u274c Error configuring genai client: {e}")
+            traceback.print_exc()
             sys.exit(1)
 
     def start_interaction(self):
-        """Starts the main interaction loop using generate_content."""
+        """Starts the main interaction loop using a stateful ChatSession via client.chats.create."""
         if not self.client:
             print("\n\u274c Client not configured. Exiting.")
             return
 
-        print("\n\u2692\ufe0f Agent ready. Ask me anything involving file operations (read, list, edit) or allowed bash commands (ls, cat, git...). Type 'exit' to quit.")
+        print("\n\u2692\ufe0f Initializing chat session...")
+        try:
+            # Create a chat session using the client
+            self.chat = self.client.chats.create(model=self.model_name, history=[])
+            print("\u2705 Chat session initialized.")
+        except Exception as e:
+            print(f"\u274c Error initializing chat session: {e}")
+            traceback.print_exc()
+            sys.exit(1)
 
-        # Define the tool configuration once
-        tool_config = types.GenerateContentConfig(
-            tools=self.tool_functions
-        )
+        print("\n\u2692\ufe0f Agent ready. Ask me anything. Type 'exit' to quit.")
+
+        # Prepare tool config once to pass to send_message
+        tool_config = types.GenerateContentConfig(tools=self.tool_functions)
 
         while True:
             try:
@@ -65,29 +74,33 @@ class CodeAgent:
                     print("\n👋 Goodbye!")
                     break
 
+                if not user_input:
+                    continue
+
                 print("\n\u23f3 Sending message and processing...")
-                # Use generate_content for each message, enabling automatic function calling via config
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=user_input,
-                    config=tool_config,
+                # Use chat.send_message, passing the tool config
+                response = self.chat.send_message(
+                    message=user_input,
+                    config=tool_config # Pass tools here for potential automatic function calling
                 )
 
-                # The SDK should handle the function call automatically and return the final text
+                # Access the final text response (assuming response structure is similar)
+                # Check the actual response object structure if this causes errors
                 print(f"\n🟢 \x1b[92mAgent:\x1b[0m {response.text}")
 
+            except KeyboardInterrupt:
+                print("\n👋 Goodbye!")
+                break
             except Exception as e:
                 print(f"\n🔴 \x1b[91mAn error occurred during interaction: {e}\x1b[0m")
-                # Optionally add more specific error handling, e.g., for API errors
-                # break
+                traceback.print_exc() # Print traceback for debugging
 
 # --- Main Execution ---
 if __name__ == "__main__":
     print("🚀 Starting Code Agent...")
     api_key = all_creds['GEMINI_HIMS_API_KEY_mlproj_V1']
 
-    # Set project_root globally for tools that might need it (though tools.py defines its own)
-    # project_root = Path(__file__).resolve().parents[1] # Already defined above
+    # Add project root to sys.path
     sys.path.insert(0, str(project_root))
 
     # Make project_root available to the tools module if needed indirectly

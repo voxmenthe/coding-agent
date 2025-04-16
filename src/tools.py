@@ -159,7 +159,6 @@ def run_in_sandbox(command: str) -> str:
             remove=True,        # Remove container after execution
             network_mode='none',# Disable networking
             mem_limit='512m',   # Limit memory
-            cpus=1,             # Limit CPUs
             detach=False,       # Run synchronously
             stdout=True,        # Capture stdout
             stderr=True         # Capture stderr
