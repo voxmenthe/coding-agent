@@ -3,7 +3,7 @@ import docker
 from docker.errors import DockerException
 from pathlib import Path
 import subprocess
-
+import os
 
 # --- Project Root ---
 project_root = Path(__file__).resolve().parents[1]
@@ -60,10 +60,11 @@ def edit_file(path: str, content: str) -> str:
     """Writes or overwrites content to a file at the given path."""
     print(f"\n\u2692\ufe0f Tool: Editing file: {path}")
     try:
-        # Security check: Ensure path is within the project directory
-        target_path = (project_root / path).resolve()
-        if not target_path.is_relative_to(project_root):
-            return "Error: Access denied. Path is outside the project directory."
+        # Security check: Ensure path is within the current working directory
+        cwd = Path(os.getcwd())
+        target_path = (cwd / path).resolve()
+        if not target_path.is_relative_to(cwd):
+            return "Error: Access denied. Path is outside the current working directory."
 
         # Create parent directories if they don't exist
         target_path.parent.mkdir(parents=True, exist_ok=True)
