@@ -103,6 +103,8 @@ convention = "google"
     "S311", # Standard pseudo-random generators are not suitable for cryptographic purposes
 ]
 
+[tool.poetry.scripts]
+coding-agent = "src.main:main"
 
 [build-system]
 requires = ["poetry-core"]

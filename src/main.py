@@ -136,12 +136,9 @@ class CodeAgent:
                 traceback.print_exc() # Print traceback for debugging
 
 # --- Main Execution ---
-if __name__ == "__main__":
+def main():
     print("🚀 Starting Code Agent...")
     api_key = all_creds['GEMINI_API_KEY']
-
-    # Add project root to sys.path
-    sys.path.insert(0, str(project_root))
 
     # Make project_root available to the tools module if needed indirectly
     # (Though direct definition in tools.py is preferred)
@@ -150,3 +147,6 @@ if __name__ == "__main__":
 
     agent = CodeAgent(api_key=api_key, model_name=MODEL_NAME)
     agent.start_interaction()
+
+if __name__ == "__main__":
+    main()

@@ -52,19 +52,16 @@ The agent can:
 
 ## ▶️ Running the Agent
 
-Navigate to the `src` directory and run the main script:
+Install the package locally and run the CLI from anywhere:
 
+From the root directory of the project
 ```bash
-cd src
-python main.py
+pip install -e .
 ```
 
-The agent will initialize and present you with a prompt like:
-
-```
-⚒️ Agent ready. Ask me anything. Type 'exit' to quit.
-
-🔵 You (0): 
+Run the agent
+```bash
+coding-agent
 ```
 
 ## 💬 Usage

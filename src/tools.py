@@ -3,7 +3,7 @@ import docker
 from docker.errors import DockerException
 from pathlib import Path
 import subprocess
-import sys
+
 
 # --- Project Root ---
 project_root = Path(__file__).resolve().parents[1]
@@ -129,7 +129,7 @@ def execute_bash_command(command: str) -> str:
 
 def run_in_sandbox(command: str) -> str:
     """Executes a command inside a sandboxed Docker container.
-
+    The sandbox's cwd is the directory where the agent is run from.
     Uses the 'python:3.12-slim' image.
     The project directory is mounted at /app.
     Network access is disabled for security.
@@ -155,7 +155,7 @@ def run_in_sandbox(command: str) -> str:
             image=image, # Use the hardcoded image variable
             command=f"sh -c '{command}'", # Execute command within a shell in the container
             working_dir="/app",
-            volumes={str(project_root): {'bind': '/app', 'mode': 'rw'}},
+            volumes={os.getcwd(): {'bind': '/app', 'mode': 'rw'}},
             remove=True,        # Remove container after execution
             network_mode='none',# Disable networking
             mem_limit='512m',   # Limit memory
