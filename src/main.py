@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 import json
-from creds import all_creds
+from src.creds import all_creds
 from src.tools import read_file, list_files, edit_file, execute_bash_command, run_in_sandbox
 import traceback
 
