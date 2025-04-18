@@ -63,6 +63,9 @@ Run the agent
 coding-agent
 ```
 
+## 📝 Notes
+- The agent operates relative to the directory it was started from.
+
 ## 💬 Usage
 
 - Simply type your requests or questions at the `You (<token_count>):` prompt.
@@ -74,8 +77,3 @@ coding-agent
     - "run the command 'ls -l'"
     - "run 'pip list' in the sandbox"
 - The number in parentheses indicates the approximate token count of the conversation history that will be sent with your *next* message.
-
-## 📝 Notes
-
-- The agent operates relative to the project root directory defined in `src/main.py`.
-- Ensure the API key handling is secure and not committed to version control.
