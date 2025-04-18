@@ -36,11 +36,10 @@ The agent can:
     ```
 
 3.  **Set up API Key:**
-    - The agent expects your Google Gemini API key to be available.
-    - Currently, it's hardcoded in `src/main.py` to read from `all_creds['GEMINI_API_KEY']`. You'll need to adapt this to your own credential management (e.g., environment variables, a `.env` file).
-    - *Example using environment variable:* Modify `src/main.py` to use `os.environ.get("GEMINI_API_KEY")` and set the variable in main.py:
-      ```python
-      api_key = os.environ.get("GEMINI_API_KEY")
+    - The agent reads your Gemini API key exclusively from the `GEMINI_API_KEY` environment variable.
+    - Before running, export your key:
+      ```bash
+      export GEMINI_API_KEY="your_key_here"
       ```
 
 4.  **(Optional) Docker for Sandbox:**
@@ -62,7 +61,9 @@ pip install -e .
 Run the agent
 ```bash
 coding-agent
-```
+
+## 📝 Notes
+- The agent operates relative to the directory it was started from.
 
 ## 💬 Usage
 
@@ -75,8 +76,3 @@ coding-agent
     - "run the command 'ls -l'"
     - "run 'pip list' in the sandbox"
 - The number in parentheses indicates the approximate token count of the conversation history that will be sent with your *next* message.
-
-## 📝 Notes
-
-- The agent operates relative to the project root directory defined in `src/main.py`.
-- Ensure the API key handling is secure and not committed to version control.

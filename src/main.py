@@ -3,12 +3,10 @@ from google.genai import types
 import os
 import sys
 from pathlib import Path
-import json
-from src.creds import all_creds
 from src.tools import read_file, list_files, edit_file, execute_bash_command, run_in_sandbox
 import traceback
 
-# Choose your Gemini model - flash models are currently 2.0 NOT 1.5 - 1.5 is deprecated!!
+# Choose your Gemini model - unless you want something crazy "gemini-2.5-flash-preview-04-17" is the default model
 MODEL_NAME = "gemini-2.5-flash-preview-04-17" 
 
 # Define project root - needed here for agent initialization
@@ -138,7 +136,7 @@ class CodeAgent:
 # --- Main Execution ---
 def main():
     print("🚀 Starting Code Agent...")
-    api_key = all_creds['GEMINI_API_KEY']
+    api_key = os.getenv('GEMINI_API_KEY')
 
     # Make project_root available to the tools module if needed indirectly
     # (Though direct definition in tools.py is preferred)
