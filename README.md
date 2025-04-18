@@ -61,7 +61,6 @@ pip install -e .
 Run the agent
 ```bash
 coding-agent
-```
 
 ## 📝 Notes
 - The agent operates relative to the directory it was started from.
