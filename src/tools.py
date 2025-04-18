@@ -3,7 +3,7 @@ import docker
 from docker.errors import DockerException
 from pathlib import Path
 import subprocess
-import sys
+import os
 
 # --- Project Root ---
 project_root = Path(__file__).resolve().parents[1]
@@ -60,10 +60,11 @@ def edit_file(path: str, content: str) -> str:
     """Writes or overwrites content to a file at the given path."""
     print(f"\n\u2692\ufe0f Tool: Editing file: {path}")
     try:
-        # Security check: Ensure path is within the project directory
-        target_path = (project_root / path).resolve()
-        if not target_path.is_relative_to(project_root):
-            return "Error: Access denied. Path is outside the project directory."
+        # Security check: Ensure path is within the current working directory
+        cwd = Path(os.getcwd())
+        target_path = (cwd / path).resolve()
+        if not target_path.is_relative_to(cwd):
+            return "Error: Access denied. Path is outside the current working directory."
 
         # Create parent directories if they don't exist
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,7 +130,7 @@ def execute_bash_command(command: str) -> str:
 
 def run_in_sandbox(command: str) -> str:
     """Executes a command inside a sandboxed Docker container.
-
+    The sandbox's cwd is the directory where the agent is run from.
     Uses the 'python:3.12-slim' image.
     The project directory is mounted at /app.
     Network access is disabled for security.
@@ -155,7 +156,7 @@ def run_in_sandbox(command: str) -> str:
             image=image, # Use the hardcoded image variable
             command=f"sh -c '{command}'", # Execute command within a shell in the container
             working_dir="/app",
-            volumes={str(project_root): {'bind': '/app', 'mode': 'rw'}},
+            volumes={os.getcwd(): {'bind': '/app', 'mode': 'rw'}},
             remove=True,        # Remove container after execution
             network_mode='none',# Disable networking
             mem_limit='512m',   # Limit memory

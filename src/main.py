@@ -4,12 +4,12 @@ import os
 import sys
 from pathlib import Path
 import json
-from creds import all_creds
+from src.creds import all_creds
 from src.tools import read_file, list_files, edit_file, execute_bash_command, run_in_sandbox
 import traceback
 
 # Choose your Gemini model - flash models are currently 2.0 NOT 1.5 - 1.5 is deprecated!!
-MODEL_NAME = "gemini-2.0-flash" 
+MODEL_NAME = "gemini-2.5-flash-preview-04-17" 
 
 # Define project root - needed here for agent initialization
 project_root = Path(__file__).resolve().parents[1]
@@ -18,7 +18,7 @@ project_root = Path(__file__).resolve().parents[1]
 class CodeAgent:
     """A simple coding agent using Google Gemini (google-genai SDK)."""
 
-    def __init__(self, api_key: str, model_name: str = "gemini-2.0-flash"):
+    def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash-preview-04-17"):
         """Initializes the agent with API key and model name."""
         self.api_key = api_key
         self.model_name = f'models/{model_name}' # Add 'models/' prefix
@@ -66,8 +66,17 @@ class CodeAgent:
 
         print("\n\u2692\ufe0f Agent ready. Ask me anything. Type 'exit' to quit.")
 
-        # Prepare tool config once to pass to send_message
-        tool_config = types.GenerateContentConfig(tools=self.tool_functions)
+        # Prompt for thinking budget per session
+        try:
+            budget_input = input("Enter thinking budget (0 to 24000) for this session [1024]: ").strip()
+            self.thinking_budget = int(budget_input) if budget_input else 1024
+        except ValueError:
+            print("⚠️ Invalid thinking budget. Using default of 1024.")
+            self.thinking_budget = 1024
+        self.thinking_config = types.ThinkingConfig(thinking_budget=self.thinking_budget)
+
+        # Prepare tool config with thinking_config
+        tool_config = types.GenerateContentConfig(tools=self.tool_functions, thinking_config=self.thinking_config)
 
         while True:
             try:
@@ -89,7 +98,7 @@ class CodeAgent:
                 # --- Keep existing Tool Config and Send Message call --- 
                 print("\n⏳ Sending message and processing...")
                 # Prepare tool configuration (Assuming this structure is correct based on earlier state/memory)
-                tool_config = types.GenerateContentConfig(tools=self.tool_functions)
+                tool_config = types.GenerateContentConfig(tools=self.tool_functions, thinking_config=self.thinking_config)
 
                 # Send message using the chat object's send_message method
                 response = self.chat.send_message(
@@ -127,12 +136,9 @@ class CodeAgent:
                 traceback.print_exc() # Print traceback for debugging
 
 # --- Main Execution ---
-if __name__ == "__main__":
+def main():
     print("🚀 Starting Code Agent...")
     api_key = all_creds['GEMINI_API_KEY']
-
-    # Add project root to sys.path
-    sys.path.insert(0, str(project_root))
 
     # Make project_root available to the tools module if needed indirectly
     # (Though direct definition in tools.py is preferred)
@@ -141,3 +147,6 @@ if __name__ == "__main__":
 
     agent = CodeAgent(api_key=api_key, model_name=MODEL_NAME)
     agent.start_interaction()
+
+if __name__ == "__main__":
+    main()
