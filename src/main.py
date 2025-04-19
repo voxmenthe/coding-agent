@@ -76,8 +76,8 @@ class CodeAgent:
             sys.exit(1)
 
         print("\n\u2692\ufe0f Agent ready. Ask me anything. Type 'exit' to quit.")
-        print("   Use '/upload <path/to/file.pdf>' to add a PDF to context.")
-        print("   Use '/clearfiles' to remove PDFs from context.")
+        print("   Use '/upload <path/to/file.pdf>' to seed PDF into context.")
+        print("   Use '/reset' to clear the chat and start fresh.")
 
         # Prompt for thinking budget per session
         try:
@@ -118,28 +118,27 @@ class CodeAgent:
                         # Call the upload function (which prints status)
                         uploaded_file = upload_pdf_for_gemini(pdf_path_str)
                         if uploaded_file:
-                            self.active_files.append(uploaded_file)
-                            print(f"\n✅ Added '{uploaded_file.display_name}' to active files.")
+                            print("\n⚒️ Extracting text from PDF to seed context...")
+                            extraction_response = self.chat.send_message(
+                                message=[uploaded_file, "\n\nExtract the entire text of this PDF, organized by section. Include all tables, and figures (full descriptions where appropriate in place of images)."],
+                                config=tool_config
+                            )
+                            extraction_content = extraction_response.candidates[0].content
+                            self.conversation_history.append(extraction_content)
+                            # Stop attaching the file after ingestion
+                            self.active_files = []
+                            print("\n✅ PDF context seeded.")
                         # No else needed, upload_pdf_for_gemini prints errors
                     else:
                         print("\n⚠️ Usage: /upload <relative/path/to/your/file.pdf>")
                     continue # Skip sending this command to the model
 
-                elif user_input.lower() == "/clearfiles":
-                    if self.active_files:
-                        print("\n🧹 Clearing active files:")
-                        for f in self.active_files:
-                            print(f"   - {f.display_name} ({f.name})")
-                            # Optional: Delete the file on Google's side
-                            try:
-                                self.client.files.delete(name=f.name)
-                                print(f"     (Deleted from cloud storage)")
-                            except Exception as delete_e:
-                                print(f"     (Could not delete from cloud: {delete_e})")
-                        self.active_files = []
-                        print("\n✅ Active files cleared.")
-                    else:
-                        print("\nℹ️ No active files to clear.")
+                elif user_input.lower() == "/reset":
+                    print("\n🎯 Resetting context and starting a new chat session...")
+                    self.chat = self.client.chats.create(model=self.model_name, history=[])
+                    self.conversation_history = []
+                    self.current_token_count = 0
+                    print("\n✅ Chat session and history cleared.")
                     continue # Skip sending this command to the model
 
                 # --- Prepare message content (Text + Files) ---
@@ -188,12 +187,12 @@ class CodeAgent:
 
                 # Calculate and store token count for the *next* prompt
                 try:
-                    # Count tokens with the current API pattern
-                    token_count_response = self.client.count_tokens(
+                    # Get token count via the models endpoint
+                    token_count_response = self.client.models.count_tokens(
                         model=self.model_name,
-                        contents=self.conversation_history # Use the updated manual history
+                        contents=self.conversation_history
                     )
-                    self.current_token_count = token_count_response.total_token_count
+                    self.current_token_count = token_count_response.total_tokens
                 except Exception as count_error:
                     # Don't block interaction if counting fails, just report it and keep old count
                     print(f"\n⚠️ \x1b[93mCould not update token count: {count_error}\x1b[0m")

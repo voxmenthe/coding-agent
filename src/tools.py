@@ -283,11 +283,15 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
             return None
 
         print(f"\n\u2692\ufe0f Uploading '{target_path.name}'...")
-        # Create client instance for file operations
-        client = genai.Client()
+        # Initialize Gemini client with API key
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            print(f"\n\u001b[31mError: GEMINI_API_KEY environment variable not set.\nPlease export your API key before uploading PDFs.\u001b[0m")
+            return None
+        client = genai.Client(api_key=api_key)
+
         # Use display_name for user-friendliness
-        pdf_file = client.files.upload(file=target_path,
-                              display_name=target_path.name)
+        pdf_file = client.files.upload(file=target_path)
         print(f"\u2705 Uploaded '{pdf_file.display_name}' as: {pdf_file.name}")
         print("⏳ Waiting for processing...")
 
