@@ -4,6 +4,12 @@ from docker.errors import DockerException
 from pathlib import Path
 import subprocess
 import os
+import requests
+import feedparser
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from src.find_arxiv_papers import build_query, fetch_entries # build_query now in find_arxiv_papers.py
 
 # --- Project Root ---
 project_root = Path(__file__).resolve().parents[1]
@@ -179,3 +185,61 @@ def run_in_sandbox(command: str) -> str:
         error_msg = f"Unexpected error during sandbox execution: {e}"
         print(f"\n\u274c {error_msg}")
         return f"Error: {error_msg}"
+
+def get_current_date_and_time(timezone: str) -> str:
+    """Returns the current date and time as ISO 8601 string in the specified timezone. Default is PST (America/Los_Angeles) if an invalid timezone is provided."""
+    try:
+        print(f"\n\u2692\ufe0f Tool: Getting current date and time for timezone: {timezone}")
+        tz = ZoneInfo(timezone)
+    except Exception as e:
+        print(f"Error: Invalid timezone '{timezone}' provided. Using default: America/Los_Angeles")
+        tz = ZoneInfo('America/Los_Angeles')
+    now = datetime.now(tz)
+    return now.isoformat()
+
+def find_arxiv_papers(keywords: str, start_date: str, end_date: str, max_results: int) -> str:
+    """Search arXiv for papers based on keywords and date range.
+
+    Args:
+        keywords: A string containing space-separated keywords or phrases to search for.
+                  Use ' OR ' to separate distinct search terms/phrases (e.g., '"llm reasoning" OR grpo').
+                  Provide meaningful keywords; logical operators like standalone 'and'/'or' will be ignored.
+        start_date: Inclusive start date (YYYY-MM-DD).
+        end_date: Inclusive end date (YYYY-MM-DD).
+        max_results: Maximum number of results to return.
+
+    Returns:
+        JSON string of papers with title, link, summary, and published date."""
+    # Parse date range
+    try:
+        start_dt = datetime.fromisoformat(start_date)
+        end_dt = datetime.fromisoformat(end_date)
+    except Exception:
+        raise ValueError("start_date and end_date must be in YYYY-MM-DD format")
+    # Define categories and keywords
+    categories = ['cs.*', 'stat.*']
+    # Split by ' OR ', convert to lowercase, and strip whitespace
+    raw_keywords = [kw.strip().lower() for kw in keywords.split(' OR ') if kw.strip()]
+    processed_keywords = [kw for kw in raw_keywords if kw not in ('and', 'or')]
+    # Build query and fetch entries
+    query = build_query(categories, processed_keywords)
+    print(f"\n🔍 Arxiv search query: {query} | dates: {start_date} to {end_date} | max_results: {max_results}")
+    entries = fetch_entries(query, max_results=max_results, verbose=False)
+    print(f"\n🔍 Raw entries fetched: {len(entries)}")
+    # Filter by publication date and format
+    results = []
+    for entry in entries:
+        pub_str = entry.published[:10]
+        pub_dt = datetime.fromisoformat(pub_str)
+        if start_dt <= pub_dt <= end_dt:
+            results.append({
+                "title": entry.title.strip(),
+                "link": entry.link,
+                "summary": entry.summary.strip(),
+                "published": pub_str
+            })
+            if len(results) >= max_results:
+                break
+    import json
+    print(f"\n🔍 Filtered entries count: {len(results)}")
+    return json.dumps(results, indent=2)

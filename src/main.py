@@ -3,11 +3,14 @@ from google.genai import types
 import os
 import sys
 from pathlib import Path
-from src.tools import read_file, list_files, edit_file, execute_bash_command, run_in_sandbox
+from src.tools import read_file, list_files, edit_file, execute_bash_command, run_in_sandbox, find_arxiv_papers, get_current_date_and_time
 import traceback
+import argparse
+import functools
 
 # Choose your Gemini model - unless you want something crazy "gemini-2.5-flash-preview-04-17" is the default model
-MODEL_NAME = "gemini-2.5-flash-preview-04-17" 
+MODEL_NAME = "gemini-2.5-flash-preview-04-17"
+DEFAULT_THINKING_BUDGET = 256
 
 # Define project root - needed here for agent initialization
 project_root = Path(__file__).resolve().parents[1]
@@ -16,9 +19,10 @@ project_root = Path(__file__).resolve().parents[1]
 class CodeAgent:
     """A simple coding agent using Google Gemini (google-genai SDK)."""
 
-    def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash-preview-04-17"):
+    def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash-preview-04-17", verbose: bool = False):
         """Initializes the agent with API key and model name."""
         self.api_key = api_key
+        self.verbose = verbose
         self.model_name = f'models/{model_name}' # Add 'models/' prefix
         # Use imported tool functions
         self.tool_functions = [
@@ -26,8 +30,12 @@ class CodeAgent:
             list_files,
             edit_file,
             execute_bash_command,
-            run_in_sandbox
+            run_in_sandbox,
+            find_arxiv_papers,
+            get_current_date_and_time
         ]
+        if self.verbose:
+            self.tool_functions = [self._make_verbose_tool(f) for f in self.tool_functions]
         self.client = None
         self.chat = None
         self.conversation_history = [] # Manual history for token counting ONLY
@@ -66,11 +74,11 @@ class CodeAgent:
 
         # Prompt for thinking budget per session
         try:
-            budget_input = input("Enter thinking budget (0 to 24000) for this session [1024]: ").strip()
-            self.thinking_budget = int(budget_input) if budget_input else 1024
+            budget_input = input(f"Enter thinking budget (0 to 24000) for this session [{DEFAULT_THINKING_BUDGET}]: ").strip()
+            self.thinking_budget = int(budget_input) if budget_input else DEFAULT_THINKING_BUDGET
         except ValueError:
-            print("⚠️ Invalid thinking budget. Using default of 1024.")
-            self.thinking_budget = 1024
+            print(f"⚠️ Invalid thinking budget. Using default of {DEFAULT_THINKING_BUDGET}.")
+            self.thinking_budget = DEFAULT_THINKING_BUDGET
         self.thinking_config = types.ThinkingConfig(thinking_budget=self.thinking_budget)
 
         # Prepare tool config with thinking_config
@@ -133,8 +141,21 @@ class CodeAgent:
                 print(f"\n🔴 \x1b[91mAn error occurred during interaction: {e}\x1b[0m")
                 traceback.print_exc() # Print traceback for debugging
 
+    def _make_verbose_tool(self, func):
+        """Wrap tool function to print verbose info when called."""
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            print(f"\n🔧 Tool called: {func.__name__}, args: {args}, kwargs: {kwargs}")
+            result = func(*args, **kwargs)
+            print(f"\n▶️ Tool result ({func.__name__}): {result}")
+            return result
+        return wrapper
+
 # --- Main Execution ---
 def main():
+    parser = argparse.ArgumentParser(description="Run the Code Agent")
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose tool logging')
+    args = parser.parse_args()
     print("🚀 Starting Code Agent...")
     api_key = os.getenv('GEMINI_API_KEY')
 
@@ -143,7 +164,7 @@ def main():
     # import src.tools
     # src.tools.project_root = project_root
 
-    agent = CodeAgent(api_key=api_key, model_name=MODEL_NAME)
+    agent = CodeAgent(api_key=api_key, model_name=MODEL_NAME, verbose=args.verbose)
     agent.start_interaction()
 
 if __name__ == "__main__":
