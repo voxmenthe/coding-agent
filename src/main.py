@@ -3,7 +3,11 @@ from google.genai import types
 import os
 import sys
 from pathlib import Path
-from src.tools import read_file, list_files, edit_file, execute_bash_command, run_in_sandbox, find_arxiv_papers, get_current_date_and_time
+from src.tools import (
+    read_file, list_files, edit_file, execute_bash_command,
+    run_in_sandbox, find_arxiv_papers, get_current_date_and_time,
+    upload_pdf_for_gemini
+)
 import traceback
 import argparse
 import functools
@@ -40,13 +44,14 @@ class CodeAgent:
         self.chat = None
         self.conversation_history = [] # Manual history for token counting ONLY
         self.current_token_count = 0 # Store token count for the next prompt
+        self.active_files = [] # List to store active File objects
         self._configure_client()
 
     def _configure_client(self):
         """Configures the Google Generative AI client."""
         print("\n\u2692\ufe0f Configuring genai client...")
         try:
-
+            # Configure the client with our API key
             self.client = genai.Client(api_key=self.api_key)
             print("\u2705 Client configured successfully.")
         except Exception as e:
@@ -71,6 +76,8 @@ class CodeAgent:
             sys.exit(1)
 
         print("\n\u2692\ufe0f Agent ready. Ask me anything. Type 'exit' to quit.")
+        print("   Use '/upload <path/to/file.pdf>' to seed PDF into context.")
+        print("   Use '/reset' to clear the chat and start fresh.")
 
         # Prompt for thinking budget per session
         try:
@@ -87,7 +94,9 @@ class CodeAgent:
         while True:
             try:
                 # Display token count from *previous* turn in the prompt
-                prompt_text = f"\n🔵 You ({self.current_token_count}): "
+                # Also show number of active files
+                active_files_info = f" [{len(self.active_files)} files]" if self.active_files else ""
+                prompt_text = f"\n🔵 You ({self.current_token_count}{active_files_info}): "
                 user_input = input(prompt_text).strip()
 
                 if user_input.lower() in ["exit", "quit"]:
@@ -96,38 +105,92 @@ class CodeAgent:
                 if not user_input:
                     continue
 
-                # --- Update manual history (for token counting ONLY) --- 
+                # --- Handle User Commands --- 
+                if user_input.lower().startswith("/upload "):
+                    pdf_path_str = user_input[len("/upload "):].strip()
+                    if pdf_path_str:
+                        # Make sure genai is configured before calling upload
+                        if not self.client:
+                             self._configure_client()
+                             if not self.client:
+                                 print("\n\u274c Cannot upload: genai client not configured.")
+                                 continue # Skip to next loop iteration
+                        # Call the upload function (which prints status)
+                        uploaded_file = upload_pdf_for_gemini(pdf_path_str)
+                        if uploaded_file:
+                            print("\n⚒️ Extracting text from PDF to seed context...")
+                            extraction_response = self.chat.send_message(
+                                message=[uploaded_file, "\n\nExtract the entire text of this PDF, organized by section. Include all tables, and figures (full descriptions where appropriate in place of images)."],
+                                config=tool_config
+                            )
+                            extraction_content = extraction_response.candidates[0].content
+                            self.conversation_history.append(extraction_content)
+                            # Stop attaching the file after ingestion
+                            self.active_files = []
+                            print("\n✅ PDF context seeded.")
+                        # No else needed, upload_pdf_for_gemini prints errors
+                    else:
+                        print("\n⚠️ Usage: /upload <relative/path/to/your/file.pdf>")
+                    continue # Skip sending this command to the model
+
+                elif user_input.lower() == "/reset":
+                    print("\n🎯 Resetting context and starting a new chat session...")
+                    self.chat = self.client.chats.create(model=self.model_name, history=[])
+                    self.conversation_history = []
+                    self.current_token_count = 0
+                    print("\n✅ Chat session and history cleared.")
+                    continue # Skip sending this command to the model
+
+                # --- Prepare message content (Text + Files) ---
+                message_content = [user_input] # Start with user text
+                if self.active_files:
+                    message_content.extend(self.active_files) # Add file objects
+                    if self.verbose:
+                        print(f"\n📎 Attaching {len(self.active_files)} files to the prompt:")
+                        for f in self.active_files:
+                            print(f"   - {f.display_name} ({f.name})")
+
+                # --- Update manual history (for token counting ONLY - Use Text Only) --- 
                 # Add user message BEFORE sending to model
+                # Store only the text part for history counting simplicity
                 new_user_content = types.Content(parts=[types.Part(text=user_input)], role="user")
                 self.conversation_history.append(new_user_content)
 
-                # --- Keep existing Tool Config and Send Message call --- 
+                # --- Send Message --- 
                 print("\n⏳ Sending message and processing...")
-                # Prepare tool configuration (Assuming this structure is correct based on earlier state/memory)
+                # Prepare tool configuration
                 tool_config = types.GenerateContentConfig(tools=self.tool_functions, thinking_config=self.thinking_config)
 
                 # Send message using the chat object's send_message method
+                # Pass the potentially combined list of text and files
                 response = self.chat.send_message(
-                    message=user_input, # Pass only the new user input here
-                    config=tool_config # Use 'config' kwarg with GenerateContentConfig
+                    message=message_content, # Pass the list here
+                    config=tool_config
                 )
 
                 # --- Update manual history and calculate new token count AFTER response --- 
                 agent_response_content = None
+                response_text = "" # Initialize empty response text
                 if response.candidates and response.candidates[0].content:
                     agent_response_content = response.candidates[0].content
+                    # Ensure we extract text even if other parts exist (e.g., tool calls)
+                    if agent_response_content.parts:
+                         # Simple concatenation of text parts for history
+                         response_text = " ".join(p.text for p in agent_response_content.parts if hasattr(p, 'text'))
                     self.conversation_history.append(agent_response_content)
                 else:
                     print("\n⚠️ Agent response did not contain content for history/counting.")
 
                 # Print agent's response text to user
-                print(f"\n🟢 \x1b[92mAgent:\x1b[0m {response.text}")
+                # Use the extracted response_text or response.text as fallback
+                print(f"\n🟢 \x1b[92mAgent:\x1b[0m {response_text or response.text}")
 
                 # Calculate and store token count for the *next* prompt
                 try:
+                    # Get token count via the models endpoint
                     token_count_response = self.client.models.count_tokens(
                         model=self.model_name,
-                        contents=self.conversation_history # Use the updated manual history
+                        contents=self.conversation_history
                     )
                     self.current_token_count = token_count_response.total_tokens
                 except Exception as count_error:
@@ -165,6 +228,8 @@ def main():
     # src.tools.project_root = project_root
 
     agent = CodeAgent(api_key=api_key, model_name=MODEL_NAME, verbose=args.verbose)
+    # Ensure agent's client is configured before starting interaction
+    # This happens inside start_interaction now
     agent.start_interaction()
 
 if __name__ == "__main__":
