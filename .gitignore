@@ -8,3 +8,4 @@ __pycache__
 .git*
 **/.git*search*.txt
 **/search*.txt
+**/*.pdf
