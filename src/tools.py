@@ -10,6 +10,9 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from src.find_arxiv_papers import build_query, fetch_entries # build_query now in find_arxiv_papers.py
+from google import genai # Current import pattern
+from google.genai import types # Current import pattern
+import time # Added import
 
 # --- Project Root ---
 project_root = Path(__file__).resolve().parents[1]
@@ -243,3 +246,92 @@ def find_arxiv_papers(keywords: str, start_date: str, end_date: str, max_results
     import json
     print(f"\n🔍 Filtered entries count: {len(results)}")
     return json.dumps(results, indent=2)
+
+def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
+    """
+    Uploads a PDF file relative to the project root to Google Gemini
+    using the File API and waits for it to be processed.
+
+    Args:
+        pdf_path_str: The path to the PDF file, relative to the project root.
+
+    Returns:
+        A google.generativeai.types.File object if successful, None otherwise.
+        Prints errors to console.
+    """
+    # Ensure project_root is accessible. Define it globally or pass it.
+    # For now, assuming it's defined globally in this module like in main.py
+    global project_root
+    if 'project_root' not in globals():
+         # Attempt to define it if not present (adjust path as needed)
+         project_root = Path(__file__).resolve().parents[1]
+         print("⚠️ 'project_root' was not defined globally in tools.py, attempting definition.")
+         # If this fails, you might need a more robust way to share project_root
+
+    try:
+        target_path = (project_root / pdf_path_str).resolve()
+
+        # Security check: Ensure path is within the project directory
+        if not target_path.is_relative_to(project_root):
+            print(f"\n\u274c Error: Access denied. Path '{pdf_path_str}' is outside the project directory.")
+            return None
+        if not target_path.is_file():
+            print(f"\n\u274c Error: PDF file not found at resolved path '{target_path}'")
+            return None
+        if target_path.suffix.lower() != ".pdf":
+            print(f"\n\u274c Error: File '{target_path.name}' is not a PDF.")
+            return None
+
+        print(f"\n\u2692\ufe0f Uploading '{target_path.name}'...")
+        # Create client instance for file operations
+        client = genai.Client()
+        # Use display_name for user-friendliness
+        pdf_file = client.files.upload(file=target_path,
+                              display_name=target_path.name)
+        print(f"\u2705 Uploaded '{pdf_file.display_name}' as: {pdf_file.name}")
+        print("⏳ Waiting for processing...")
+
+        # Wait for the file to be processed. Add a timeout?
+        start_time = time.time()
+        timeout_seconds = 120 # 2 minutes timeout for processing
+        while pdf_file.state.name == "PROCESSING":
+            if time.time() - start_time > timeout_seconds:
+                 print(f"\n\u274c Error: File processing timed out after {timeout_seconds} seconds for {pdf_file.name}.")
+                 # Attempt to delete the potentially stuck file
+                 try:
+                     client.files.delete(name=pdf_file.name)
+                     print(f"🧹 Cleaned up timed-out file: {pdf_file.name}")
+                 except Exception as delete_e:
+                     print(f"⚠️ Could not delete timed-out file {pdf_file.name}: {delete_e}")
+                 return None
+
+            time.sleep(5) # Wait 5 seconds before checking again
+            pdf_file = client.files.get(name=pdf_file.name) # Refresh file state
+            print(f"   Current state: {pdf_file.state.name}")
+
+        if pdf_file.state.name == "ACTIVE":
+            print(f"\u2705 File '{pdf_file.display_name}' is ready.")
+            return pdf_file
+        else:
+            print(f"\n\u274c Error: File processing failed for '{pdf_file.display_name}'. Final State: {pdf_file.state.name}")
+            # Consider deleting the failed file
+            try:
+                 client.files.delete(name=pdf_file.name)
+                 print(f"🧹 Cleaned up failed file: {pdf_file.name}")
+            except Exception as delete_e:
+                 print(f"⚠️ Could not delete failed file {pdf_file.name}: {delete_e}")
+            return None
+
+    except Exception as e:
+        print(f"\n\u274c An error occurred during PDF upload/processing: {e}")
+        # Attempt to clean up if a file object was created but failed later
+        if 'pdf_file' in locals() and hasattr(pdf_file, 'name'):
+             try:
+                 print(f"🧹 Attempting to delete potentially failed upload: {pdf_file.name}")
+                 client.files.delete(name=pdf_file.name)
+             except Exception as delete_e:
+                 print(f"⚠️ Could not delete file during error cleanup: {delete_e}")
+        return None
+
+# Note: This function should NOT be added to the list of tools passed to Gemini
+# as it's meant to be called directly by the agent application logic.
