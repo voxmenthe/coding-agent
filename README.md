@@ -9,6 +9,7 @@ The agent can:
 - Interact with your local file system (read, list, edit files).
 - Execute shell commands.
 - Run commands within a secure Docker sandbox (no network access, resource limits).
+- Find arxiv papers.
 - Maintain conversation history.
 - Display the token count of the current conversation context in the input prompt.
 
@@ -16,6 +17,7 @@ The agent can:
 
 - **Interactive Chat:** Engage in a conversational manner with the AI.
 - **File Operations:** Ask the agent to read, list, or modify files within the project directory.
+- **Arxiv Search:** Ask the agent to find arxiv papers from cs or stat categories matching keywords.
 - **Command Execution:** Request the agent to run shell commands in the project's context.
 - **Sandboxed Execution:** Safely run potentially risky commands in an isolated Docker container using the `run_in_sandbox` tool (requires Docker).
 - **Tool Integration:** Leverages Gemini's function calling capabilities to use defined Python tools.
