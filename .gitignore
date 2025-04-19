@@ -6,4 +6,5 @@ creds.py
 **/__pycache__
 __pycache__
 .git*
-**/.git*
+**/.git*search*.txt
+**/search*.txt
