@@ -79,6 +79,7 @@ coding-agent
     - "Edit README.md and add a section about future plans"
     - "run the command 'ls -l'"
     - "run 'pip list' in the sandbox"
+    - "Browse https://www.example.com and summarize the page content."
 - The number in parentheses indicates the approximate token count of the conversation history that will be sent with your *next* message.
 
 ### 📄 Working with PDFs

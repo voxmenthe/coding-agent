@@ -15,6 +15,9 @@ poetry lock
 # Install dependencies and the project
 poetry install
 
+# Install Playwright
+poetry run playwright install
+
 # Create and install the IPython kernel for the project
 # poetry run python -m python -m ipykernel install --user --name=crv3 --display-name "Clever Routing v3"
 # poetry run python -m ipykernel install --sys-prefix --name=crv3 --display-name "Clever Routing v3"

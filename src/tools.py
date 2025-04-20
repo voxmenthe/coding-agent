@@ -13,6 +13,11 @@ from src.find_arxiv_papers import build_query, fetch_entries # build_query now i
 from google import genai # Current import pattern
 from google.genai import types # Current import pattern
 import time # Added import
+import asyncio
+from browser_use.browser.browser import BrowserContext
+from browser_use import Agent, Browser, BrowserContextConfig, BrowserConfig
+from langchain_google_genai import ChatGoogleGenerativeAI
+
 
 # --- Project Root ---
 project_root = Path(__file__).resolve().parents[1]
@@ -286,7 +291,7 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
         # Initialize Gemini client with API key
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            print(f"\n\u001b[31mError: GEMINI_API_KEY environment variable not set.\nPlease export your API key before uploading PDFs.\u001b[0m")
+            print(f"\n[31mError: GEMINI_API_KEY environment variable not set.\nPlease export your API key before uploading PDFs.[0m")
             return None
         client = genai.Client(api_key=api_key)
 
@@ -318,7 +323,7 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
             return pdf_file
         else:
             print(f"\n\u274c Error: File processing failed for '{pdf_file.display_name}'. Final State: {pdf_file.state.name}")
-            # Consider deleting the failed file
+             # Consider deleting the failed file
             try:
                  client.files.delete(name=pdf_file.name)
                  print(f"🧹 Cleaned up failed file: {pdf_file.name}")
@@ -337,5 +342,111 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
                  print(f"⚠️ Could not delete file during error cleanup: {delete_e}")
         return None
 
-# Note: This function should NOT be added to the list of tools passed to Gemini
-# as it's meant to be called directly by the agent application logic.
+# --- Tool Function: Browse URL on Web ---
+def browse_url_on_web(url: str) -> str:
+    """Tool: Browse a specific provided URL using a headless browser and return its HTML content (fallback to HTTP GET)."""
+    print(f"\n🧭 Tool: Browsing URL: {url}")
+    try:
+        async def _browse():
+            browser = Browser(config=BrowserConfig(headless=True))
+            context = BrowserContext(
+                browser=browser,
+                config=BrowserContextConfig(
+                    wait_for_network_idle_page_load_time=5.0,
+                    highlight_elements=False,
+                ),
+            )
+            await context.open_tab({"url": url})
+            pages = getattr(context, 'pages', None) or getattr(browser, 'pages', None)
+            if pages:
+                return await pages[0].content()
+            return ""
+        content = asyncio.run(_browse())
+        if content:
+            return content
+    except Exception as e:
+        print(f"\n⚠️ browse_url_on_web exception: {e}")
+    try:
+        response = requests.get(url)
+        return response.text
+    except Exception as e:
+        return f"Error fetching URL {url}: {e}"
+
+# --- Tool Function: Browse Web ---
+# --- Tool Function: Browse Web ---
+def browse_web(params: dict) -> str:
+    """Tool: Browse the web using browser_use.
+    params keys:
+        url (str): URL to open (default https://www.google.com)
+        headless (bool): headless mode (default True)
+        highlight (bool): highlight elements (default False)
+        record (bool): save recording (default False)
+        wait_time (float): wait seconds for network idle (default 5.0)
+        task (str): specific task to perform (e.g., "Click on the first search result")
+    Returns HTML content or error string."""
+    url = params.get("url", "https://www.google.com")
+    headless = params.get("headless", True)
+    highlight = params.get("highlight", False)
+    record = params.get("record", False)
+    wait_time = params.get("wait_time", 5.0)
+    task = params.get("task", "Extract the content of this page")
+    
+    print(f"\n🧭 Tool: browse_web params: url={url}, headless={headless}, highlight={highlight}, record={record}, wait_time={wait_time}, task={task}")
+    
+    try:
+        async def _browse_with_agent():
+            # Get the API key from environment
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                return "Error: GEMINI_API_KEY environment variable not set"
+            
+            # Setup LLM
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-2.5-flash-preview-04-17",
+                google_api_key=api_key
+            )
+            
+            # Configure browser settings
+            browser_config = BrowserConfig(headless=headless)
+            context_config = BrowserContextConfig(
+                wait_for_network_idle_page_load_time=wait_time,
+                highlight_elements=highlight,
+                save_recording_path="./recordings" if record else None
+            )
+            
+            # Create a browser
+            browser = Browser(config=browser_config)
+            
+            # Create a browser context with the specified config
+            context = BrowserContext(
+                browser=browser,
+                config=context_config,
+            )
+            
+            # Set up initial actions to navigate to the URL
+            initial_actions = [{"open_tab": {"url": url}}]
+            
+            # Create and run the agent
+            agent = Agent(
+                task=task,
+                llm=llm,
+                browser=browser, # Pass the browser instance
+                browser_context=context, # Pass the configured context
+                use_vision=True,
+                generate_gif=record,
+                initial_actions=initial_actions
+            )
+            
+            # Run the agent
+            result = await agent.run()
+            
+            # Get the final result
+            return result.final_result() if result else "No result from browser agent"
+        
+        # Run the async function
+        result = asyncio.run(_browse_with_agent())
+        return result
+    except Exception as e:
+        print(f"\n⚠️ browse_web exception: {e}")
+        print("\nℹ️ Falling back to HTTP GET using browse_url_on_web")
+        return browse_url_on_web(url)
