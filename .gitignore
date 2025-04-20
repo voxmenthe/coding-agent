@@ -9,3 +9,5 @@ __pycache__
 **/.git*search*.txt
 **/search*.txt
 **/*.pdf
+agent_history.gif
+recordings

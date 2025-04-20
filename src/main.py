@@ -6,7 +6,7 @@ from pathlib import Path
 from src.tools import (
     read_file, list_files, edit_file, execute_bash_command,
     run_in_sandbox, find_arxiv_papers, get_current_date_and_time,
-    upload_pdf_for_gemini
+    upload_pdf_for_gemini, google_search, open_url
 )
 import traceback
 import argparse
@@ -36,7 +36,9 @@ class CodeAgent:
             execute_bash_command,
             run_in_sandbox,
             find_arxiv_papers,
-            get_current_date_and_time
+            get_current_date_and_time,
+            google_search,
+            open_url
         ]
         if self.verbose:
             self.tool_functions = [self._make_verbose_tool(f) for f in self.tool_functions]
