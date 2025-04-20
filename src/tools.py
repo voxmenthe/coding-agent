@@ -13,6 +13,10 @@ from src.find_arxiv_papers import build_query, fetch_entries # build_query now i
 from google import genai # Current import pattern
 from google.genai import types # Current import pattern
 import time # Added import
+import asyncio
+from pydantic import SecretStr
+from langchain_google_genai import ChatGoogleGenerativeAI
+from src.browser_use import setup_browser, agent_loop
 
 # --- Project Root ---
 project_root = Path(__file__).resolve().parents[1]
@@ -336,6 +340,42 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
              except Exception as delete_e:
                  print(f"⚠️ Could not delete file during error cleanup: {delete_e}")
         return None
+
+def google_search(query: str) -> str:
+    """Search Google for the given query using browser-use and return JSON-formatted results."""
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17"),
+            api_key=SecretStr(os.getenv("GEMINI_API_KEY"))
+        )
+        browser, context = asyncio.run(setup_browser(headless=True))
+        result = asyncio.run(agent_loop(
+            llm,
+            context,
+            f"Search Google for '{query}' and extract the first 10 results as JSON list of {{'title','url'}}.",
+            initial_url=f"https://www.google.com/search?q={query}"
+        ))
+        return result or "No results."
+    except Exception as e:
+        return f"Error during google_search: {e}"
+
+def open_url(url: str) -> str:
+    """Open a URL using browser-use and return the page's visible text content."""
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17"),
+            api_key=SecretStr(os.getenv("GEMINI_API_KEY"))
+        )
+        browser, context = asyncio.run(setup_browser(headless=True))
+        result = asyncio.run(agent_loop(
+            llm,
+            context,
+            f"Extract and return visible text content from the page at: {url}.",
+            initial_url=url
+        ))
+        return result or "No content."
+    except Exception as e:
+        return f"Error during open_url: {e}"
 
 # Note: This function should NOT be added to the list of tools passed to Gemini
 # as it's meant to be called directly by the agent application logic.
