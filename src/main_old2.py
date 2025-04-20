@@ -11,8 +11,8 @@ import textwrap
 import traceback
 import argparse
 
-import google.generativeai as genai
-from google.generativeai import types
+import google.genai as genai
+from google.genai import types
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from langchain_google_genai import ChatGoogleGenerativeAI # Moved here
 
@@ -46,10 +46,11 @@ DEFAULT_THINKING_BUDGET = 256
 class CodeAgent:
     def __init__(self, config: Config):
         self.config = config
-        self.api_key = config.get_api_key()
+        self.api_key = config.get_api_key() # Still need the key for Langchain/explicit client
         self.model_name = config.get_model_name()
         self.verbose = config.is_verbose()
         self.client = None
+        self.model = None
         self.chat_session = None
         self.llm = None # To store the Langchain LLM instance
         self.thinking_budget = config.get_default_thinking_budget()
@@ -130,25 +131,33 @@ class CodeAgent:
         logger.info("⚒️ Configuring genai client...")
         try:
             if not self.api_key:
-                logger.error("❌ GEMINI_API_KEY not found. Please set the environment variable.")
-                sys.exit(1)
+                logger.warning("⚠️ GEMINI_API_KEY/GOOGLE_API_KEY not found explicitly. Relying on environment variable for genai.Client(). Ensure GOOGLE_API_KEY is set.")
+                # sys.exit(1)
+            else:
+                 # Still configure the API key for potential direct use or Langchain
+                 # genai.configure is not used with genai.Client() in the new SDK
+                 pass
 
-            genai.configure(
-                api_key=self.api_key,
-                # transport="rest", # Optional: Use REST for broader compatibility
-                # client_options={"api_endpoint": "..."} # Optional: Specify endpoint
-            )
-            # Use a compatible model name for the Python SDK client
-            # TODO: Verify model name compatibility if issues arise
-            self.client = genai.GenerativeModel(
-                 model_name=self.model_name, # e.g., 'gemini-1.5-flash-latest' or 'gemini-1.5-pro-latest'
-                 safety_settings={
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                }
-             )
+            # Initialize the client using the new SDK style
+            # It will automatically pick up GOOGLE_API_KEY env var if api_key is not passed
+            self.client = genai.Client()
+
+            # Model interaction is done via client.get_model or client.generate_content etc.
+            # Let's get the specific model instance we'll use for chat
+            self.model = self.client.get_model(f"models/{self.model_name}") # Use client.get_model
+
+            # Check if the model instance supports tools directly (new SDK might differ)
+            # We might need to pass tools during chat start or send_message
+            # self.model = genai.GenerativeModel(
+            #    model_name=self.model_name,
+            #    tools=self.tool_schemas, # Pass generated tool schemas here?
+            #    safety_settings={
+            #        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            #        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            #        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            #        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+            #    }
+            # )
 
             # Setup Langchain LLM for browser_use Agent
             self.llm = ChatGoogleGenerativeAI(
@@ -174,7 +183,7 @@ class CodeAgent:
         try:
             # Start_chat is synchronous in google-generativeai v0.5+
             # No await needed here. Handle potential history if needed.
-            self.chat_session = self.client.start_chat(
+            self.chat_session = self.model.start_chat(
                 enable_automatic_function_calling=True,
                 history=[] # Start fresh history for this session
             )
@@ -228,67 +237,80 @@ class CodeAgent:
         # We need the registered functions later in _handle_function_call.
         return tools_dict # Keep returning dict for _handle_function_call lookup
 
+    async def browse_web(self, params: dict) -> str:
+        """Tool: Browse the web using browser_use. Handles URLs and tasks.
+        params keys:
+            url (str): URL to open (required if no context/task implies it).
+            task (str): Specific task to perform (e.g., "Click login", "Extract prices").
+            headless (bool): Run headless (default uses agent setting, often True).
+            highlight (bool): Highlight elements (default False).
+            record (bool): Save recording (default False).
+            wait_time (float): Wait seconds for network idle (default 5.0).
+        Returns HTML content, task result, or error string.
+        """
+        url = params.get("url")
+        task = params.get("task", "Describe the content of this page.") # Default task
+        # Defaults for browser settings - can be overridden by params if needed
+        headless = params.get("headless", True) # Default to headless
+        highlight = params.get("highlight", False)
+        record = params.get("record", False)
+        wait_time = params.get("wait_time", 5.0)
 
-    async def _send_message(self, user_input: str):
-        """Sends a message to the chat session and handles responses/function calls."""
-        if not self.chat_session:
-            return "Chat session not initialized."
+        logger.info(f"\n🧭 Tool: browse_web params: url={url}, task='{task}', headless={headless}, highlight={highlight}, record={record}, wait_time={wait_time}")
+
+        # Check if browser context and LLM are initialized
+        if not self.browser_context:
+            return "Error: Browser context is not initialized. Cannot browse."
+        if not self.llm:
+            return "Error: LLM for browser agent is not initialized. Cannot browse."
 
         try:
-            # --- Append user message to local history for display ---
-            self.conversation_history.append({"role": "user", "parts": [user_input]})
+            # Configure browser settings for this specific call if needed
+            # This might override the context's initial config - check browser_use docs
+            context_config_overrides = BrowserContextConfig(
+                wait_for_network_idle_page_load_time=wait_time,
+                highlight_elements=highlight,
+                save_recording_path="./recordings" if record else None
+            )
+            # TODO: Check if context config can be updated per-call or needs new context
+            # For now, we assume the Agent uses the provided context's config.
 
-            # --- Send Message to Gemini ---
-            # Use the potentially updated registered tools dictionary
-            # For automatic function calling, tool_config might not be needed here anymore
-            # if enable_automatic_function_calling=True was set in start_chat.
-            # Verify this with the library version documentation.
-            # Let's assume we still pass it for clarity or older versions.
-            tool_config = types.ToolConfig(
-                 function_calling_config=types.FunctionCallingConfig(
-                     mode=types.FunctionCallingConfig.Mode.AUTO # or ANY or NONE
-                 )
-             )
-            response = await self.chat_session.send_message_async(
-                user_input,
-                # stream=False, # Use False for simpler handling now
-                # tool_config=tool_config # Pass tool config if needed by version
+            # Set up initial actions *only if* a specific URL is given for this task
+            initial_actions = []
+            if url:
+                initial_actions.append({"open_tab": {"url": url}})
+            elif not self.browser_context.pages: # If no URL and no pages open, open default
+                default_url = "https://www.google.com"
+                logger.warning(f"⚠️ No URL provided and no active pages. Opening default: {default_url}")
+                initial_actions.append({"open_tab": {"url": default_url}})
+
+            # Create and run the agent using the persistent context
+            agent = Agent(
+                task=task,
+                llm=self.llm,
+                browser=self.browser, # Pass the main browser instance
+                browser_context=self.browser_context, # Use the persistent context
+                use_vision=True,
+                generate_gif=record,
+                initial_actions=initial_actions if initial_actions else None
+                # config=context_config_overrides # Check if Agent accepts config override
             )
 
-            # --- Handle Function Calls ---
-            while response.candidates[0].content.parts and response.candidates[0].content.parts[0].function_call:
-                function_call = response.candidates[0].content.parts[0].function_call
-                logger.info(f"⚙️ Function Call requested: {function_call.name}")
-                function_response_content = await self._handle_function_call(function_call)
+            # Run the agent asynchronously
+            result = await agent.run()
 
-                # --- Append function call & response to local history ---
-                self.conversation_history.append({"role": "model", "parts": [function_call]})
-                # Ensure function_response_content is serializable if needed
-                self.conversation_history.append({"role": "function", "parts": [function_response_content.parts[0]]}) # parts[0] assuming FunctionResponse structure
-
-                # --- Send Function Response back to Gemini ---
-                response = await self.chat_session.send_message_async(
-                    function_response_content,
-                    # tool_config=tool_config # Pass tool config if needed
-                )
-                # Loop continues if another function call is made
-
-            # --- Process Final Agent Response ---
-            response_text = ""
-            if response.candidates and response.candidates[0].content.parts:
-                 response_text = "".join(p.text for p in response.candidates[0].content.parts if hasattr(p, 'text'))
-                 # --- Append agent response to local history ---
-                 self.conversation_history.append({"role": "model", "parts": [part for part in response.candidates[0].content.parts]}) # Store full parts
-            else:
-                 logger.warning("⚠️ Agent response seemed empty.")
-                 response_text = "(Agent response was empty)"
-
-
-            return response_text
+            # Get the final result
+            final_result = result.final_result() if result else "No result from browser agent."
+            logger.info(f"  -> Browser agent final result: {final_result[:200]}...")
+            return final_result
 
         except Exception as e:
-            logger.error(f"❌ Error during message sending/processing: {e}\n{traceback.format_exc()}")
-            return f"Error processing message: {e}"
+            logger.error(f"\n⚠️ browse_web exception: {e}\n{traceback.format_exc()}")
+            # Fallback to simple HTTP GET if browser automation fails?
+            # Let's return the error for now, as fallback might lose context.
+            # Consider adding fallback using 'read_url_content' tool if needed.
+            # return read_url_content(url=url) # Example fallback
+            return f"Error during browser operation: {e}"
 
     async def _handle_function_call(self, function_call):
         """Handles a function call from the model."""
@@ -347,9 +369,6 @@ class CodeAgent:
              ]
         )
         return response_content
-
-
-    # <<< Define async def browse_web(self, params: dict) method here in the next step >>>
 
 
     def _make_verbose_tool(self, func):
@@ -420,7 +439,6 @@ async def main():
                     if not 0 <= agent.thinking_budget <= MAX_THINKING_BUDGET:
                         agent.thinking_budget = DEFAULT_THINKING_BUDGET
                         logger.warning(f"⚠️ Invalid budget. Using default: {agent.thinking_budget}")
-                # TODO: Update thinking budget in API call if library supports it dynamically
             except ValueError:
                 logger.warning(f"⚠️ Invalid input. Using previous budget: {agent.thinking_budget}")
 
