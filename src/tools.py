@@ -13,9 +13,10 @@ from src.find_arxiv_papers import build_query, fetch_entries # build_query now i
 from google import genai # Current import pattern
 from google.genai import types # Current import pattern
 import time # Added import
-
-# --- Project Root ---
-project_root = Path(__file__).resolve().parents[1]
+import asyncio
+from pydantic import SecretStr
+from langchain_google_genai import ChatGoogleGenerativeAI
+from src.browser_use import setup_browser, agent_loop
 
 # --- Helper Functions ---
 def _check_docker_running() -> tuple[bool, docker.DockerClient | None, str]:
@@ -36,13 +37,15 @@ def _check_docker_running() -> tuple[bool, docker.DockerClient | None, str]:
 
 # --- Tool Functions ---
 def read_file(path: str) -> str:
-    """Reads the content of a file at the given path."""
+    """Reads the content of a file at the given path relative to the current working directory."""
     print(f"\n\u2692\ufe0f Tool: Reading file: {path}")
     try:
-        # Security check: Ensure path is within the project directory
-        target_path = (project_root / path).resolve()
-        if not target_path.is_relative_to(project_root):
-            return "Error: Access denied. Path is outside the project directory."
+        # Security check: Ensure path is within the current working directory
+        cwd = Path(os.getcwd())
+        target_path = (cwd / path).resolve()
+        # Ensure the resolved path is still within the intended CWD scope
+        if not target_path.is_relative_to(cwd):
+            return "Error: Access denied. Path is outside the current working directory."
         if not target_path.is_file():
             return f"Error: File not found at {path}"
         return target_path.read_text()
@@ -50,13 +53,14 @@ def read_file(path: str) -> str:
         return f"Error reading file: {e}"
 
 def list_files(directory: str) -> str:
-    """Lists files in the specified directory relative to the project root."""
+    """Lists files in the specified directory relative to the current working directory."""
     print(f"\n\u2692\ufe0f Tool: Listing files in directory: {directory}")
     try:
-        target_dir = (project_root / directory).resolve()
-        # Security check: Ensure path is within the project directory
-        if not target_dir.is_relative_to(project_root):
-            return "Error: Access denied. Path is outside the project directory."
+        cwd = Path(os.getcwd())
+        target_dir = (cwd / directory).resolve()
+        # Security check: Ensure path is within the current working directory
+        if not target_dir.is_relative_to(cwd):
+            return "Error: Access denied. Path is outside the current working directory."
         if not target_dir.is_dir():
             return f"Error: Directory not found at {directory}"
 
@@ -66,7 +70,7 @@ def list_files(directory: str) -> str:
         return f"Error listing files: {e}"
 
 def edit_file(path: str, content: str) -> str:
-    """Writes or overwrites content to a file at the given path."""
+    """Writes or overwrites content to a file at the given path relative to the current working directory."""
     print(f"\n\u2692\ufe0f Tool: Editing file: {path}")
     try:
         # Security check: Ensure path is within the current working directory
@@ -83,7 +87,7 @@ def edit_file(path: str, content: str) -> str:
         return f"Error writing file: {e}"
 
 def execute_bash_command(command: str) -> str:
-    """Executes a whitelisted bash command in the project's root directory.
+    """Executes a whitelisted bash command in the current working directory.
 
     Allowed commands (including arguments):
     - ls ...
@@ -114,7 +118,7 @@ def execute_bash_command(command: str) -> str:
         return f"Error: Command '{command}' is not allowed. Only specific commands (ls, cat, git add/status/commit/push) are permitted."
 
     try:
-        # Execute the command in the project root directory
+        # Execute the command in the current working directory
         # Use shell=True cautiously, but it's simpler for handling complex commands/args here.
         # The whitelist check provides the primary security boundary.
         result = subprocess.run(
@@ -122,7 +126,7 @@ def execute_bash_command(command: str) -> str:
             shell=True, 
             capture_output=True, 
             text=True, 
-            cwd=project_root, # Ensure command runs in project root
+            cwd=os.getcwd(), # Ensure command runs in the current working directory
             check=False # Don't raise exception on non-zero exit code, handle manually
         )
         # --- Print stdout directly to console for visibility ---
@@ -336,6 +340,42 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
              except Exception as delete_e:
                  print(f"⚠️ Could not delete file during error cleanup: {delete_e}")
         return None
+
+def google_search(query: str) -> str:
+    """Search Google for the given query using browser-use and return JSON-formatted results."""
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17"),
+            api_key=SecretStr(os.getenv("GEMINI_API_KEY"))
+        )
+        browser, context = asyncio.run(setup_browser(headless=True))
+        result = asyncio.run(agent_loop(
+            llm,
+            context,
+            f"Search Google for '{query}' and extract the first 10 results as JSON list of {{'title','url'}}.",
+            initial_url=f"https://www.google.com/search?q={query}"
+        ))
+        return result or "No results."
+    except Exception as e:
+        return f"Error during google_search: {e}"
+
+def open_url(url: str) -> str:
+    """Open a URL using browser-use and return the page's visible text content."""
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17"),
+            api_key=SecretStr(os.getenv("GEMINI_API_KEY"))
+        )
+        browser, context = asyncio.run(setup_browser(headless=True))
+        result = asyncio.run(agent_loop(
+            llm,
+            context,
+            f"Extract and return visible text content from the page at: {url}.",
+            initial_url=url
+        ))
+        return result or "No content."
+    except Exception as e:
+        return f"Error during open_url: {e}"
 
 # Note: This function should NOT be added to the list of tools passed to Gemini
 # as it's meant to be called directly by the agent application logic.

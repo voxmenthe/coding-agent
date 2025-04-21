@@ -6,18 +6,16 @@ from pathlib import Path
 from src.tools import (
     read_file, list_files, edit_file, execute_bash_command,
     run_in_sandbox, find_arxiv_papers, get_current_date_and_time,
-    upload_pdf_for_gemini
+    upload_pdf_for_gemini, google_search, open_url
 )
 import traceback
 import argparse
 import functools
+import logging
 
 # Choose your Gemini model - unless you want something crazy "gemini-2.5-flash-preview-04-17" is the default model
 MODEL_NAME = "gemini-2.5-flash-preview-04-17"
 DEFAULT_THINKING_BUDGET = 256
-
-# Define project root - needed here for agent initialization
-project_root = Path(__file__).resolve().parents[1]
 
 # --- Code Agent Class ---
 class CodeAgent:
@@ -36,7 +34,9 @@ class CodeAgent:
             execute_bash_command,
             run_in_sandbox,
             find_arxiv_papers,
-            get_current_date_and_time
+            get_current_date_and_time,
+            google_search,
+            open_url
         ]
         if self.verbose:
             self.tool_functions = [self._make_verbose_tool(f) for f in self.tool_functions]
@@ -75,7 +75,7 @@ class CodeAgent:
             traceback.print_exc()
             sys.exit(1)
 
-        print("\n\u2692\ufe0f Agent ready. Ask me anything. Type 'exit' to quit.")
+        print("\n\u2692\ufe0f Agent ready. Ask me anything. Type '/exit' or '/q' to quit.")
         print("   Use '/upload <path/to/file.pdf>' to seed PDF into context.")
         print("   Use '/reset' to clear the chat and start fresh.")
 
@@ -99,7 +99,7 @@ class CodeAgent:
                 prompt_text = f"\n🔵 You ({self.current_token_count}{active_files_info}): "
                 user_input = input(prompt_text).strip()
 
-                if user_input.lower() in ["exit", "quit"]:
+                if user_input.lower() in ["exit", "quit", "/exit", "/quit", "/q"]:
                     print("\n👋 Goodbye!")
                     break
                 if not user_input:
@@ -226,6 +226,15 @@ def main():
     # (Though direct definition in tools.py is preferred)
     # import src.tools
     # src.tools.project_root = project_root
+
+    # Configure logging level based on verbose flag
+    level = logging.DEBUG if args.verbose else logging.WARNING
+    logging.basicConfig(format="%(levelname)s:%(name)s:%(message)s", level=level)
+    # Suppress verbose logs from external libraries
+    logging.getLogger('google_genai').setLevel(level)
+    logging.getLogger('browser_use').setLevel(level)
+    logging.getLogger('agent').setLevel(level)
+    logging.getLogger('controller').setLevel(level)
 
     agent = CodeAgent(api_key=api_key, model_name=MODEL_NAME, verbose=args.verbose)
     # Ensure agent's client is configured before starting interaction

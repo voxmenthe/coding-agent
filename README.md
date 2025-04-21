@@ -23,7 +23,9 @@ The agent can:
 - **Sandboxed Execution:** Safely run potentially risky commands in an isolated Docker container using the `run_in_sandbox` tool (requires Docker).
 - **Tool Integration:** Leverages Gemini's function calling capabilities to use defined Python tools.
 - **Context Token Count:** Displays the approximate token count for the next API call right in the prompt (e.g., `You (123):`).
-- **PDF Context Support:** Upload PDFs to include them in the conversation context for discussing document content.
+- **PDF Context Support:** Upload and discuss PDF documents using the Gemini File API.
+- **Web Search:** Query Google and return top results as a JSON list of titles and URLs using the `google_search` tool. *Warning: This tool can be very slow to return results and consumes a lot of tokens. Also web-search-related token use is not shown in the coding-agent's token count.*
+- **URL Browsing:** Visit any webpage and extract its visible text using the `open_url` tool.
 
 ## 🛠️ Setup
 
@@ -72,13 +74,15 @@ coding-agent
 ## 💬 Usage
 
 - Simply type your requests or questions at the `You (<token_count>):` prompt.
-- To exit the agent, type `exit` or `quit`.
+- To exit the agent, type `exit`, `quit`, `/exit` or `/q`.
 - Ask it to perform tasks like:
     - "Read the file src/tools.py"
     - "List files in the root directory"
     - "Edit README.md and add a section about future plans"
     - "run the command 'ls -l'"
     - "run 'pip list' in the sandbox"
+    - "Search Google for 'latest AI news'"
+    - "Open https://example.com and extract visible text"
 - The number in parentheses indicates the approximate token count of the conversation history that will be sent with your *next* message.
 
 ### 📄 Working with PDFs
@@ -109,3 +113,20 @@ The agent can include PDF documents in the conversation context, allowing you to
    ```
 
 5. **View Status:** The number of active PDFs is shown in the prompt (e.g., `You (123) [2 files]:`)
+
+### 🔍 Example: Web Search & Browse
+
+```bash
+# Launch the agent
+coding-agent
+
+# Perform a Google search
+🔵 You (0): Search Google for "Python 3.14 new features"
+🟢 Agent: [
+  {"title": "What’s New in Python 3.14", "url": "https://docs.python.org/3/whatsnew/3.14.html"},
+  {"title": "Python 3.14 Release Notes", "url": "https://www.python.org/downloads/release/python-3140/"}
+]
+
+# Browse a webpage
+🔵 You (123): Open https://docs.python.org/3/tutorial/
+🟢 Agent: The Python Tutorial — Python 3.x ...
