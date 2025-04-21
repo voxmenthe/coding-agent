@@ -17,9 +17,6 @@ import logging
 MODEL_NAME = "gemini-2.5-flash-preview-04-17"
 DEFAULT_THINKING_BUDGET = 256
 
-# Define project root - needed here for agent initialization
-project_root = Path(__file__).resolve().parents[1]
-
 # --- Code Agent Class ---
 class CodeAgent:
     """A simple coding agent using Google Gemini (google-genai SDK)."""
