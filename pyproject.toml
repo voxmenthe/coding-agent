@@ -38,6 +38,11 @@ weasyprint = "^63.1"
 ruff = ">=0.6.0,<0.7.0"
 black = "*"
 feedparser = "*"
+anyio = "^4.4.0" # Added for async scheduling
+sentence-transformers = "^4.1.0" # Added for embeddings
+filelock = "^3.15.4" # Added for file locking
+pydantic = "^2.8.2" # Added for data validation (MemoryDoc etc.)
+pdfplumber = "^0.11.6" # Added for PDF processing
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.10.1"
