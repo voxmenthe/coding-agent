@@ -60,8 +60,25 @@ class HybridSQLiteAdapter(MemoryAdapter):
                     content_rowid = 'id' 
                 )
             """)
+            # Add triggers for FTS synchronization (although often automatic with 'content=')
+            # It's safer to include them explicitly for robustness.
+            self.conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+                    INSERT INTO memories_fts (rowid, text_content) VALUES (new.id, new.text_content);
+                END;
+            """)
+            self.conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                    DELETE FROM memories_fts WHERE rowid = old.id;
+                END;
+            """)
+            self.conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+                    UPDATE memories_fts SET text_content = new.text_content WHERE rowid = old.id;
+                END;
+            """)
             self.conn.commit()
-            log.info("SQLite schema setup complete (auto-sync FTS, embedding_path added).")
+            log.info("SQLite schema setup complete (FTS triggers added).")
         except sqlite3.Error as e:
             log.error(f"Error setting up SQLite schema: {e}")
             raise
@@ -126,23 +143,56 @@ class HybridSQLiteAdapter(MemoryAdapter):
     def query(self, query_text: str, k: int = 10,
               filter_tags: list[str] | None = None, 
               filter_source_agents: list[str] | None = None) -> list[MemoryDoc]:
-        """Queries the memory store using FTS5 (simplified, returns dicts)."""
+        """Queries the memory store using FTS5, applying optional filters."""
         if not query_text:
             return []
         
-        sql = """
+        # Base query joining FTS and main table
+        sql_base = """
             SELECT m.uuid, m.text_content, m.embedding_path, m.timestamp, 
-            m.source_agent, m.tags_json, m.metadata_json, fts_rank as score 
+                   m.source_agent, m.tags_json, m.metadata_json, fts.rank as score 
             FROM memories_fts fts
             JOIN memories m ON m.id = fts.rowid 
-            WHERE fts.text_content MATCH ?
         """
+        
+        where_clauses = ["fts.text_content MATCH ?"]
         params = [query_text]
 
+        # Add tag filtering (requires ALL specified tags to be present)
+        if filter_tags:
+            # This assumes tags_json stores a JSON array like '["tag1", "tag2"]'
+            # We use JSON_EACH to check for the presence of each tag.
+            # A Common Table Expression (CTE) might be cleaner for complex tag logic,
+            # but for simple AND logic, multiple JOINs or subqueries work.
+            # Using json_each and checking count:
+            # Add placeholder for each tag to params
+            tag_placeholders = ','.join(['?'] * len(filter_tags))
+            where_clauses.append(f"""
+                m.id IN (
+                    SELECT jt.id
+                    FROM json_each(m.tags_json) AS je, memories AS jt
+                    WHERE jt.id = m.id AND je.value IN ({tag_placeholders})
+                    GROUP BY jt.id
+                    HAVING COUNT(DISTINCT je.value) = ?
+                )
+            """)
+            params.extend(filter_tags)
+            params.append(len(filter_tags))
+            
+        # Add source agent filtering
+        if filter_source_agents:
+            agent_placeholders = ','.join(['?'] * len(filter_source_agents))
+            where_clauses.append(f"m.source_agent IN ({agent_placeholders})")
+            params.extend(filter_source_agents)
+
+        # Combine WHERE clauses
+        sql = sql_base + " WHERE " + " AND ".join(where_clauses)
+
+        # Add ordering and limit
         sql += " ORDER BY fts.rank LIMIT ?" 
         params.append(k)
 
-        log.info(f"Executing FTS query: '{query_text[:50]}...', k={k}")
+        log.info(f"Executing FTS query: '{query_text[:50]}...', k={k}, tags={filter_tags}, agents={filter_source_agents}")
         log.debug(f"Full FTS SQL: {sql} PARAMS: {params}") 
         cursor = None
         try:
