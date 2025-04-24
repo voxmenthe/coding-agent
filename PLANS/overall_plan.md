@@ -4,8 +4,8 @@ AI Multi‑Agent Research Synthesizer (v0.1 – 2‑3 week sprint)
 ---
 
 #### 1. Vision & Scope
-- Build an open‑source framework that lets multiple LLM‑powered agents collaboratively generate new research hypotheses and deep summaries from a user‑supplied set of papers.  
-- Demo‑ready in 2–3 weeks: three agent roles running concurrently via a wrapper scheduler, CLI interface (existing), thin REST API stub, vector‑store + rolling‑summary memory.
+*   Build an open‑source framework that lets multiple LLM‑powered agents collaboratively generate new research hypotheses and deep summaries from a user‑supplied set of papers.
+*   Demo‑ready in 2–3 weeks: multiple agent roles running concurrently via a wrapper scheduler, CLI interface (existing), thin REST API stub, **hybrid SQLite + embedding memory store [Implemented]**.
 
 Success metric v0.1:  
 Given 2 input PDFs, system returns (a) structured per‑paper summary, (b) list of ≥3 distinct, non‑trivial research ideas, all within ~2× single‑LLM‑call latency.
@@ -13,10 +13,10 @@ Given 2 input PDFs, system returns (a) structured per‑paper summary, (b) list 
 ---
 
 #### 2. Key “Wow” Factors
-1. Multi‑agent reasoning core with concurrency.  
-2. Clean, documented codebase + tests + GitHub Actions CI.  
-3. Modular memory layer (FAISS/Chroma + summary roll‑ups).  
-4. Easy config: swap APIs (OpenAI, Gemini) or local models later.  
+1.  Multi‑agent reasoning core with concurrency.
+2.  Clean, documented codebase + tests + GitHub Actions CI.
+3.  **[Updated]** Modular memory layer (`HybridSQLiteAdapter`: SQLite + FTS5 + file embeddings). **[Implemented]**
+4.  Easy config: swap APIs (OpenAI, Gemini) or local models later.
 
 ---
 
@@ -25,45 +25,53 @@ Given 2 input PDFs, system returns (a) structured per‑paper summary, (b) list 
 CLI / FastAPI           Human feedback (free‑text)
       │
 ┌──────▼───────────┐
-│  Scheduler (async task‑queue wrapper)
+│  Scheduler (async task‑queue wrapper)  # TODO
 │  • max_concurrent = cfg
 └──────┬─────┬─────┘
        │     │
   ┌────▼─┐ ┌─▼────┐ ...
-  │Agent │ │Agent │  each has:
+  │Agent │ │Agent │  each has: # TODO
   │Role A│ │Role B│  • run_step()
   └──────┘ └──────┘
-       │ shared StorageAdapter
+       │ uses HybridSQLiteAdapter
 ┌──────▼────────────────────────────────────┐
-│ Memory Layer                              │
-│ • Vector store (Chroma or FAISS or other) │
-│ • Rolling summaries (jsonl)               │
+│ Memory Layer (HybridSQLiteAdapter)      │
+│ • SQLite DB (metadata + FTS5 index)     │
+│ • Embeddings stored as .npy files       │
 └───────────────────────────────────────────┘
 ```
 
 ---
 
-#### 4. Memory & Data Design
-- Vector store: Chroma in‑proc SQLite (swap‑able). Keys: `doc_chunk_id`, `paper_id`, embedding.  
-- Rolling summary: per‑agent JSONL, each line `{step, agent, summary}`; periodically compressed by a “Compressor” utility.  
-- Metadata store: TinyDB or YAML for `paper_id → title, url, abstract`.
+#### 4. Memory & Data Design **[Updated Implementation]**
+*   **Primary Storage:** `HybridSQLiteAdapter` manages:
+    *   An SQLite database (`.db` file) containing:
+        *   `memories` table: Stores metadata (`uuid`, `text_content`, `timestamp`, `source_agent`, `tags_json`, `metadata_json`, `embedding_path`).
+        *   `memories_fts` virtual table: FTS5 index on `text_content` for keyword search.
+    *   Embeddings stored as individual NumPy (`.npy`) files in a specified directory, linked from the `memories` table.
+*   **Embedding Model:** Uses `sentence-transformers` (e.g., `all-MiniLM-L6-v2`), managed by `EmbeddingManager`.
+*   **Querying:** Supports both FTS (keyword) and semantic (vector similarity) searches, with filtering by tags and source agents.
+*   ~~Vector store: Chroma in‑proc SQLite (swap‑able). Keys: `doc_chunk_id`, `paper_id`, embedding.~~ *(Replaced)*
+*   ~~Rolling summary: per‑agent JSONL, each line `{step, agent, summary}`; periodically compressed by a “Compressor” utility.~~ *(Removed - Summaries stored as regular memory docs)*
+*   ~~Metadata store: TinyDB or YAML for `paper_id → title, url, abstract`.~~ *(Incorporated into SQLite)*
 
 ---
 
-#### 5. Agent Roles for v0.1
-| Role | Purpose | Key I/O fields |
-|------|---------|----------------|
-| Ingestor | Parse PDF → chunks, embed, store metadata | `file_path` |
-| Summarizer | Produce structured summary for each paper | `paper_id` |
-| Synthesizer | Cross‑paper synthesis + idea generation | `[summary_ids]` |
-| Critic | Review Synth output, flag overlaps, propose improvements | `synth_id` |
+#### 5. Agent Roles for v0.1 **[Not Implemented Yet]**
+| Role | Purpose | Key I/O fields | Status |
+|------|---------|----------------|--------|
+| Ingestor | Parse PDF → chunks, embed, store metadata | `file_path` | TODO |
+| Summarizer | Produce structured summary for each paper | `paper_id` | TODO |
+| Synthesizer | Cross‑paper synthesis + idea generation | `[summary_ids]` | TODO |
+| Critic | Review Synth output, flag overlaps, propose improvements | `synth_id` | TODO |
 
-Each `run_step()` returns `AgentResult(message:str, citations:list[str], artifacts:dict)`.
+*Each `run_step()` returns `AgentResult(...)` and interacts with `HybridSQLiteAdapter`.*
 
 ---
 
-#### 6. Async Scheduler Wrapper
+#### 6. Async Scheduler Wrapper **[Not Implemented Yet]**
 ```python
+# Proposed design - Needs implementation
 import asyncio, anyio
 
 class TaskScheduler:
@@ -86,35 +94,37 @@ class TaskScheduler:
         await self.queue.join()
         for w in workers: w.cancel()
 ```
-Agents stay synchronous; concurrency handled at scheduler level.
+*Agents stay synchronous; concurrency handled at scheduler level.*
 
 ---
 
-#### 7. Implementation Roadmap
+#### 7. Implementation Roadmap **[Updated Status]**
 ##### Week 1
-1. Repo hygiene: `dev-20250419` → `main`; pre‑commit, black, mypy.  
-2. Add `memory/` module (vector + summary).  
-3. Implement Ingestor + Summarizer roles; unit tests.  
-4. Scheduler wrapper integrated; benchmark just these two roles.
+1.  Repo hygiene: `dev-20250419` → `main`; pre‑commit, black, mypy. *(Assumed Done)*
+2.  Add `memory/` module (**`HybridSQLiteAdapter`** + **`EmbeddingManager`**). **[DONE]**
+3.  Implement Ingestor + Summarizer roles; unit tests. **[TODO]**
+4.  Scheduler wrapper integrated; benchmark just these two roles. **[TODO]**
+5.  **[NEW]** Example scripts for memory usage. **[DONE]**
 
 ##### Week 2
-1. Synthesizer + Critic roles.  
-2. Free‑form human feedback ingestion (store in `feedback/` YAML).  
-3. Command `multi_run` in CLI: reads config YAML mapping roles & count.  
-4. GitHub Actions: lint, tests, basic benchmark (<60 s).
+1.  Synthesizer + Critic roles. **[TODO]**
+2.  Free‑form human feedback ingestion (store in `feedback/` YAML). **[TODO]**
+3.  Command `multi_run` in CLI: reads config YAML mapping roles & count. **[TODO]**
+4.  GitHub Actions: lint, tests, basic benchmark (<60 s). **[TODO]** (Lint/Test partially setup)
 
 ##### Week 3
-1. Thin FastAPI (`/run` & `/status`) exposing same scheduler.  
-2. README “Launch in 5 min” tutorial; example demo script.  
-3. Performance tuning: semaphore size vs. rate‑limit; timeout & retry.  
-4. Draft blog‑style docs in `docs/`, OpenAPI schema stub.
+1.  Thin FastAPI (`/run` & `/status`) exposing same scheduler. **[TODO]**
+2.  README “Launch in 5 min” tutorial; example demo script. **[TODO]** (Examples README done)
+3.  Performance tuning: semaphore size vs. rate‑limit; timeout & retry. **[TODO]**
+4.  Draft blog‑style docs in `docs/`, OpenAPI schema stub. **[TODO]**
 
 ---
 
-#### 8. Key Code Snippets
+#### 8. Key Code Snippets **[Outdated - See Examples/Implementation]**
 
-h4. Agent base
+##### Agent base
 ```python
+# Conceptual
 class BaseAgent:
     role = "agent"
     def __init__(self, storage, llm):
@@ -149,6 +159,7 @@ class StorageAdapter:
 
 h4. CLI enhancement
 ```python
+# Conceptual - Needs implementation for multi_run
 @cli.command()
 @click.option("--config", type=click.File("r"), default="config.yaml")
 def multi_run(config):
@@ -162,22 +173,23 @@ def multi_run(config):
 
 ---
 
-#### 9. Testing & Benchmarking
-- Unit: pytest‑parametrized `run_step` stubs with fake LLM.  
-- Integration: mini‑pipeline on 2 toy PDFs (public domain).  
-- Benchmark script captures wall‑clock vs. sequential baseline.  
-- Criteria: < 1.5× sequential latency when `max_concurrent=3`.
+#### 9. Testing & Benchmarking **[Partially Updated]**
+*   Unit: `pytest` tests for `HybridSQLiteAdapter` exist. **[DONE]** Need tests for agents.
+*   Integration: Need end-to-end tests with scheduler + agents.
+*   Examples: Standalone example scripts serve as basic integration/usage tests. **[DONE]**
+*   Benchmark script captures wall‑clock vs. sequential baseline. **[TODO]**
+*   Criteria: < 1.5× sequential latency when `max_concurrent=3`.
 
 ---
 
-#### 10. Deployment & Distribution
-- `pip install coding-agent[fastapi]` extra.  
-- Dockerfile (CPU): poetry install + uvicorn entrypoint.  
-- GitHub README badges: CI status, coverage, PyPI version.
+#### 10. Deployment & Distribution **[No Change Yet]**
+*   `pip install coding-agent[fastapi]` extra.
+*   Dockerfile (CPU): poetry install + uvicorn entrypoint.
+*   GitHub README badges: CI status, coverage, PyPI version.
 
 ---
 
-#### 11. Risk & Mitigation
+#### 11. Risk & Mitigation **[No Change Yet]**
 | Risk | Mitigation |
 |------|------------|
 | Async deadlocks / task leaks | Wrapper design, timeout + cancel; `anyio.fail_after()` |
@@ -187,12 +199,13 @@ def multi_run(config):
 
 ---
 
-#### 12. Future Extensions (post‑v0.1)
-- Dynamic agent birth/death via Planner role.  
-- Feedback‑aware fine‑tuning on cloud GPUs.  
-- UI dashboard with live agent timelines (React + WebSocket).  
-- Multi‑modal: plug CV encoder for figures & tables.
+#### 12. Future Extensions (post‑v0.1) **[No Change Yet]**
+*   Dynamic agent birth/death via Planner role.
+*   Feedback‑aware fine‑tuning on cloud GPUs.
+*   UI dashboard with live agent timelines (React + WebSocket).
+*   Multi‑modal: plug CV encoder for figures & tables.
+*   **(New)** Implement RRF query combining FTS & Semantic scores.
 
 ---
 
-Focus next 48 hours: finish StorageAdapter + Ingestor + Scheduler skeleton; push branch `feat/async-scheduler` for review.
+**Updated Focus:** Implement agent roles (`Ingestor`, `Summarizer`, etc.) using the `HybridSQLiteAdapter`. Implement and integrate the `TaskScheduler`.

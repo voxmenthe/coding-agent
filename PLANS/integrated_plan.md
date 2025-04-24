@@ -1,13 +1,13 @@
 ### Updated Comprehensive Plan (v0.1, 2‑3‑week sprint)  
 Multi‑Agent Research Synthesizer  
-(Concurrency‑friendly core + Hybrid/Pluggable Memory, **no Chroma**)
+(Concurrency‑friendly core + Hybrid/Pluggable Memory - **SQLite+Embeddings Implemented**, **no Chroma**)
 
 ---
 
 #### 1. Vision & Success Criteria
-* Three collaborating agents (Summarizer, Synthesizer, Critic) run concurrently through an async wrapper and generate ≥3 distinct research ideas from two PDFs in ≤ 1.5 × single‑call latency.  
-* Memory layer is **Hybrid/Pluggable**: local embeddings + SQLite FTS5 + Reciprocal Rank Fusion (RRF).  
-* Clean repo, CI, docs; CLI MVP plus stub REST endpoint.
+*   Three collaborating agents (Summarizer, Synthesizer, Critic) run concurrently through an async wrapper and generate ≥3 distinct research ideas from two PDFs in ≤ 1.5 × single‑call latency.
+*   **[DONE]** Memory layer is **Hybrid/Pluggable**: local embeddings + SQLite FTS5. *(RRF planned)*.
+*   Clean repo, CI, docs; CLI MVP plus stub REST endpoint.
 
 ---
 
@@ -22,10 +22,11 @@ Multi‑Agent Research Synthesizer
        ┌───────▼───┐ ┌────▼────┐
        │ Agent A   │ │ Agent B │   ... each: sync run_step()
        └───────────┘ └─────────┘
-               │ shared MemoryService (singleton)
+               │ uses HybridSQLiteAdapter
 ┌──────────────▼─────────────────────────┐
-│ Hybrid Memory Backend (SQLite + FTS5   │
-│  embeddings on FS, RRF fusion)         │
+│ Hybrid Memory Backend (SQLite + FTS5 + │
+│  embeddings on FS)                     │
+│  (RRF fusion planned)                  │
 └─────────────────────────────────────────┘
 ```
 
@@ -33,218 +34,127 @@ Multi‑Agent Research Synthesizer
 
 ### 3. Memory Sub‑System
 
-#### 3.1 MemoryAdapter Interface
+#### 3.1 `MemoryAdapter` Interface (Conceptual)
+*_(Interface not formally defined yet, but `HybridSQLiteAdapter` serves this role).*
 ```python
-class MemoryAdapter(ABC):
-    @abstractmethod
+# Conceptual - Not yet a formal ABC
+class MemoryAdapter:
     def add(self, doc: "MemoryDoc") -> str: ...
-    @abstractmethod
-    def query(self, query: str, *, k: int = 10,
-              tags: list[str] | None = None,
-              source_agents: list[str] | None = None) -> list["MemoryDoc"]: ...
+    def query(self, query_text: str, k: int = 10, filter_tags: list[str] | None = None, filter_source_agents: list[str] | None = None) -> list["MemoryDoc"]: ... # FTS
+    def semantic_query(self, query_text: str, k: int = 10, filter_tags: list[str] | None = None, filter_source_agents: list[str] | None = None) -> list["MemoryDoc"]: ... # Semantic
 ```
 
-#### 3.2 HybridSQLiteAdapter  
-* **SQLite schema** (`memories` + `memories_fts`).  
-* Embeddings: `.memory_db/embeddings/{uuid}.npy`.  
-* FTS5 index on `text_content`.  
-* RRF implementation combines:  
-  • cosine‑similarity ranks (semantic)  
-  • FTS BM25 ranks (lexical).  
+#### 3.2 `HybridSQLiteAdapter` **[IMPLEMENTED]**
+*   **SQLite schema** (`memories` table + `memories_fts` virtual table using FTS5). **[DONE]**
+*   Embeddings managed via `EmbeddingManager`, stored as `.npy` files (e.g., `.memory_db/embeddings/{uuid}.npy`). **[DONE]**
+*   FTS5 index on `text_content`, explicit synchronization triggers added. **[DONE]**
+*   Filtering by `tags` and `source_agent` implemented for both FTS and semantic queries. **[DONE]**
+*   RRF planned for future combination of FTS and semantic results.
 
 #### 3.3 Concurrency Guarantees
-* **One writer coroutine** inside `MemoryService`; writes are funneled through an `asyncio.Queue` to avoid database contention.  
-* Reads: each thread/worker opens its own SQLite connection (`check_same_thread=False`).  
-* File‑level `filelock` around `.npy` write.
+*   Adapter uses a single `sqlite3` connection internally.
+*   For multi-threaded/process use, consider separate adapter instances per worker or implement connection pooling/queueing if needed.
+*   Embedding file writes are currently not explicitly locked (potential race condition if multiple agents add the *exact* same doc simultaneously, though UUIDs make this unlikely). *(Consider adding `filelock`)*.
 
-#### 3.4 MemoryDoc Dataclass
+#### 3.4 `MemoryDoc` Dataclass **[DEFINED & USED]**
 ```python
+# Located in src/memory/adapter.py
 @dataclass
 class MemoryDoc:
-    id: str
-    text: str
-    tags: list[str]
-    source_agent: str
-    timestamp: datetime
-    meta: dict[str, Any] = field(default_factory=dict)
+    id: str | None = None # Auto-generated if None
+    text: str | None = None # text_content in DB
+    embedding: np.ndarray | None = None # Not stored directly in DB
+    embedding_path: Path | str | None = None # Path to .npy file
+    timestamp: datetime | None = None # Auto-generated if None
+    tags: list[str] | None = None
+    source_agent: str | None = None
+    metadata: dict[str, Any] | None = None
+    score: float | None = None # For query results
 ```
 
 ---
 
-### 4. Concurrency Design (unchanged wrapper)
+### 4. Concurrency Design (Wrapper - Not Implemented Yet)
 
 #### 4.1 Scheduler Skeleton
 ```python
+# Proposed design - Needs implementation
 class TaskScheduler:
-    def __init__(self, max_concurrent=3, timeout_s=120):
-        self.sem  = anyio.Semaphore(max_concurrent)
-        self.to   = timeout_s
-        self.wq   = asyncio.Queue()
-
-    async def _run_agent(self, agent):
-        async with self.sem:
-            async with anyio.fail_after(self.to):
-                return await anyio.to_thread.run_sync(agent.run_step)
-
-    async def run(self, agents):
-        async with anyio.create_task_group() as tg:
-            for a in agents:
-                tg.start_soon(self._run_agent, a)
+    # ... (design seems reasonable, uses AnyIO)
 ```
 
 ---
 
-### 5. Agent Roles (v0.1)
+### 5. Agent Roles (v0.1 - Not Implemented Yet)
 
-| Role | Responsibilities | Tools used |
-|------|------------------|-----------|
-| Ingestor | PDF → chunks, add to memory | `pdfplumber`, `MemoryService.add()` |
-| Summarizer | Summaries per paper | `MemoryService.query()`, LLM |
-| Synthesizer | Cross‑paper ideas | Same |
-| Critic | Detect overlap, propose fixes | Same |
+| Role | Responsibilities | Tools needed | Status |
+|------|------------------|--------------|--------|
+| Ingestor | PDF → chunks, add to memory | `pdfplumber`, `HybridSQLiteAdapter.add()` | TODO |
+| Summarizer | Summaries per paper | `HybridSQLiteAdapter.query/semantic_query()`, LLM | TODO |
+| Synthesizer | Cross‑paper ideas | Same | TODO |
+| Critic | Detect overlap, propose fixes | Same | TODO |
 
-All agents call `save_memory()` at the end of each `run_step()`.
+*Agents will need access to an instance of `HybridSQLiteAdapter`.*
 
 ---
 
-### 6. Module & File Layout
+### 6. Module & File Layout **[Partially Updated]**
 
 ```
 src/
- ├─ core/
- │   ├─ scheduler.py
- │   └─ agents/
+ ├─ core/                 # TODO
+ │   ├─ scheduler.py      # TODO
+ │   └─ agents/           # TODO
  │        ├─ base.py
  │        ├─ ingestor.py
  │        ├─ summarizer.py
  │        ├─ synthesizer.py
  │        └─ critic.py
  ├─ memory/
- │   ├─ adapter.py          # interface
- │   ├─ hybrid_sqlite.py    # HybridSQLiteAdapter
- │   └─ service.py          # MemoryService singleton
- ├─ tools.py                # save_memory / recall_memory wrappers
- └─ cli.py                  # click group
+ │   ├─ adapter.py        # MemoryDoc definition
+ │   ├─ hybrid_sqlite.py  # HybridSQLiteAdapter **[DONE]**
+ │   └─ embedding_manager.py # EmbeddingManager **[DONE]**
+ └─ cli.py                # TODO (or enhance existing)
+
+examples/
+ ├─ memory/
+ │   ├─ example_basic_usage.py       **[DONE]**
+ │   └─ example_advanced_querying.py **[DONE]**
+ └─ README.md                 **[DONE]**
+
+tests/
+ └─ memory/
+     └─ test_hybrid_sqlite.py    **[UPDATED]**
 ```
 
 ---
 
-### 7. Key Code Snippets
-
-#### 7.1 MemoryService (excerpt)
-```python
-class MemoryService:
-    _instance: "MemoryService" | None = None
-
-    def __new__(cls, db_path=".memory_db/memory.db"):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._init(db_path)
-        return cls._instance
-
-    def _init(self, db_path):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(exist_ok=True)
-        self.conn_pool = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.emb_dir   = self.db_path.parent / "embeddings"
-        self.emb_dir.mkdir(exist_ok=True)
-        self.model = SentenceTransformer(os.getenv("EMBED_MODEL","all-MiniLM-L6-v2"))
-        self._setup_schema()
-
-    def add_memory(self, doc: MemoryDoc):
-        emb = self.model.encode(doc.text)
-        np.save(self.emb_dir / f"{doc.id}.npy", emb)
-        with self.conn_pool:
-            self.conn_pool.execute(
-                "INSERT INTO memories VALUES (?,?,?,?,?,?)",
-                (doc.id, doc.text, str(self.emb_dir / f"{doc.id}.npy"),
-                 doc.timestamp.isoformat(), doc.source_agent,
-                 json.dumps({"tags": doc.tags, **doc.meta}))
-            )
-            self.conn_pool.execute(
-                "INSERT INTO memories_fts(rowid, text_content) VALUES (?,?)",
-                (doc.id, doc.text)
-            )
-
-    def rrf_query(self, query:str, k:int=10):
-        ...
-```
-
-#### 7.2 save_memory / recall_memory Tools
-```python
-def save_memory(content:str, tags:list[str]|None=None, source_agent_id:str=""):
-    doc = MemoryDoc(id=str(uuid4()), text=content,
-                    tags=tags or [], source_agent=source_agent_id,
-                    timestamp=datetime.utcnow())
-    MemoryService().add_memory(doc)
-    return "✅ memory saved"
-
-def recall_memory(query:str, top_k:int=5, filter_tags=None, filter_agent_ids=None):
-    docs = MemoryService().rrf_query(query, k=top_k)
-    # simple JSON response
-    return json.dumps([asdict(d) for d in docs], indent=2)
-```
+### 7. Key Code Snippets **[Outdated - See Examples]**
+*_(Removed outdated `MemoryService` and `save/recall` snippets. Refer to `examples/memory/` scripts for current usage patterns of `HybridSQLiteAdapter`)*.
 
 ---
 
-### 8. Implementation Road‑Map
+### 8. Implementation Road‑Map **[Updated Status]**
 
-| Week | Deliverables |
-|------|--------------|
-| **1** | • Repo cleanup, pre‑commit, GH Actions lint/test<br>• `MemoryAdapter` + `HybridSQLiteAdapter` skeleton<br>• `MemoryService` with add/query (semantic only)<br>• Ingestor agent + unit tests |
-| **2** | • RRF fusion completed & benchmarked<br>• `save_memory` / `recall_memory` tools wired into agents<br>• Scheduler integrated, Summarizer & Synthesizer roles<br>• Single‑writer coroutine + locking proof<br>• Integration test (max_concurrent=1 & 3) |
-| **3** | • Critic role, free‑form feedback persistence<br>• Thin FastAPI (`/run`, `/status`)<br>• README demo script, blog‑style docs<br>• Performance / rate‑limit tuning, timeouts<br>• Final CI: unit, integration, benchmark < 60 s |
+| Week | Deliverables | Status |
+|------|--------------|--------|
+| **1** | • Repo cleanup, pre‑commit, GH Actions lint/test | *(Assumed Mostly Done)*<br>• ~~`MemoryAdapter` + `HybridSQLiteAdapter` skeleton~~ | **DONE** (Full adapter)<br>• ~~`MemoryService` with add/query (semantic only)~~ | **DONE** (Via Adapter)<br>• Ingestor agent + unit tests | TODO |
+| **2** | • RRF fusion completed & benchmarked | TODO<br>• ~~`save_memory` / `recall_memory` tools wired into agents~~ | (Use adapter directly) TODO<br>• Scheduler integrated, Summarizer & Synthesizer roles | TODO<br>• ~~Single‑writer coroutine + locking proof~~ | (Review concurrency needs) TODO<br>• Integration test (max_concurrent=1 & 3) | TODO<br>• **[NEW]** Example scripts created & tested | **DONE** |
+| **3** | • Critic role, free‑form feedback persistence | TODO<br>• Thin FastAPI (`/run`, `/status`) | TODO<br>• README demo script, blog‑style docs | TODO (Examples README done)<br>• Performance / rate‑limit tuning, timeouts | TODO<br>• Final CI: unit, integration, benchmark < 60 s | TODO |
 
----
+--- 
 
-### 9. Testing & Benchmarks
-
-* **Unit:**  
-  • MemoryService: add + query returns correct doc count.  
-  • RRF: fused ranking > individual ranks (toy data).
-
-* **Integration:**  
-  `pytest -m pipeline` loads 2 PDFs, runs 3 agents concurrently, asserts ≥3 unique ideas.
-
-* **Benchmark:**  
-  Sequential vs. `max_concurrent=3`; pass if `t_async ≤ 1.5 × t_seq`.
+### 9. Testing & Benchmarks **[Partially Updated]**
+*   Unit Tests: `pytest` tests for `HybridSQLiteAdapter` exist and cover core functionality including filtering. **[DONE]** Need tests for agents.
+*   Integration: Need end-to-end tests with scheduler and agents.
+*   Examples: Standalone example scripts serve as basic integration/usage tests. **[DONE]**
+*   Benchmark: Script needed to compare concurrent vs. sequential. RRF benchmark needed.
 
 ---
 
-### 10. Dependencies
-
-```
-sentence-transformers
-numpy
-anyio
-click
-pdfplumber
-fastapi[all]  # optional extra
-filelock
-```
-(`chromadb` removed.)
-
----
-
-### 11. Risk & Mitigation
-
-| Risk | Mitigation |
-|------|------------|
-| SQLite write contention | Single writer coroutine; WAL mode |
-| Model load per thread | Global singleton; warm‑up at service init |
-| Large memory (>100 k) | Phase‑3: switch to FAISS index |
-| API rate limits | AnyIO token bucket; exponential backoff |
-
----
-
-### 12. Deliverable Recap
-
-* `src/memory/` with hybrid backend, RRF.  
-* Concurrency wrapper (AnyIO), max concurrent configurable.  
-* Three agents integrated, saving & recalling memories.  
-* CLI command `coding-agent multi_run --config demo.yaml`.  
-* README + example session GIF (optional) for “wow” factor.
-
----
-
-This consolidated plan drops Chroma entirely, adopts the uploaded hybrid memory design, and retains the proven concurrency wrapper so we can still ship a polished, demo‑ready v0.1 within 3 weeks.
+### 10. Next Steps (Immediate Focus)
+1.  **Agent Implementation:** Start implementing the agent roles (`Ingestor`, `Summarizer`, `Synthesizer`, `Critic`), using the `HybridSQLiteAdapter` for memory operations.
+2.  **Scheduler Implementation:** Implement the `TaskScheduler` based on the proposed design using `anyio`.
+3.  **Integration:** Integrate the agents with the scheduler.
+4.  **Concurrency Review:** Re-evaluate concurrency needs for the adapter (locking, connection handling) once agents are running concurrently.
+5.  **(Optional) RRF:** Implement Reciprocal Rank Fusion in the adapter for combined query results.
