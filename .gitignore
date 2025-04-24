@@ -11,7 +11,7 @@ __pycache__
 **/*.pdf
 agent_history.gif
 recordings
-examples/output/advanced_querying_embeddings/code_snippet_01.npy examples/output/advanced_querying_embeddings/meeting_notes_01.npy examples/output/advanced_querying_embeddings/meeting_notes_02.npy examples/output/advanced_querying_embeddings/proj_idea_01.npy examples/output/advanced_querying_embeddings/proj_idea_02.npy examples/output/advanced_querying_embeddings/tech_article_01.npy examples/output/basic_usage_embeddings/doc_001.npy examples/output/basic_usage_embeddings/doc_002.npy examples/output/basic_usage_embeddings/doc_003.npy
+**/*.npy
 *.npy
 *.db
 **/*.db
