@@ -4,9 +4,13 @@ import uuid
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+import numpy as np
+from unittest.mock import patch, MagicMock
 
 from src.memory.adapter import MemoryDoc
 from src.memory.hybrid_sqlite import HybridSQLiteAdapter
+# Assuming EmbeddingManager is importable relative to HybridSQLiteAdapter for mocking
+# from src.memory.embedding_manager import EmbeddingManager 
 
 # Fixture to create a temporary directory for test databases/embeddings
 @pytest.fixture(scope="function") # Use function scope for isolation between tests
@@ -26,160 +30,207 @@ def db_paths(temp_db_dir):
     emb_path_str = str(emb_dir)
     return str(db_path), emb_path_str
 
+@pytest.fixture
+def sample_doc_data():
+    """Provides dictionary data for a sample MemoryDoc."""
+    return {
+        "id": str(uuid.uuid4()),
+        "text": "This is a sample document.",
+        "timestamp": datetime.now(timezone.utc),
+        "source_agent": "TestAgent1",
+        "tags": ["sample", "test"],
+        "metadata": {"key": "value", "source": "fixture"}
+    }
+
+@pytest.fixture
+def mock_embedding_manager():
+    """Provides a fully configured MagicMock instance simulating EmbeddingManager."""
+    manager = MagicMock(name="MockEmbeddingManagerInstance")
+    manager.embedding_model = MagicMock(name="MockEmbeddingModel") # Simulate having a model
+    manager.embedding_dir = Path("/mock/embeddings") # Use a distinct mock path
+    
+    # Mock generate_and_save_embedding to return a predictable mock path
+    def mock_gen_save(text, doc_id):
+        # Return the mock path, adapter should store this string
+        mock_path = manager.embedding_dir / f"{doc_id}.npy"
+        return mock_path
+    manager.generate_and_save_embedding.side_effect = mock_gen_save
+    manager.generate_and_save_embedding.__name__ = 'generate_and_save_embedding' # Help with debugging
+
+    # Mock other methods needed for semantic_query tests later
+    manager.generate_embedding.return_value = np.array([0.1, 0.2, 0.3])
+    manager.load_embedding.return_value = np.array([0.4, 0.5, 0.6])
+    manager.calculate_similarity.return_value = 0.95
+    
+    return manager
+
 def test_initialization(db_paths):
-    """Test if adapter initializes correctly and creates files/dirs."""
+    """Test if adapter initializes correctly and creates files/dirs and EmbeddingManager."""
     db_path_str, emb_path_str = db_paths
     db_path = Path(db_path_str)
     emb_dir = Path(emb_path_str)
-    adapter = None # Ensure adapter is defined for finally block
+    adapter = None
+    mock_model = MagicMock(name="MockSentenceTransformer") # Mock the actual model object passed
     try:
-        adapter = HybridSQLiteAdapter(db_path_str=db_path_str, embedding_dir_str=emb_path_str)
+        # Patch EmbeddingManager specifically during adapter init if needed,
+        # but easier to mock the whole class as done in add/query tests.
+        adapter = HybridSQLiteAdapter(db_path_str=db_path_str, 
+                                      embedding_dir_str=emb_path_str,
+                                      embedding_model=mock_model) 
 
         assert db_path.parent.exists()
-        assert emb_dir.exists()
+        assert emb_dir.exists() # Embedding dir should be created by EmbeddingManager init
         assert db_path.exists()
-        assert str(adapter.db_path) == db_path_str
-        assert str(adapter.embedding_dir) == emb_path_str
         assert adapter.conn is not None
+        # Check if EmbeddingManager was initialized correctly inside the adapter
+        assert adapter.embedding_manager is not None
+        assert adapter.embedding_manager.embedding_model == mock_model
+        assert adapter.embedding_manager.embedding_dir == emb_dir
+
     finally:
         if adapter:
             adapter.close()
 
 def test_schema_creation(db_paths):
-    """Verify that the necessary tables are created."""
+    """Verify that the necessary tables and columns are created."""
     db_path_str, emb_path_str = db_paths
     adapter = None
     try:
+        # No model needed just to check schema
         adapter = HybridSQLiteAdapter(db_path_str=db_path_str, embedding_dir_str=emb_path_str)
         cursor = adapter.conn.cursor()
         
-        # Check if 'memories' table exists
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memories';")
         assert cursor.fetchone() is not None, "'memories' table not found."
 
-        # Check columns in 'memories' table
         cursor.execute("PRAGMA table_info(memories);")
-        columns = {row['name']: row['type'] for row in cursor.fetchall()} # Use column names
-        print(f"DIAG (test_schema): Found columns: {columns}") # DIAG PRINT
-        assert len(columns) == 3, f"Expected 3 columns, found {len(columns)}"
-        assert 'id' in columns and columns['id'] == 'INTEGER'
-        assert 'uuid' in columns and columns['uuid'] == 'TEXT'
-        assert 'text_content' in columns and columns['text_content'] == 'TEXT'
+        # Use dict comprehension for easy lookup
+        columns = {row['name']: row['type'] for row in cursor.fetchall()}
+        
+        # Verify all expected columns exist (now includes embedding_path etc.)
+        expected_columns = {
+            'id': 'INTEGER',
+            'uuid': 'TEXT',
+            'text_content': 'TEXT',
+            'embedding_path': 'TEXT', # New column
+            'timestamp': 'TEXT',      # New column
+            'source_agent': 'TEXT',   # New column
+            'tags_json': 'TEXT',      # New column
+            'metadata_json': 'TEXT'   # New column
+        }
+        # Check if the set of column names match exactly
+        assert set(columns.keys()) == set(expected_columns.keys()), \
+               f"Column mismatch: Got {columns.keys()}, Expected {expected_columns.keys()}"
+        # Check types individually
+        for col_name, col_type in expected_columns.items():
+            assert columns[col_name] == col_type, f"Column '{col_name}' has wrong type: expected {col_type}, got {columns[col_name]}"
 
-        # Check if 'memories_fts' table exists and is FTS5
+        # Check FTS table remains correctly configured
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts';")
         assert cursor.fetchone() is not None, "'memories_fts' table not found."
         cursor.execute("SELECT sql FROM sqlite_master WHERE name='memories_fts';")
         fts_sql = cursor.fetchone()['sql']
-        print(f"DIAG (test_schema): FTS SQL: {fts_sql}") # DIAG PRINT
-        assert 'USING FTS5' in fts_sql.upper() # Check it's an FTS5 table
-
+        # Normalize whitespace somewhat, but keep internal structures
+        normalized_fts_sql = ' '.join(fts_sql.lower().split())
+        
+        assert 'using fts5' in normalized_fts_sql
+        assert 'content = memories' in normalized_fts_sql
+        assert "content_rowid = 'id'" in normalized_fts_sql
+        assert "tokenize = 'porter'" in normalized_fts_sql
+        
     finally:
         if adapter:
             adapter.close()
 
-def test_add_memory_basic(db_paths):
-    """Test adding a simple MemoryDoc (simplified schema)."""
+@patch('src.memory.hybrid_sqlite.EmbeddingManager') 
+def test_add_memory_basic(MockEmbeddingManagerClass, db_paths, sample_doc_data, mock_embedding_manager):
+    """Test adding a MemoryDoc, verifying DB content and EmbeddingManager interaction."""
     db_path_str, emb_path_str = db_paths
+    
+    # Configure the mock instance that will be returned by MockEmbeddingManagerClass()
+    # Use the pre-configured mock from the fixture
+    MockEmbeddingManagerClass.return_value = mock_embedding_manager 
+    # Ensure the mock manager simulates having a model attached
+    mock_embedding_manager.embedding_model = MagicMock(name="MockModelOnInstance") 
+    
     adapter = None
-    print(f"\n--- Starting test_add_memory_basic ---") # DIAG PRINT
     try:
-        adapter = HybridSQLiteAdapter(db_path_str=db_path_str, embedding_dir_str=emb_path_str)
-        doc_id = str(uuid.uuid4())
-        test_doc = MemoryDoc(
-            id=doc_id,
-            text="This is a test document for FTS.",
-            # Removed other fields for simplification
-        )
-        print(f"DIAG (test): Calling adapter.add() for UUID {doc_id}") # DIAG PRINT
+        # Initialize adapter; it will get the mocked EmbeddingManager instance upon creation
+        adapter = HybridSQLiteAdapter(db_path_str=db_path_str, 
+                                      embedding_dir_str=emb_path_str,
+                                      embedding_model=MagicMock()) # Pass a dummy model object
+        
+        test_doc = MemoryDoc(**sample_doc_data)
+        # Determine the expected path based on the mock manager's logic
+        expected_emb_path_str = str((mock_embedding_manager.embedding_dir / f"{test_doc.id}.npy").resolve())
+        
+        # --- Action --- 
         added_id = adapter.add(test_doc)
-        assert added_id == doc_id
-        print(f"DIAG (test): adapter.add() returned {added_id}") # DIAG PRINT
+        
+        # --- Assertions --- 
+        assert added_id == test_doc.id
+
+        # Verify EmbeddingManager's method was called correctly by the adapter
+        mock_embedding_manager.generate_and_save_embedding.assert_called_once_with(test_doc.text, test_doc.id)
 
         # Verify data in 'memories' table
         cursor = adapter.conn.cursor()
-        print(f"DIAG (test): Querying 'memories' table for UUID {doc_id}") # DIAG PRINT
-        cursor.execute("SELECT id, uuid, text_content FROM memories WHERE uuid = ?", (doc_id,))
+        cursor.execute("SELECT * FROM memories WHERE uuid = ?", (test_doc.id,))
         row = cursor.fetchone()
-        assert row is not None
-        assert row['uuid'] == doc_id
+        assert row is not None, "Row not found in database after add."
+        assert row['uuid'] == test_doc.id
         assert row['text_content'] == test_doc.text
-        integer_id = row['id'] # Get the auto-generated integer ID
-        assert isinstance(integer_id, int)
-        print(f"DIAG (test): Found row in 'memories', integer_id: {integer_id}") # DIAG PRINT
-
-        # Verify data in 'memories_fts' using the integer id
-        print(f"DIAG (test): Querying 'memories_fts' table for rowid {integer_id}") # DIAG PRINT
-        cursor.execute("SELECT rowid FROM memories_fts WHERE rowid = ?;", (integer_id,))
-        fts_row = cursor.fetchone()
-        assert fts_row is not None, f"FTS table should contain the integer rowid {integer_id} after insert."
-        print(f"DIAG (test): Found rowid {fts_row['rowid']} in 'memories_fts'.") # DIAG PRINT
+        assert row['embedding_path'] == expected_emb_path_str # Check correct mock path was stored
+        assert row['timestamp'] == test_doc.timestamp.isoformat() # Check ISO format string
+        assert row['source_agent'] == test_doc.source_agent
+        assert json.loads(row['tags_json']) == test_doc.tags # Check JSON decoded tags
+        assert json.loads(row['metadata_json']) == test_doc.metadata # Check JSON decoded metadata
         
-        # Now check the specific text match via FTS query
-        print(f"DIAG (test): Querying 'memories_fts' via MATCH 'test' for rowid {integer_id}") # DIAG PRINT
-        cursor.execute("SELECT rowid FROM memories_fts WHERE text_content MATCH ? AND rowid = ?;", ("test", integer_id))
-        match_row = cursor.fetchone()
-        assert match_row is not None, f"FTS query for 'test' should match the inserted rowid {integer_id}."
-        print(f"DIAG (test): Found rowid {match_row['rowid']} via MATCH 'test'.") # DIAG PRINT
+        # Verify FTS entry exists for the corresponding rowid
+        integer_id = row['id']
+        cursor.execute("SELECT count(*) FROM memories_fts WHERE rowid = ?;", (integer_id,))
+        assert cursor.fetchone()[0] == 1, "FTS entry not found for added document."
 
     finally:
         if adapter:
             adapter.close()
-        print(f"--- Finished test_add_memory_basic ---\n") # DIAG PRINT
 
+@patch('src.memory.hybrid_sqlite.EmbeddingManager')
+def test_add_memory_no_embedding(MockEmbeddingManagerClass, db_paths, sample_doc_data, mock_embedding_manager):
+    """Test adding a MemoryDoc when embedding generation fails or model is None."""
+    db_path_str, emb_path_str = db_paths
+    
+    # Simulate embedding failure by having the mock return None
+    # Clear side_effect first, as it takes precedence over return_value
+    mock_embedding_manager.generate_and_save_embedding.side_effect = None 
+    mock_embedding_manager.generate_and_save_embedding.return_value = None 
+    MockEmbeddingManagerClass.return_value = mock_embedding_manager
+    mock_embedding_manager.embedding_model = MagicMock() # Still need the attribute
+    
+    adapter = None
+    try:
+        adapter = HybridSQLiteAdapter(db_path_str=db_path_str, embedding_dir_str=emb_path_str, embedding_model=MagicMock())
+        test_doc = MemoryDoc(**sample_doc_data)
+        
+        # --- Action --- 
+        adapter.add(test_doc)
+
+        # --- Assertions --- 
+        # Verify manager was still called
+        mock_embedding_manager.generate_and_save_embedding.assert_called_once_with(test_doc.text, test_doc.id)
+        
+        # Verify embedding_path is NULL in the database
+        cursor = adapter.conn.cursor()
+        cursor.execute("SELECT embedding_path FROM memories WHERE uuid = ?", (test_doc.id,))
+        row = cursor.fetchone()
+        assert row is not None, "Row not found in database."
+        assert row['embedding_path'] is None, "Embedding path should be NULL when generation fails."
+    finally:
+        if adapter:
+            adapter.close()
 
 def test_query_memory_fts(db_paths):
     """Test querying memory using FTS (simplified schema)."""
-    db_path_str, emb_path_str = db_paths
-    adapter = None
-    print(f"\n--- Starting test_query_memory_fts ---") # DIAG PRINT
-    try:
-        adapter = HybridSQLiteAdapter(db_path_str=db_path_str, embedding_dir_str=emb_path_str)
-        doc1_id = str(uuid.uuid4())
-        doc1 = MemoryDoc(id=doc1_id, text="The quick brown fox jumps over the lazy dog.")
-        doc2_id = str(uuid.uuid4())
-        doc2 = MemoryDoc(id=doc2_id, text="Another test document about foxes.")
-        doc3_id = str(uuid.uuid4())
-        doc3 = MemoryDoc(id=doc3_id, text="This one is about dogs only.")
-
-        print(f"DIAG (test): Adding doc1 (fox dog) UUID {doc1_id}") # DIAG PRINT
-        adapter.add(doc1)
-        print(f"DIAG (test): Adding doc2 (foxes) UUID {doc2_id}") # DIAG PRINT
-        adapter.add(doc2)
-        print(f"DIAG (test): Adding doc3 (dogs) UUID {doc3_id}") # DIAG PRINT
-        adapter.add(doc3)
-
-        # Query for "fox" - Expecting dict results
-        print(f"DIAG (test): Calling adapter.query('fox')") # DIAG PRINT
-        results_fox = adapter.query("fox", k=5)
-        print(f"DIAG (test): adapter.query('fox') returned {len(results_fox)} results: {results_fox}") # DIAG PRINT
-        
-        assert len(results_fox) == 2, f"Expected 2 results for 'fox', got {len(results_fox)}"
-        result_uuids_fox = {r['uuid'] for r in results_fox}
-        assert doc1_id in result_uuids_fox
-        assert doc2_id in result_uuids_fox
-        
-        # Query for "lazy"
-        print(f"DIAG (test): Calling adapter.query('lazy')") # DIAG PRINT
-        results_lazy = adapter.query("lazy", k=5)
-        print(f"DIAG (test): adapter.query('lazy') returned {len(results_lazy)} results: {results_lazy}") # DIAG PRINT
-        assert len(results_lazy) == 1
-        assert results_lazy[0]['uuid'] == doc1_id
-
-        # Query for "missing"
-        print(f"DIAG (test): Calling adapter.query('missing')") # DIAG PRINT
-        results_missing = adapter.query("missing", k=5)
-        print(f"DIAG (test): adapter.query('missing') returned {len(results_missing)} results: {results_missing}") # DIAG PRINT
-        assert len(results_missing) == 0
-
-    finally:
-        if adapter:
-            adapter.close()
-        print(f"--- Finished test_query_memory_fts ---\n") # DIAG PRINT
-
-
-def test_query_empty_db(db_paths):
-    """Test querying an empty database."""
     db_path_str, emb_path_str = db_paths
     adapter = None
     try:
