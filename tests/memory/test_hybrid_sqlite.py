@@ -472,3 +472,135 @@ def test_semantic_query_filter_combined(adapter_with_docs):
     assert actual_order == expected_order
 
 # TODO: Add tests for missing embeddings etc.
+
+# --- Tests for Hybrid Query (RRF) --- MOCKING REQUIRED
+
+# To properly test RRF, we need to control the *ranking* from FTS and Semantic.
+# The current mock_embedding_manager returns fixed similarity scores, but not ranks based on query.
+# We'll simulate the *output lists* of `query` and `semantic_query` instead of fully mocking the internals.
+
+@pytest.fixture
+def adapter_for_hybrid(tmp_path): # Separate fixture to avoid data conflicts
+    db_path = tmp_path / "test_hybrid.db"
+    embedding_dir = tmp_path / "embeddings"
+    embedding_dir.mkdir()
+    adapter = HybridSQLiteAdapter(str(db_path), str(embedding_dir))
+    yield adapter
+    adapter.close()
+
+# Sample docs for hybrid tests
+doc1 = MemoryDoc(id="doc1", text="apple banana computer", embedding_path="", tags=["fruit", "tech"], source_agent="A")
+doc2 = MemoryDoc(id="doc2", text="banana orange grape", embedding_path="", tags=["fruit"], source_agent="B")
+doc3 = MemoryDoc(id="doc3", text="computer keyboard mouse", embedding_path="", tags=["tech"], source_agent="A")
+doc4 = MemoryDoc(id="doc4", text="apple grape juice", embedding_path="", tags=["fruit", "drink"], source_agent="C")
+
+hybrid_test_data = [doc1, doc2, doc3, doc4]
+
+def test_hybrid_query_basic_rrf(adapter_for_hybrid, mocker):
+    """Test basic RRF scoring and ranking."""
+    adapter = adapter_for_hybrid
+
+    # --- Setup Mocks --- 
+    # Mock the internal calls to query and semantic_query
+    # We are testing the RRF combination logic here, assuming the underlying queries work (tested elsewhere)
+
+    # Scenario: Query for "computer fruit"
+    # FTS Ranking (hypothetical): doc3 (computer), doc1 (computer), doc2 (fruit), doc4 (fruit)
+    # Semantic Ranking (hypothetical): doc1 (apple/computer), doc4 (apple/grape), doc2 (banana/grape), doc3 (computer)
+    mocker.patch.object(adapter, 'query', return_value=[doc3, doc1, doc2, doc4])
+    mocker.patch.object(adapter, 'semantic_query', return_value=[doc1, doc4, doc2, doc3])
+
+    # --- Execute Hybrid Query --- 
+    results_with_scores = adapter.hybrid_query("computer fruit", k=3, rrf_k=60)
+
+    # --- Assertions --- 
+    assert len(results_with_scores) == 3
+    results = [doc for doc, score in results_with_scores]
+    scores = [score for doc, score in results_with_scores]
+
+    # Expected RRF scores (1 / (60 + rank)):
+    # doc1: (1/61) [sem=0] + (1/61) [fts=1] = 0.01639 + 0.01639 = 0.03278
+    # doc3: (1/60) [sem=3] + (1/60) [fts=0] = 0.01667 + 0.01667 = 0.03334
+    # doc4: (1/61) [sem=1] + (1/63) [fts=3] = 0.01639 + 0.01587 = 0.03226
+    # Expected Order: doc1, doc3, doc4
+
+    expected_order_ids = ["doc1", "doc3", "doc4"] # Correct expected order
+    actual_order_ids = [doc.id for doc in results]
+
+    assert actual_order_ids == expected_order_ids
+
+    # Check scores approximately
+    assert scores[0] == pytest.approx(1/61 + 1/60, rel=1e-3) # doc1 score
+    assert scores[1] == pytest.approx(1/60 + 1/63, rel=1e-3) # doc3 score
+    assert scores[2] == pytest.approx(1/63 + 1/61, rel=1e-3) # doc4 score
+
+    # Verify mocks were called
+    adapter.query.assert_called_once_with("computer fruit", k=15, filter_tags=None, filter_source_agents=None)
+    adapter.semantic_query.assert_called_once_with("computer fruit", k=15, filter_tags=None, filter_source_agents=None)
+
+def test_hybrid_query_with_filters(adapter_for_hybrid, mocker):
+    """Test RRF with filters applied."""
+    adapter = adapter_for_hybrid
+
+    # Scenario: Query "fruit", filter tag="tech"
+    # Expected: Should only consider doc1 and doc3
+    # FTS Ranking (filtered): doc3, doc1
+    # Semantic Ranking (filtered): doc1, doc3
+    mocker.patch.object(adapter, 'query', return_value=[doc3, doc1]) # Simulate pre-filtered results
+    mocker.patch.object(adapter, 'semantic_query', return_value=[doc1, doc3]) # Simulate pre-filtered results
+
+    results_with_scores = adapter.hybrid_query(
+        "fruit",
+        k=2,
+        filter_tags=["tech"],
+        rrf_k=60
+    )
+
+    assert len(results_with_scores) == 2
+    results = [doc for doc, score in results_with_scores]
+
+    # Expected RRF:
+    # doc1: (1/61)[sem=0] + (1/61)[fts=1] = 0.03278
+    # doc3: (1/61)[sem=1] + (1/60)[fts=0] = 0.03306
+    # Expected order based on stable sort (doc3 inserted first): doc3, doc1
+
+    assert [doc.id for doc in results] == ["doc3", "doc1"] # Updated based on stable sort for equal scores
+
+    # Verify mocks called with filters
+    adapter.query.assert_called_once_with("fruit", k=10, filter_tags=["tech"], filter_source_agents=None)
+    adapter.semantic_query.assert_called_once_with("fruit", k=10, filter_tags=["tech"], filter_source_agents=None)
+
+def test_hybrid_query_k_limits_results(adapter_for_hybrid, mocker):
+    """Test that K correctly limits the final results."""
+    adapter = adapter_for_hybrid
+    mocker.patch.object(adapter, 'query', return_value=[doc3, doc1, doc2, doc4])
+    mocker.patch.object(adapter, 'semantic_query', return_value=[doc1, doc4, doc2, doc3])
+
+    # Ask for only 1 result
+    results_with_scores = adapter.hybrid_query("computer fruit", k=1, rrf_k=60)
+    assert len(results_with_scores) == 1
+    assert results_with_scores[0][0].id == "doc1" # Highest score is doc1
+
+    # Ask for more results than available unique docs
+    results_with_scores = adapter.hybrid_query("computer fruit", k=10, rrf_k=60)
+    assert len(results_with_scores) == 4 # Only 4 unique docs mocked
+    assert {doc.id for doc, _ in results_with_scores} == {"doc1", "doc2", "doc3", "doc4"}
+
+def test_hybrid_query_no_results(adapter_for_hybrid, mocker):
+    """Test hybrid query when underlying queries return nothing."""
+    adapter = adapter_for_hybrid
+    mocker.patch.object(adapter, 'query', return_value=[])
+    mocker.patch.object(adapter, 'semantic_query', return_value=[])
+
+    results_with_scores = adapter.hybrid_query("nonexistent", k=5)
+    assert len(results_with_scores) == 0
+
+# --- End Hybrid Query Tests ---
+
+
+
+def test_close(adapter_with_docs): # Use the fixture that provides a populated adapter
+    """Test closing the adapter."""
+    adapter = adapter_with_docs[0] # Fixture returns (adapter, mock_manager, doc_objects)
+    adapter.close()
+    assert adapter.conn is None

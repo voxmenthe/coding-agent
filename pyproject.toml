@@ -19,6 +19,9 @@ google-genai = "^1.10.0"
 googlemaps = "^4.10.0"
 instructor = ">=1.4.3,<2.0.0"
 ipykernel = ">=6.29,<7.0"
+langchain = ">=0.3.24,<0.4.0"
+langsmith = "*"
+langgraph = ">=0.3.34,<0.4.0"
 markdown = "^3.7.0"
 matplotlib = ">=3.9.0,<4.0.0"
 notebook = ">=7.2.0,<8.0.0"
@@ -48,6 +51,11 @@ pdfplumber = "^0.11.6" # Added for PDF processing
 mypy = "^1.10.1"
 pytest = "^8.2.2"
 ruff = ">=0.6.0,<0.7.0"
+pytest-mock = "^3.14.0" # Added for mocker fixture
+pytest-asyncio = "^0.23.7"
+pytest-playwright = "^0.7.0"
+pytest-base-url = "^2.1.0"
+trio = "^0.26.0"
 
 [tool.coverage.run]
 source = ["src"]

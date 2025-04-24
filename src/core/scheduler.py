@@ -1,120 +1,67 @@
 import anyio
-import asyncio
 import logging
-from typing import List, Any # Replace 'Any' with actual Agent type later
+from typing import List
 
-logging.basicConfig(level=logging.INFO)
+from .agents.base import BaseAgent
+
+# Configure logging for the scheduler
 log = logging.getLogger(__name__)
-
-# Placeholder for the actual Agent base class/type
-Agent = Any 
+# Use a standard format
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 class TaskScheduler:
-    """Manages the concurrent execution of agents using anyio."""
+    """Manages the concurrent execution of agent tasks using AnyIO."""
 
-    def __init__(self, max_concurrent: int = 3, timeout_s: float = 120.0):
-        """Initializes the scheduler.
-        
+    def __init__(self, max_concurrent_tasks: int = 5):
+        """Initializes the TaskScheduler.
+
         Args:
-            max_concurrent: The maximum number of agents allowed to run concurrently.
-            timeout_s: Maximum time in seconds for a single agent step to complete.
+            max_concurrent_tasks: The maximum number of agent tasks to run concurrently.
         """
-        if max_concurrent <= 0:
-            raise ValueError("max_concurrent must be positive")
-        if timeout_s <= 0:
-            raise ValueError("timeout_s must be positive")
-            
-        self.semaphore = anyio.Semaphore(max_concurrent)
-        self.timeout = timeout_s
-        # Optional: Could add a queue here if tasks need to be submitted dynamically
-        # self.work_queue = asyncio.Queue()
-        log.info(f"TaskScheduler initialized (max_concurrent={max_concurrent}, timeout={timeout_s}s)")
+        if max_concurrent_tasks < 1:
+            raise ValueError("max_concurrent_tasks must be at least 1")
+        self.max_concurrent_tasks = max_concurrent_tasks
+        self._tasks: List[BaseAgent] = [] # Store agent instances to run
+        log.info(f"TaskScheduler initialized with max_concurrent_tasks={self.max_concurrent_tasks}")
 
-    async def _run_agent_step(self, agent: Agent):
-        """Runs a single step of an agent within semaphore and timeout constraints."""
-        agent_name = getattr(agent, 'name', agent.__class__.__name__) # Get agent name if available
-        log.info(f"Scheduler: Aquiring semaphore for {agent_name}...")
-        async with self.semaphore:
-            log.info(f"Scheduler: Running {agent_name} step...")
+    def add_task(self, agent_instance: BaseAgent) -> None:
+        """Adds an agent instance to the list of tasks to be run."""
+        if not isinstance(agent_instance, BaseAgent):
+            raise TypeError("agent_instance must be an instance of BaseAgent or its subclass")
+        self._tasks.append(agent_instance)
+        # Attempt to get agent_id for logging, default to class name if not present
+        agent_id = getattr(agent_instance, 'agent_id', 'N/A')
+        log.info(f"Added task for agent: {agent_instance.__class__.__name__} (ID: {agent_id})")
+
+    # --- run, _run_internal, _run_agent_task methods will be added next ---
+
+    async def run(self) -> None:
+        """Runs all added tasks concurrently, respecting the concurrency limit."""
+        log.info(f"Starting scheduler run with {len(self._tasks)} tasks.")
+        if not self._tasks:
+            log.warning("No tasks added to the scheduler. Exiting run.")
+            return
+
+        try:
+            async with anyio.create_task_group() as tg:
+                semaphore = anyio.Semaphore(self.max_concurrent_tasks)
+                for agent_instance in self._tasks:
+                    tg.start_soon(self._run_agent_task, agent_instance, semaphore)
+            log.info("Scheduler run finished successfully.")
+        except Exception as e:
+            log.exception("An error occurred during scheduler run.")
+            # Depending on desired behavior, could re-raise or handle
+
+    async def _run_agent_task(self, agent_instance: BaseAgent, semaphore: anyio.Semaphore) -> None:
+        """Internal method to run a single agent task, managing the semaphore and errors."""
+        agent_id = getattr(agent_instance, 'agent_id', 'N/A')
+        agent_name = agent_instance.__class__.__name__
+        async with semaphore:
+            log.info(f"Starting execution for agent: {agent_name} (ID: {agent_id})")
             try:
-                async with anyio.fail_after(self.timeout):
-                    # Assuming agent.run_step() is a synchronous method that needs to be run in a thread
-                    # If run_step becomes async later, this can change to 'await agent.run_step()'
-                    result = await anyio.to_thread.run_sync(agent.run_step)
-                    log.info(f"Scheduler: {agent_name} step completed.")
-                    return result
-            except TimeoutError:
-                log.error(f"Scheduler: Timeout exceeded ({self.timeout}s) for agent {agent_name}!")
-                # Handle timeout (e.g., log, return error, cancel agent?)
-                return None # Or raise an exception
+                # Assuming BaseAgent.run is async as defined
+                await agent_instance.run()
+                log.info(f"Finished execution for agent: {agent_name} (ID: {agent_id})")
             except Exception as e:
-                log.error(f"Scheduler: Error running agent {agent_name}: {e}", exc_info=True)
-                # Handle other exceptions
-                return None # Or raise
-
-    async def run_pipeline(self, agents: List[Agent]):
-        """Runs a list of agents concurrently.
-
-        Args:
-            agents: A list of agent instances to run.
-        """
-        if not agents:
-            log.warning("Scheduler: No agents provided to run_pipeline.")
-            return []
-
-        log.info(f"Scheduler: Starting pipeline with {len(agents)} agents.")
-        results = []
-        async with anyio.create_task_group() as tg:
-            for agent in agents:
-                # Using start_soon to run _run_agent_step for each agent concurrently
-                # Need to capture results if _run_agent_step returns them
-                # Option 1: Pass a list/dict to append results (careful with concurrency)
-                # Option 2: Use tg.start() and collect results from the returned task handles
-                # Option 3: Simpler - if results aren't critical per-step, just launch
-                tg.start_soon(self._run_agent_step, agent)
-                # If results are needed:
-                # task = await tg.start(self._run_agent_step, agent)
-                # results.append(task) # Store task handles
-        
-        # If using Option 2/3, results might need processing after tg completes
-        # For now, assuming results are handled by agents saving to memory
-        log.info("Scheduler: Agent pipeline execution finished.")
-        # Process results from task handles if needed
-        # final_results = [await t.get_result() for t in results if t] # Example
-        return [] # Placeholder
-
-# Example Usage (if run directly)
-if __name__ == '__main__':
-    
-    # Dummy Agent class for testing
-    class DummyAgent:
-        def __init__(self, name: str, duration: float = 1.0):
-            self.name = name
-            self.duration = duration
-        
-        def run_step(self):
-            """Simulates a synchronous agent step."""
-            print(f"Agent [{self.name}]: Starting step (will take {self.duration}s)")
-            time.sleep(self.duration)
-            print(f"Agent [{self.name}]: Finishing step.")
-            return f"{self.name} result"
-
-    async def main():
-        print("--- Testing TaskScheduler ---")
-        scheduler = TaskScheduler(max_concurrent=2, timeout_s=5.0)
-        
-        agents_to_run = [
-            DummyAgent("Agent A", duration=2.0),
-            DummyAgent("Agent B", duration=3.0),
-            DummyAgent("Agent C", duration=1.0),
-            DummyAgent("Agent D", duration=2.5),
-        ]
-        
-        print(f"Running {len(agents_to_run)} agents...")
-        await scheduler.run_pipeline(agents_to_run)
-        print("--- Test Finished ---")
-
-    # Need time module for DummyAgent sleep
-    import time 
-    anyio.run(main)
-
+                log.exception(f"Error executing agent: {agent_name} (ID: {agent_id})")
+                # Decide how to handle agent errors (e.g., stop scheduler? continue?)

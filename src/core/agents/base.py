@@ -1,13 +1,14 @@
 from abc import ABC, abstractmethod
 import logging
+import abc
 
 # Configure logging for the base agent module
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 
-class BaseAgent(ABC):
-    """Abstract Base Class for all agents in the system."""
+class BaseAgent(abc.ABC):
+    """Abstract base class for all agents."""
 
     def __init__(self, agent_id: str, **kwargs):
         """Initializes the base agent.
@@ -25,21 +26,10 @@ class BaseAgent(ABC):
         """Returns the name of the agent class."""
         return self.__class__.__name__
 
-    @abstractmethod
-    def run_step(self, *args, **kwargs) -> any:
-        """Executes a single step of the agent's logic.
-        
-        This method should contain the core processing for the agent.
-        It will be called by the TaskScheduler, likely within a thread.
-
-        Args:
-            *args: Positional arguments specific to the agent's task.
-            **kwargs: Keyword arguments specific to the agent's task.
-            
-        Returns:
-            Any result produced by the agent's step (optional).
-        """
-        pass # Must be implemented by subclasses
+    @abc.abstractmethod
+    async def run(self) -> None:
+        """The main execution logic for the agent."""
+        raise NotImplementedError
 
     # Optional: Add common helper methods here if needed by multiple agents
     # For example, interacting with a shared configuration or state manager.
@@ -51,9 +41,7 @@ class BaseAgent(ABC):
 #         self.specific_param = specific_param
 #         log.info(f"MyConcreteAgent specific param: {self.specific_param}")
 
-#     def run_step(self, input_data: str) -> str:
-#         log.info(f"[{self.name} / {self.agent_id}] Running step with input: {input_data}")
+#     async def run(self) -> None:
+#         log.info(f"[{self.name} / {self.agent_id}] Running step.")
 #         # --- Agent logic here ---
-#         result = f"Processed '{input_data}' using '{self.specific_param}'"
 #         log.info(f"[{self.name} / {self.agent_id}] Step finished.")
-#         return result

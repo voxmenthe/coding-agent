@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 import uuid
+from typing import List, Optional, Dict, Tuple
 
 from .adapter import MemoryAdapter, MemoryDoc
 from .embedding_manager import EmbeddingManager
@@ -277,6 +278,84 @@ class HybridSQLiteAdapter(MemoryAdapter):
 
         log.info(f"Semantic query returned {len(final_results)} results.")
         return final_results
+
+    def hybrid_query(
+        self,
+        query_text: str,
+        k: int = 10,
+        filter_tags: Optional[List[str]] = None,
+        filter_source_agents: Optional[List[str]] = None,
+        rrf_k: int = 60,  # RRF constant, common default is 60
+    ) -> List[Tuple[MemoryDoc, float]]:
+        """Perform a hybrid search combining FTS and semantic search using RRF.
+
+        Args:
+            query_text: The text to search for.
+            k: The final number of results to return.
+            filter_tags: Optional list of tags to filter results by.
+            filter_source_agents: Optional list of source agents to filter results by.
+            rrf_k: The constant used in the RRF calculation (default: 60).
+
+        Returns:
+            A list of tuples, each containing a MemoryDoc and its RRF score,
+            sorted by score in descending order.
+        """
+        # 1. Perform FTS query
+        # We fetch more results initially to give RRF a good pool to work with
+        fts_results = self.query(
+            query_text,
+            k=k * 5,  # Fetch more for ranking
+            filter_tags=filter_tags,
+            filter_source_agents=filter_source_agents,
+        )
+
+        # 2. Perform Semantic query
+        semantic_results = self.semantic_query(
+            query_text,
+            k=k * 5,  # Fetch more for ranking
+            filter_tags=filter_tags,
+            filter_source_agents=filter_source_agents,
+        )
+
+        # 3. Combine results using Reciprocal Rank Fusion (RRF)
+        ranked_results: Dict[str, float] = {}
+
+        # Process FTS results
+        for rank, doc in enumerate(fts_results):
+            doc_id = str(doc.id)
+            if doc_id not in ranked_results:
+                ranked_results[doc_id] = 0.0
+            ranked_results[doc_id] += 1.0 / (rrf_k + rank)
+
+        # Process Semantic results
+        for rank, doc in enumerate(semantic_results):
+            doc_id = str(doc.id)
+            if doc_id not in ranked_results:
+                ranked_results[doc_id] = 0.0
+            ranked_results[doc_id] += 1.0 / (rrf_k + rank)
+
+        # 4. Sort by RRF score
+        sorted_doc_ids = sorted(ranked_results.keys(), key=lambda doc_id: ranked_results[doc_id], reverse=True)
+
+        # 5. Retrieve full MemoryDoc objects for the top K results
+        final_results: List[Tuple[MemoryDoc, float]] = []
+        doc_map = {str(doc.id): doc for doc in fts_results + semantic_results}
+
+        for doc_id in sorted_doc_ids[:k]:
+            if doc_id in doc_map:
+                # Add the doc and its score, ensuring no duplicates if a doc was only in one list initially
+                if not any(res[0].id == doc_map[doc_id].id for res in final_results):
+                     final_results.append((doc_map[doc_id], ranked_results[doc_id]))
+            else:
+                # This case might happen if filters were applied differently or
+                # if a doc appeared very low in both lists and wasn't fetched.
+                # Fetch the doc explicitly if needed, though less likely with k*5 fetch.
+                # For simplicity here, we rely on the combined list. If a doc_id isn't
+                # in doc_map, it means it wasn't in the top k*5 of either search.
+                pass # Or log a warning
+
+        # Ensure we don't exceed k due to potential rounding/tie issues (unlikely with float scores)
+        return final_results[:k]
 
     def close(self):
         """Closes the SQLite database connection."""

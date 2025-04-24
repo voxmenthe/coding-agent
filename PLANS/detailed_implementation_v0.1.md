@@ -79,24 +79,44 @@ This plan elaborates on the 3-week roadmap outlined in `PLANS/integrated_plan.md
 
 **Tasks:**
 
-1.  **[ ] Memory System - RRF Fusion:**
-    *   `[ ]` Update `HybridSQLiteAdapter` to add a new method, e.g., `hybrid_query()`.
-    *   `[ ]` This method performs both FTS (`query`) and semantic (`semantic_query`) searches internally.
-    *   `[ ]` Implement Reciprocal Rank Fusion (RRF) logic to combine the ranked results.
-    *   `[ ]` Add configuration for RRF weighting.
-    *   `[ ]` Add unit tests for RRF implementation.
-    *   `[ ]` Benchmark query performance (latency).
+1.  **[X] Memory System - RRF Fusion:**
+    *   `[X]` Update `HybridSQLiteAdapter` to add a new method, e.g., `hybrid_query()`.
+    *   `[X]` This method performs both FTS (`query`) and semantic (`semantic_query`) searches internally.
+    *   `[X]` Implement Reciprocal Rank Fusion (RRF) logic to combine the ranked results.
+    *   `[X]` Add configuration for RRF weighting (`rrf_k` parameter).
+    *   `[X]` Add unit tests for RRF implementation.
+    *   `[ ]` Benchmark query performance (latency). (*Deferred - Low Priority*)
 
-2.  **[ ] Concurrency - Scheduler Implementation:**
-    *   `[ ]` Fully implement `TaskScheduler` in `src/core/scheduler.py` based on the `anyio` design.
-    *   `[ ]` Implement `_run_agent` using `anyio.to_thread.run_sync`.
-    *   `[ ]` Implement `run` method using `anyio.create_task_group`.
-    *   `[ ]` Add tests for `TaskScheduler` functionality.
+2.  **[X] Concurrency - Scheduler Implementation:**
+    *   `[X]` Define `TaskScheduler` class in `src/core/scheduler.py`.
+    *   `[X]` Implement `__init__(max_concurrent_tasks: int)`.
+    *   `[X]` Store tasks internally (e.g., a list of agent instances).
+    *   `[X]` Implement `add_task(agent_instance: BaseAgent)` method.
+    *   `[X]` Implement `async run()` method which internally calls `_run_internal` (merged logic).
+    *   `[X]` Implement `async _run_internal()` (merged into `run`): 
+        *   `[X]` Initialize `anyio.Semaphore(self.max_concurrent_tasks)`.
+        *   `[X]` Use `anyio.create_task_group()`.
+        *   `[X]` Iterate tasks, calling `task_group.start_soon(self._run_agent_task, agent_instance, semaphore)`.
+    *   `[X]` Implement private `async _run_agent_task(agent_instance, semaphore)`:
+        *   `[X]` Acquire the semaphore: `async with semaphore:`.
+        *   `[X]` Log agent start.
+        *   `[X]` Execute agent's main logic (`await agent_instance.run()`).
+            *   *Decision:* Assumed agent `run` methods are `async`. Checked `BaseAgent` definition.
+        *   `[X]` Log agent completion or error.
+        *   `[X]` Use `try...except` for agent error logging; `async with` handles semaphore release.
+    *   `[X]` Add tests for `TaskScheduler` in `tests/core/test_scheduler.py`:
+        *   `[X]` Test task addition & initialization.
+        *   `[X]` Test basic execution flow with mock agents.
+        *   `[X]` Test concurrency limiting using mock agents with delays and callbacks.
+        *   `[X]` Test error handling (scheduler continues if one agent fails).
+    *   `[X]` Add `trio` dependency for `pytest-anyio` cross-backend testing.
+    *   *Notes:* Implemented using `anyio` library for async operations. Handles concurrency with a semaphore and manages task execution within a task group. Basic error handling logs agent exceptions but allows the scheduler to continue.
 
-3.  **[ ] Concurrency - Adapter Usage Review:**
-    *   `[ ]` Review concurrency needs for `HybridSQLiteAdapter` when used by multiple agents via `TaskScheduler`.
-    *   `[ ]` Decide if separate adapter instances per agent thread are needed, or if internal locking/queueing is required for shared instances (especially for writes).
-    *   `[ ]` Add `filelock` around `.npy` file writing in `EmbeddingManager` for robustness if not already present.
+3.  **[X] Concurrency - Adapter Usage Review:**
+    *   `[X]` **Analyze `HybridSQLiteAdapter` Thread Safety:** Analysis complete. The current adapter uses `check_same_thread=False`, making the single `sqlite3` connection unsafe for concurrent writes if the adapter instance is shared across tasks/threads.
+    *   `[X]` **Consider Connection Strategy & Decision:** **Decision Made: Each agent task will receive its own `HybridSQLiteAdapter` instance.** This avoids sharing the unsafe connection object. SQLite's built-in file-level locking will handle concurrency between these separate connections to the same database file. This requires passing configuration (like DB path) to agents or using an adapter factory during agent initialization.
+    *   `[-]` ~~Evaluate Async Adapter (`aiosqlite`):~~ Not pursued as the primary safety issue is resolved by instance-per-task strategy.
+    *   `[X]` **Decision Documentation:** Decision documented here and in the high-level plan.
 
 4.  **[ ] Core Agents (Ingestor, Summarizer, Synthesizer):**
     *   `[ ]` Implement `IngestorAgent`: Use `pdfplumber` for parsing, chunking logic, use `HybridSQLiteAdapter.add` to store chunks.
