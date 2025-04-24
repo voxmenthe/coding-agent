@@ -240,3 +240,235 @@ def test_query_memory_fts(db_paths):
     finally:
         if adapter:
             adapter.close()
+
+# --- Fixture for Semantic Query Tests --- 
+
+@pytest.fixture
+def adapter_with_docs(db_paths, mock_embedding_manager):
+    """Sets up an adapter instance and adds multiple documents for semantic tests."""
+    db_path_str, emb_path_str = db_paths
+    
+    # Use the mock manager provided by the fixture
+    # Configure its behavior for the add operations
+    saved_paths = {}
+    def mock_gen_save_capture(text, doc_id):
+        mock_path = mock_embedding_manager.embedding_dir / f"{doc_id}.npy"
+        saved_paths[doc_id] = mock_path # Store path for later reference if needed
+        return mock_path
+    mock_embedding_manager.generate_and_save_embedding.side_effect = mock_gen_save_capture
+    mock_embedding_manager.embedding_model = MagicMock() # Ensure it has a model attribute
+    
+    # Patch the class globally for this fixture setup
+    with patch('src.memory.hybrid_sqlite.EmbeddingManager', return_value=mock_embedding_manager):
+        adapter = HybridSQLiteAdapter(db_path_str=db_path_str, 
+                                      embedding_dir_str=emb_path_str,
+                                      embedding_model=MagicMock()) # Pass dummy model
+
+        docs_data = [
+            {"id": "doc1", "text": "Apples are red fruit.", "tags": ["fruit", "food"], "source_agent": "AgentA"},
+            {"id": "doc2", "text": "Oranges are orange citrus.", "tags": ["fruit", "citrus"], "source_agent": "AgentA"},
+            {"id": "doc3", "text": "Bananas are yellow and long.", "tags": ["fruit", "berry"], "source_agent": "AgentB"},
+            {"id": "doc4", "text": "Carrots are orange vegetables.", "tags": ["vegetable", "food"], "source_agent": "AgentB"},
+            {"id": "doc5", "text": "Red cars go fast.", "tags": ["vehicle"], "source_agent": "AgentA"},
+        ]
+        
+        doc_objects = []
+        for data in docs_data:
+            # Ensure timestamp and full MemoryDoc structure
+            doc = MemoryDoc(
+                id=data["id"],
+                text=data["text"],
+                timestamp=datetime.now(timezone.utc),
+                source_agent=data["source_agent"],
+                tags=data["tags"],
+                metadata={"source": "fixture"}
+            )
+            adapter.add(doc)
+            doc_objects.append(doc)
+            
+        yield adapter, mock_embedding_manager, doc_objects # Provide adapter, manager, and added docs to tests
+
+    # Teardown: close connection
+    if adapter:
+        adapter.close()
+
+# --- Semantic Query Tests --- 
+
+MOCK_QUERY_EMBEDDING = np.array([0.1, 0.2, 0.3])
+MOCK_DOC_EMBEDDINGS = {
+    "doc1": np.array([0.11, 0.21, 0.31]), # High similarity
+    "doc2": np.array([0.5, 0.5, 0.5]),   # Medium similarity
+    "doc3": np.array([0.9, 0.9, 0.9]),   # Low similarity
+    "doc4": np.array([0.8, 0.8, 0.8]),   # Low similarity
+    "doc5": np.array([0.01, 0.02, 0.03]) # Very high similarity (to test ranking)
+}
+
+MOCK_SIMILARITIES = {
+    ("query", "doc1"): 0.95,
+    ("query", "doc2"): 0.60,
+    ("query", "doc3"): 0.10,
+    ("query", "doc4"): 0.15,
+    ("query", "doc5"): 0.99
+}
+
+def test_semantic_query_basic(adapter_with_docs):
+    """Test basic semantic query, returning results ranked by similarity."""
+    adapter, manager, _ = adapter_with_docs
+    query_text = "Tell me about red things"
+
+    # --- Configure Mock EmbeddingManager for Query --- 
+    # 1. Mock query embedding generation
+    manager.generate_embedding.return_value = MOCK_QUERY_EMBEDDING
+
+    # 2. Mock loading document embeddings (based on path stored during add)
+    def mock_load(embedding_path):
+        doc_id = Path(embedding_path).stem # Extract doc_id from filename
+        return MOCK_DOC_EMBEDDINGS.get(doc_id) 
+    manager.load_embedding.side_effect = mock_load
+
+    # 3. Mock similarity calculation
+    def mock_similarity(query_emb, doc_emb):
+        # Find which doc_emb this is to look up the score
+        # This is a bit simplified; assumes only MOCK_DOC_EMBEDDINGS are involved
+        doc_id = None
+        for d_id, d_emb in MOCK_DOC_EMBEDDINGS.items():
+            if np.array_equal(doc_emb, d_emb):
+                doc_id = d_id
+                break
+        if doc_id and np.array_equal(query_emb, MOCK_QUERY_EMBEDDING):
+            return MOCK_SIMILARITIES.get(("query", doc_id), 0.0) # Default 0
+        return 0.0 # Default similarity if lookup fails
+    manager.calculate_similarity.side_effect = mock_similarity
+    
+    # --- Action --- 
+    results = adapter.semantic_query(query_text, k=5)
+
+    # --- Assertions --- 
+    assert len(results) == 5, "Should return all 5 documents when k=5"
+    
+    # Check order based on MOCK_SIMILARITIES (highest first)
+    expected_order = ["doc5", "doc1", "doc2", "doc4", "doc3"] # Based on scores: 0.99, 0.95, 0.60, 0.15, 0.10
+    actual_order = [doc.id for doc in results]
+    assert actual_order == expected_order, f"Results not in expected similarity order. Got: {actual_order}"
+    
+    # Check scores are included in results
+    for doc in results:
+        expected_score = MOCK_SIMILARITIES.get(("query", doc.id), 0.0)
+        assert hasattr(doc, 'score'), f"Document {doc.id} should have a 'score' attribute"
+        assert np.isclose(doc.score, expected_score), f"Doc {doc.id} score mismatch. Got {doc.score}, Expected {expected_score}"
+
+def test_semantic_query_k_limit(adapter_with_docs):
+    """Test that the 'k' parameter limits the number of results."""
+    adapter, manager, _ = adapter_with_docs
+    query_text = "Tell me about fruit"
+
+    # Configure mock manager (same as basic test)
+    manager.generate_embedding.return_value = MOCK_QUERY_EMBEDDING
+    def mock_load(embedding_path):
+        doc_id = Path(embedding_path).stem
+        return MOCK_DOC_EMBEDDINGS.get(doc_id)
+    manager.load_embedding.side_effect = mock_load
+    def mock_similarity(query_emb, doc_emb):
+        doc_id = None
+        for d_id, d_emb in MOCK_DOC_EMBEDDINGS.items():
+            if np.array_equal(doc_emb, d_emb):
+                doc_id = d_id
+                break
+        if doc_id and np.array_equal(query_emb, MOCK_QUERY_EMBEDDING):
+            return MOCK_SIMILARITIES.get(("query", doc_id), 0.0)
+        return 0.0
+    manager.calculate_similarity.side_effect = mock_similarity
+    
+    # --- Action --- 
+    results = adapter.semantic_query(query_text, k=3)
+    
+    # --- Assertions --- 
+    assert len(results) == 3, "Should return exactly 3 documents when k=3"
+    # Check if they are the top 3 from the basic test
+    expected_top_3 = ["doc5", "doc1", "doc2"]
+    actual_order = [doc.id for doc in results]
+    assert actual_order == expected_top_3, "Should return the top 3 most similar documents."
+
+def test_semantic_query_filter_tags(adapter_with_docs):
+    """Test filtering results by tags (single and multiple)."""
+    adapter, manager, all_docs = adapter_with_docs
+    query_text = "food items"
+    
+    # Configure mock manager (same as basic test)
+    manager.generate_embedding.return_value = MOCK_QUERY_EMBEDDING
+    manager.load_embedding.side_effect = lambda path: MOCK_DOC_EMBEDDINGS.get(Path(path).stem)
+    manager.calculate_similarity.side_effect = lambda q_emb, d_emb: \
+        next((score for (q, d_id), score in MOCK_SIMILARITIES.items() if q == "query" and np.array_equal(d_emb, MOCK_DOC_EMBEDDINGS[d_id])), 0.0) \
+        if np.array_equal(q_emb, MOCK_QUERY_EMBEDDING) else 0.0
+
+    # --- Test Single Tag Filter --- 
+    results_fruit = adapter.semantic_query(query_text, k=5, filter_tags=["fruit"])
+    # Expected: doc1, doc2, doc3 have 'fruit' tag
+    expected_ids_fruit = {"doc1", "doc2", "doc3"}
+    actual_ids_fruit = {doc.id for doc in results_fruit}
+    assert actual_ids_fruit == expected_ids_fruit, "Filter by single tag 'fruit' failed."
+    # Check order is still maintained within the filtered set
+    expected_order_fruit = ["doc1", "doc2", "doc3"] # Scores: 0.95, 0.60, 0.10
+    actual_order_fruit = [doc.id for doc in results_fruit]
+    assert actual_order_fruit == expected_order_fruit
+    
+    # --- Test Multiple Tag Filter (AND logic) --- 
+    results_food_veg = adapter.semantic_query(query_text, k=5, filter_tags=["food", "vegetable"])
+    # Expected: Only doc4 has both 'food' and 'vegetable'
+    expected_ids_food_veg = {"doc4"}
+    actual_ids_food_veg = {doc.id for doc in results_food_veg}
+    assert actual_ids_food_veg == expected_ids_food_veg, "Filter by multiple tags ['food', 'vegetable'] failed."
+    assert len(results_food_veg) == 1
+    assert results_food_veg[0].id == "doc4"
+
+def test_semantic_query_filter_source_agent(adapter_with_docs):
+    """Test filtering results by source_agent."""
+    adapter, manager, _ = adapter_with_docs
+    query_text = "Agent B documents"
+    
+    # Configure mock manager (same as basic test)
+    manager.generate_embedding.return_value = MOCK_QUERY_EMBEDDING
+    manager.load_embedding.side_effect = lambda path: MOCK_DOC_EMBEDDINGS.get(Path(path).stem)
+    manager.calculate_similarity.side_effect = lambda q_emb, d_emb: \
+        next((score for (q, d_id), score in MOCK_SIMILARITIES.items() if q == "query" and np.array_equal(d_emb, MOCK_DOC_EMBEDDINGS[d_id])), 0.0) \
+        if np.array_equal(q_emb, MOCK_QUERY_EMBEDDING) else 0.0
+
+    # --- Action --- 
+    results = adapter.semantic_query(query_text, k=5, filter_source_agents=["AgentB"])
+    
+    # --- Assertions --- 
+    # Expected: doc3, doc4 are from AgentB
+    expected_ids = {"doc3", "doc4"}
+    actual_ids = {doc.id for doc in results}
+    assert actual_ids == expected_ids, "Filter by source_agent 'AgentB' failed."
+    # Check order within filtered set
+    expected_order = ["doc4", "doc3"] # Scores: 0.15, 0.10
+    actual_order = [doc.id for doc in results]
+    assert actual_order == expected_order
+
+def test_semantic_query_filter_combined(adapter_with_docs):
+    """Test filtering results by both tags and source_agent."""
+    adapter, manager, _ = adapter_with_docs
+    query_text = "Agent A fruit documents"
+    
+    # Configure mock manager (same as basic test)
+    manager.generate_embedding.return_value = MOCK_QUERY_EMBEDDING
+    manager.load_embedding.side_effect = lambda path: MOCK_DOC_EMBEDDINGS.get(Path(path).stem)
+    manager.calculate_similarity.side_effect = lambda q_emb, d_emb: \
+        next((score for (q, d_id), score in MOCK_SIMILARITIES.items() if q == "query" and np.array_equal(d_emb, MOCK_DOC_EMBEDDINGS[d_id])), 0.0) \
+        if np.array_equal(q_emb, MOCK_QUERY_EMBEDDING) else 0.0
+
+    # --- Action --- 
+    results = adapter.semantic_query(query_text, k=5, filter_tags=["fruit"], filter_source_agents=["AgentA"])
+    
+    # --- Assertions --- 
+    # Expected: doc1, doc2 are from AgentA AND have tag 'fruit'
+    expected_ids = {"doc1", "doc2"}
+    actual_ids = {doc.id for doc in results}
+    assert actual_ids == expected_ids, "Combined filter for tag 'fruit' and source_agent 'AgentA' failed."
+    # Check order
+    expected_order = ["doc1", "doc2"] # Scores: 0.95, 0.60
+    actual_order = [doc.id for doc in results]
+    assert actual_order == expected_order
+
+# TODO: Add tests for missing embeddings etc.
