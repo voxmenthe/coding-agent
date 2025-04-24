@@ -119,9 +119,13 @@ This plan elaborates on the 3-week roadmap outlined in `PLANS/integrated_plan.md
     *   `[X]` **Decision Documentation:** Decision documented here and in the high-level plan.
 
 4.  **[ ] Core Agents (Ingestor, Summarizer, Synthesizer):**
-    *   `[ ]` Implement `IngestorAgent`: Use `pdfplumber` for parsing, chunking logic, use `HybridSQLiteAdapter.add` to store chunks.
-    *   `[ ]` Implement `SummarizerAgent`: Use `HybridSQLiteAdapter.query/semantic_query` to get chunks for one paper, generate a summary (mock/real LLM), use `HybridSQLiteAdapter.add` to store summary.
-    *   `[ ]` Implement `SynthesizerAgent`: Use `HybridSQLiteAdapter.query/semantic_query` to get summaries/chunks across papers, generate synthesis (mock/real LLM), use `HybridSQLiteAdapter.add`.
+    *   `[ ]` Implement `IngestorAgent`:
+        *   `[ ]` Implement multiple PDF parsing strategies (e.g., `pdfplumber`, Gemini API, external service) selected via `src/config.py`.
+        *   `[ ]` Define configuration options in `src/config.py` for PDF parsing strategy selection.
+        *   `[ ]` Implement chunking logic.
+        *   `[ ]` Use `HybridSQLiteAdapter.add` to store chunks.
+    *   `[ ]` Implement `SummarizerAgent`: Use `HybridSQLiteAdapter.query/hybrid_query` to get chunks for one paper, generate a summary (mock/real LLM), use `HybridSQLiteAdapter.add` to store summary.
+    *   `[ ]` Implement `SynthesizerAgent`: Use `HybridSQLiteAdapter.query/hybrid_query` to get summaries/chunks across papers, generate synthesis (mock/real LLM), use `HybridSQLiteAdapter.add`.
     *   `[ ]` Ensure agents correctly instantiate/receive `HybridSQLiteAdapter` instances.
     *   `[ ]` Add unit tests for these agents (mocking adapter/LLM).
 

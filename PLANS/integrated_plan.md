@@ -87,7 +87,7 @@ class MemoryDoc:
 
 | Role | Responsibilities | Tools needed | Status | Notes |
 |------|------------------|--------------|--------|-------|
-| Ingestor | PDF → chunks, add to memory | `pdfplumber`, `HybridSQLiteAdapter.add()` | TODO | | 
+| Ingestor | PDF → chunks, add to memory | Configurable: `pdfplumber`/Gemini/API, `HybridSQLiteAdapter.add()` | TODO | Parsing strategy selected via `src/config.py` |
 | Summarizer | Summaries per paper | `HybridSQLiteAdapter.query/hybrid_query()`, LLM | TODO | | 
 | Synthesizer | Cross‑paper ideas | Same | TODO | | 
 | Critic | Detect overlap, propose fixes | Same | TODO | | 
