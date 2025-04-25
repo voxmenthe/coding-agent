@@ -156,9 +156,12 @@ class HybridSQLiteAdapter(MemoryAdapter):
             JOIN memories m ON m.id = fts.rowid 
         """
         
-        where_clauses = ["fts.text_content MATCH ?"]
-        params = [query_text]
+        # Sanitize query_text for FTS5 phrase search: escape double quotes and wrap in double quotes
+        fts_query_text = '"' + query_text.replace('"', '""') + '"'
 
+        where_clauses = ["fts.text_content MATCH ?"] # Query text placeholder
+        params = [fts_query_text] # Use the sanitized query text
+        
         # Add tag filtering (requires ALL specified tags to be present)
         if filter_tags:
             # This assumes tags_json stores a JSON array like '["tag1", "tag2"]'
