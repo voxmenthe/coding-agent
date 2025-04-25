@@ -306,9 +306,8 @@ class IngestorAgent(BaseAgent):
 
                 # Add chunks to memory individually
                 for doc in memory_docs:
-                    self.memory_service.add_memory(doc) # Removed await
-                # Original line commented out for clarity:
-                # await self.memory_service.add_memory(memory_docs) 
+                    log.info(f"Adding chunk {doc.id} to memory for {pdf_path.name}")
+                    self.memory_service.add_memory(doc) # Call synchronously
                 chunks_added_for_file = len(memory_docs)
                 total_chunks_added += chunks_added_for_file
                 processed_files_count += 1
