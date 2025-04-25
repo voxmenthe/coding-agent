@@ -118,42 +118,45 @@ This plan elaborates on the 3-week roadmap outlined in `PLANS/integrated_plan.md
     *   `[-]` ~~Evaluate Async Adapter (`aiosqlite`):~~ Not pursued as the primary safety issue is resolved by instance-per-task strategy.
     *   `[X]` **Decision Documentation:** Decision documented here and in the high-level plan.
 
-4.  **[-] Core Agents (Ingestor, Summarizer, Synthesizer):**
-    *   `[-]` Implement `IngestorAgent`:
+4.  **[X] Core Agents (Ingestor, Summarizer, Synthesizer):**
+    *   `[X]` Implement `IngestorAgent`:
         *   `[X]` Basic structure and `run` method defined.
         *   `[X]` Initial implementation using `pdfplumber` (later refactored).
         *   `[X]` Refactored to use `pymupdf` strategy internally.
         *   `[X]` Implemented `_process_pdf_pymupdf` helper method.
         *   `[X]` Integrated `_chunk_text` (mocked in tests, needs real implementation).
         *   `[X]` Integrated memory adapter `add` call (mocked in tests, needs real adapter integration).
-        *   `[ ]` **Define Configuration:** Add `INGESTION_STRATEGY` setting in `src/config.py` (options: `pymupdf`, `mistral_ocr`, `gemini_native`). Also add required API keys (`MISTRAL_API_KEY`, `GEMINI_API_KEY`) handling (e.g., via environment variables or config).
-        *   `[ ]` **Input Handling:** Agent accepts PDF sources (e.g., file paths, potentially URLs later). Needs robust handling of paths provided in config.
-        *   `[ ]` **Strategy Selection:** Based on `INGESTION_STRATEGY` config, select one of the following implementations within the agent's `run` method:
+        *   `[X]` Unit tests added covering pymupdf, mocked mistral_ocr, mixed paths, and error handling.
+        *   `[ ]` **Define Configuration:** Add `INGESTION_STRATEGY` setting in `src/config.py` (options: `pymupdf`, `mistral_ocr`, `gemini_native`). Also add required API keys (`MISTRAL_API_KEY`, `GEMINI_API_KEY`) handling (e.g., via environment variables or config). Read this config within the agent.
+        *   `[ ]` **Input Handling:** Agent accepts PDF sources (e.g., file paths provided via constructor/config). Needs robust handling of these paths (checking existence, permissions).
+        *   `[ ]` **Strategy Selection:** Implement logic within the agent's `run` method to select the processing method based on the loaded `INGESTION_STRATEGY` configuration.
             *   **Method 0: PyMuPDF (`pymupdf`)**
                 *   `[X]` Core text extraction logic implemented in `_process_pdf_pymupdf`.
-                *   `[ ]` Needs integration with configuration and proper error handling.
+                *   `[ ]` Needs integration with configuration and proper error handling within the main `run` flow.
             *   **Method 1: Mistral OCR API (`mistral_ocr`)**
-                *   `[ ]` Reference `src/arxiv_ocr.py`.
-                *   `[ ]` Initialize `Mistral` client.
-                *   `[ ]` Prepare PDF content (read from file path).
-                *   `[ ]` Call `mistral_client.ocr()` with the PDF content (likely base64 encoded).
-                *   `[ ]` Process the returned JSON/Markdown response to extract structured text content.
-                *   `[ ]` Handle potential errors (API limits, network issues).
+                *   `[ ]` Reference `src/arxiv_ocr.py` or similar examples.
+                *   `[ ]` Initialize `MistralClient` (requires `MISTRAL_API_KEY` from config/env).
+                *   `[ ]` Prepare PDF content (read bytes from file path).
+                *   `[ ]` Call `mistral_client.files.create_async()` to upload.
+                *   `[ ]` Call `mistral_client.ocr.process_async()` using the returned file ID.
+                *   `[ ]` Process the returned `OCRResponse` object to extract structured text content (likely iterating through `pages`).
+                *   `[ ]` Handle potential errors (API key missing, API limits, network issues, file processing errors).
+                *   `[ ]` Delete the uploaded file using `mistral_client.files.delete_async()`.
             *   **Method 2: Gemini Native File Upload & Extraction (`gemini_native`)**
-                *   `[ ]` Reference `src/tools.py::upload_pdf_for_gemini` and `src/main.py::start_interaction`.
-                *   `[ ]` Initialize `genai.Client`.
+                *   `[ ]` Reference `src/tools.py::upload_pdf_for_gemini` and related usage.
+                *   `[ ]` Initialize `genai.Client` (requires `GOOGLE_API_KEY` from config/env).
                 *   `[ ]` Use helper function (potentially adapted from `upload_pdf_for_gemini`) to upload the PDF via `client.files.upload()` and wait for `ACTIVE` state. This returns a `types.File` object.
-                *   `[ ]` **Crucially:** Send a *separate* request to the Gemini chat model (`genai.ChatSession` or similar, *not* the file client) including the `types.File` object and a specific prompt instructing it to extract the full text content (e.g., "Extract the entire text of this PDF...").
-                *   `[ ]` Process the model's response to get the extracted text.
-                *   `[ ]` Handle file upload errors, processing timeouts, and extraction errors.
+                *   `[ ]` **Crucially:** Send a *separate* request to the Gemini chat model (`genai.GenerativeModel` or similar, *not* the file client) including the `types.File` object and a specific prompt instructing it to extract the full text content (e.g., "Extract the entire text content of the provided PDF, maintaining structure where possible.").
+                *   `[ ]` Process the model's response (`response.text`) to get the extracted text.
+                *   `[ ]` Handle file upload errors, processing timeouts, extraction errors, and potential API key issues.
                 *   `[ ]` Consider file lifecycle management (deleting uploaded files after extraction using `client.files.delete()`).
-        *   `[ ]` **Chunking Logic:** Implement text chunking strategy (e.g., fixed size, semantic chunking) on the extracted text from *any* method.
-        *   `[ ]` **Storage:** Use *actual* `HybridSQLiteAdapter.add` instance to store the text chunks along with relevant metadata (source PDF, chunk number, ingestion method used).
-        *   `[ ]` **Error Handling:** Implement robust error handling for file operations, API interactions, and adapter usage.
-    *   `[ ]` Implement `SummarizerAgent`: Use `HybridSQLiteAdapter.query/hybrid_query` to get chunks for one paper, generate a summary (mock/real LLM), use `HybridSQLiteAdapter.add` to store summary.
-    *   `[ ]` Implement `SynthesizerAgent`: Use `HybridSQLiteAdapter.query/hybrid_query` to get summaries/chunks across papers, generate synthesis (mock/real LLM), use `HybridSQLiteAdapter.add`.
+        *   `[ ]` **Chunking Logic:** Implement a text chunking strategy (e.g., fixed size with overlap using `textwrap` or a more sophisticated sentence-boundary based approach) on the extracted text obtained from *any* of the selected methods. This should happen *after* text extraction.
+        *   `[ ]` **Storage:** Use the *actual* `HybridSQLiteAdapter` instance (passed during agent initialization) to call `adapter.add(MemoryDoc(...))` for *each* text chunk, storing relevant metadata (source PDF path, chunk number, ingestion method used).
+        *   `[ ]` **Error Handling:** Implement robust error handling throughout the `run` method for file operations, API interactions, chunking, and adapter usage. Log errors clearly.
+    *   `[ ]` Implement `SummarizerAgent`: Use `HybridSQLiteAdapter.query/hybrid_query` to get chunks for one paper, generate a summary (initially maybe just concatenate chunks, later use a real LLM), use `HybridSQLiteAdapter.add` to store summary.
+    *   `[ ]` Implement `SynthesizerAgent`: Use `HybridSQLiteAdapter.query/hybrid_query` to get summaries/chunks across papers, generate synthesis (initially mock/placeholder, later use a real LLM), use `HybridSQLiteAdapter.add`.
     *   `[X]` Ensure agents correctly instantiate/receive `HybridSQLiteAdapter` instances (Decision made: instance per agent).
-    *   `[-]` Add unit tests for these agents (mocking adapter/LLM).
+    *   `[ ]` Add unit tests for these agents (mocking adapter/LLM).
         *   `[X]` Added tests for `IngestorAgent` covering `pymupdf`, `mistral_ocr` (mocked), error handling, mixed paths.
         *   `[ ]` Add tests for `SummarizerAgent`.
         *   `[ ]` Add tests for `SynthesizerAgent`.
