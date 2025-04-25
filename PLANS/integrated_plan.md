@@ -87,7 +87,7 @@ class MemoryDoc:
 
 | Role | Responsibilities | Tools needed | Status | Notes |
 |------|------------------|--------------|--------|-------|
-| Ingestor | PDF → chunks, add to memory | Configurable: `pdfplumber`/Gemini/API, `HybridSQLiteAdapter.add()` | TODO | Parsing strategy selected via `src/config.py` |
+| Ingestor | PDF → chunks, add to memory | Configurable: `pymupdf`/Mistral/Gemini, `HybridSQLiteAdapter.add()` | `[-] In Progress` | `PyMuPDF parsing tested. Needs config integration & other strategies (Mistral/Gemini). Chunking & real adapter usage needed.` |
 | Summarizer | Summaries per paper | `HybridSQLiteAdapter.query/hybrid_query()`, LLM | TODO | | 
 | Synthesizer | Cross‑paper ideas | Same | TODO | | 
 | Critic | Detect overlap, propose fixes | Same | TODO | | 
@@ -143,7 +143,7 @@ tests/
 | **2** | • RRF fusion completed | **DONE** | Implemented in `hybrid_query` |
 |       | • Scheduler Implementation | **DONE** | Using `anyio` |
 |       | • **Concurrency Review** | **DONE** | Decision made - use one adapter instance per agent task |
-|       | • Agent Implementation (Ingestor, Summarizer, Synthesizer roles) | TODO | |
+|       | • Agent Implementation (Ingestor, Summarizer, Synthesizer roles) | `[-] In Progress` | Ingestor started | 
 |       | • Integration test (max_concurrent=1 & 3) | TODO | |
 | **3** | • Critic role, free‑form feedback persistence | TODO | |
 |       | • Thin FastAPI (`/run`, `/status`) | TODO | |
@@ -163,5 +163,5 @@ tests/
 
 ### 10. Next Steps (Immediate Focus)
 1.  **[DONE] Concurrency Review:** Decision made - use one adapter instance per agent task.
-2.  **Agent Implementation:** Start implementing the agent roles (`Ingestor`, `Summarizer`, `Synthesizer`, `Critic`), ensuring each agent initializes or receives its **own** `HybridSQLiteAdapter` instance.
-3.  **Integration:** Integrate the agents with the scheduler.
+2.  **Agent Implementation:** Continue implementing agent roles (`Ingestor` [config/strategies/chunking/adapter], `Summarizer`, `Synthesizer`, `Critic`), ensuring each agent initializes or receives its **own** `HybridSQLiteAdapter` instance. Integrate real adapter usage (replacing mocks).
+3.  **Integration:** Integrate the agents with the scheduler and add integration tests.
