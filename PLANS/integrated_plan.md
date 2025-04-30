@@ -7,7 +7,7 @@ Multi‑Agent Research Synthesizer
 #### 1. Vision & Success Criteria
 *   Three collaborating agents (Summarizer, Synthesizer, Critic) run concurrently through an async wrapper and generate ≥3 distinct research ideas from two PDFs in ≤ 1.5 × single‑call latency.
 *   **[DONE]** Memory layer is **Hybrid/Pluggable**: local embeddings + SQLite FTS5, with **RRF implemented** (`hybrid_query`).
-*   Clean repo, CI, docs; CLI MVP plus stub REST endpoint.
+*   Clean repo, docs; CLI MVP plus stub REST endpoint.
 
 ---
 
@@ -83,14 +83,14 @@ class MemoryDoc:
 
 ---
 
-### 5. Agent Roles (v0.1 - Not Implemented Yet)
+### 5. Agent Roles (v0.1 - Prioritizing Minimal Viability)
 
 | Role | Responsibilities | Tools needed | Status | Notes |
 |------|------------------|--------------|--------|-------|
-| Ingestor | PDF → chunks, add to memory | Configurable: `pymupdf`/Mistral/Gemini, `HybridSQLiteAdapter.add()` | `[-] In Progress` | `PyMuPDF parsing tested. Needs config integration & other strategies (Mistral/Gemini). Chunking & real adapter usage needed.` |
-| Summarizer | Summaries per paper | `HybridSQLiteAdapter.query/hybrid_query()`, LLM | TODO | | 
-| Synthesizer | Cross‑paper ideas | Same | TODO | | 
-| Critic | Detect overlap, propose fixes | Same | TODO | | 
+| Ingestor | PDF → chunks, add to memory | Configurable: `pymupdf` (**Priority**)/Mistral/Gemini, `HybridSQLiteAdapter.add()` | `[-] In Progress` | `PyMuPDF parsing tested. **Needs basic chunking & real adapter integration ASAP**. Config integration & other strategies deferred.` |
+| Summarizer | Minimal summary per paper | `HybridSQLiteAdapter.query/hybrid_query()`, **Basic LLM call (Gemini)** | TODO | `Focus on basic structure, data flow, and simple Gemini API call. Needs API key handling.` |
+| Synthesizer | Minimal synthesis | Same, **Basic LLM call (Gemini)** | TODO | `Focus on basic structure, data flow, and simple Gemini API call. Needs API key handling.` |
+| Critic | Detect overlap, propose fixes | Same | TODO | `Deferred until core pipeline works.` |
 
 *   **[DONE]** `BaseAgent` defined in `src/core/agents/base.py`.
 *   Agents will need access to an instance of `HybridSQLiteAdapter` (**Strategy Decided:** Each agent gets its own instance).
@@ -105,10 +105,10 @@ src/
  │   ├─ scheduler.py      # **[DONE]**
  │   └─ agents/           # **[Partially Implemented]**
  │        ├─ base.py       # **[DONE]**
- │        ├─ ingestor.py   # TODO
- │        ├─ summarizer.py # TODO
- │        ├─ synthesizer.py# TODO
- │        └─ critic.py     # TODO
+ │        ├─ ingestor.py   # **[-] In Progress (Minimal)**
+ │        ├─ summarizer.py # TODO (Minimal)
+ │        ├─ synthesizer.py# TODO (Minimal)
+ │        └─ critic.py     # TODO (Deferred)
  ├─ memory/
  │   ├─ adapter.py        # MemoryDoc definition
  │   ├─ hybrid_sqlite.py  # HybridSQLiteAdapter **[DONE]**
@@ -133,35 +133,38 @@ tests/
 
 ---
 
-### 8. Implementation Road‑Map **[Updated Status]**
+### 8. Implementation Road‑Map **[Updated Status & Focus]**
 
 | Week | Deliverables | Status | Notes |
 |------|--------------|--------|-------|
-| **1** | • Repo cleanup, pre‑commit, GH Actions lint/test | *(Assumed Mostly Done)* | |
+| **1** | • ~~Repo cleanup, pre‑commit, GH Actions lint/test~~ | *(Removed)* | |
 |       | • `HybridSQLiteAdapter` Full Impl | **DONE** | |
 |       | • Example scripts created & tested | **DONE** | |
 | **2** | • RRF fusion completed | **DONE** | Implemented in `hybrid_query` |
 |       | • Scheduler Implementation | **DONE** | Using `anyio` |
 |       | • **Concurrency Review** | **DONE** | Decision made - use one adapter instance per agent task |
-|       | • Agent Implementation (Ingestor, Summarizer, Synthesizer roles) | `[-] In Progress` | Ingestor started | 
-|       | • Integration test (max_concurrent=1 & 3) | TODO | |
-| **3** | • Critic role, free‑form feedback persistence | TODO | |
-|       | • Thin FastAPI (`/run`, `/status`) | TODO | |
+|       | • **Minimal Agent Implementation** (Ingestor [`pymupdf`, basic chunking, real adapter], Summarizer [**Basic LLM**], Synthesizer [**Basic LLM**]) | `[-] In Progress` | **HIGHEST PRIORITY** |
+|       | • **Minimal CLI Integration** (Run basic pipeline) | TODO | **HIGH PRIORITY** |
+|       | • **Minimal Integration Test** (Basic pipeline flow) | TODO | **HIGH PRIORITY** |
+| **3** | • *Enhance Agents:* Ingestor (config, other strategies), Summarizer/Synthesizer (**Refined LLM Prompts/Logic**) | TODO | *After minimal pipeline* |
+|       | • Critic role implementation | TODO | *After minimal pipeline* |
+|       | • Thin FastAPI (`/run`, `/status`) | TODO | *Lower priority* |
 |       | • README demo script, blog‑style docs | TODO | Examples README done |
-|       | • Performance / rate‑limit tuning, timeouts | TODO | |
-|       | • Final CI: unit, integration, benchmark < 60 s | TODO | |
+|       | • Performance / rate‑limit tuning, timeouts | TODO | *Lower priority* |
+|       | • ~~Final CI: unit, integration, benchmark < 60 s~~ | *(Removed)* | |
 
 --- 
 
 ### 9. Testing & Benchmarks **[Partially Updated]**
-*   Unit Tests: `pytest` tests for `HybridSQLiteAdapter` (**including RRF**) exist. **[DONE]**. `TaskScheduler` tests exist. **[DONE]**. Need tests for agents.
-*   Integration: Need end-to-end tests with scheduler and agents.
+*   Unit Tests: `pytest` tests for `HybridSQLiteAdapter` (**including RRF**) exist. **[DONE]**. `TaskScheduler` tests exist. **[DONE]**. Need tests for minimal agents.
+*   Integration: Need **basic end-to-end test** for minimal pipeline first.
 *   Examples: Standalone example scripts serve as basic integration/usage tests. **[DONE]**
 *   Benchmark: Script needed to compare concurrent vs. sequential. RRF benchmark *not* yet done.
 
 ---
 
-### 10. Next Steps (Immediate Focus)
-1.  **[DONE] Concurrency Review:** Decision made - use one adapter instance per agent task.
-2.  **Agent Implementation:** Continue implementing agent roles (`Ingestor` [config/strategies/chunking/adapter], `Summarizer`, `Synthesizer`, `Critic`), ensuring each agent initializes or receives its **own** `HybridSQLiteAdapter` instance. Integrate real adapter usage (replacing mocks).
-3.  **Integration:** Integrate the agents with the scheduler and add integration tests.
+### 10. Next Steps (Immediate Focus - Minimal Working System)
+1.  **Minimal Agent Implementation:** Complete the `Ingestor` agent (using `pymupdf`, adding basic chunking, integrating the real `HybridSQLiteAdapter`). Create `Summarizer` and `Synthesizer` agents **using basic Gemini LLM calls** (reference `src/main.py`) for their core logic. Ensure each agent initializes/receives its **own** `HybridSQLiteAdapter` instance and necessary API keys/client config.
+2.  **Minimal CLI & Integration:** Update `cli.py` to instantiate the scheduler and minimal agents (including LLM config), running a basic pipeline. Add a simple integration test (`tests/integration/test_minimal_pipeline.py`) to verify this flow.
+3.  *(Deferred)* Enhance Agents: Implement advanced ingestion strategies, refine LLM prompts/error handling, add Critic agent.
+4.  *(Deferred)* API Layer & Polish: Implement FastAPI, improve docs, performance tuning.

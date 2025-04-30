@@ -15,8 +15,8 @@ This plan elaborates on the 3-week roadmap outlined in `PLANS/integrated_plan.md
 1.  **[-] Project Setup & CI:**
     *   `[X]` Confirm/Set up Python environment (using `poetry` and `.venv`).
     *   `[X]` Update `pyproject.toml` with initial dependencies (`anyio`, `sqlite3`, `sentence-transformers`, `numpy`, `filelock`, `pydantic`, `pdfplumber`, `pytest`, `ruff`, etc.).
-    *   `[ ]` Initialize `pre-commit` with hooks for `ruff` (linting + formatting).
-    *   `[ ]` Set up basic GitHub Actions workflow for linting (`ruff check .`) and running tests (`pytest`).
+    *   `[ ]` ~~Initialize `pre-commit` with hooks for `ruff` (linting + formatting).~~
+    *   `[ ]` ~~Set up basic GitHub Actions workflow for linting (`ruff check .`) and running tests (`pytest`).~~
     *   `[X]` Create the core directory structure (`src/memory`, `tests/memory`, `examples/memory`) and `__init__.py` files.
 
 2.  **[X] Memory System - Core Definition:**
@@ -59,12 +59,14 @@ This plan elaborates on the 3-week roadmap outlined in `PLANS/integrated_plan.md
 5.  **[DEFERRED] Memory System - MemoryService (Singleton):**
     *   `[ ]` *Decision: Deferred singleton wrapper. Agents will use `HybridSQLiteAdapter` instances directly for now.* Consider re-introducing if complex state management or write queueing becomes necessary later.
 
-6.  **[ ] Agent Skeletons & CLI:**
-    *   `[ ]` Create `src/core/scheduler.py` with `TaskScheduler` stub.
-    *   `[ ]` Create `src/core/agents/base.py` with `BaseAgent` abstract class.
-    *   `[ ]` Create `src/core/agents/ingestor.py`, `summarizer.py`, etc. with skeleton classes.
-    *   `[ ]` Create `src/cli.py` with basic `click` setup.
-    *   `[ ]` Add basic unit tests for agent skeletons.
+6.  **[ ] Agent Skeletons & CLI: (Focus on Minimal Viable Pipeline First)**
+    *   `[X]` `src/core/scheduler.py` exists (implemented in Phase 2).
+    *   `[X]` `src/core/agents/base.py` exists.
+    *   `[X]` `src/core/agents/ingestor.py` exists (implementation in progress - Phase 2).
+    *   `[ ]` Create `src/core/agents/summarizer.py` with skeleton class (Minimal version - Phase 2).
+    *   `[ ]` Create `src/core/agents/synthesizer.py` with skeleton class (Minimal version - Phase 2).
+    *   `[X]` `src/cli.py` exists (integration needed - Phase 2).
+    *   `[ ]` Add basic unit tests for minimal agent skeletons.
 
 7.  **[X] Example Usage Scripts:**
     *   `[X]` Create `examples/memory/example_basic_usage.py` demonstrating init, add, basic FTS query, basic semantic query.
@@ -73,9 +75,9 @@ This plan elaborates on the 3-week roadmap outlined in `PLANS/integrated_plan.md
 
 ---
 
-## Phase 2: Agents & Concurrency **[NEXT UP]**
+## Phase 2: Agents & Concurrency **[IN PROGRESS - FOCUS: Minimal Pipeline]**
 
-**Goal:** Implement core agent logic, the concurrency wrapper, and integrate them.
+**Goal:** Implement *minimal functional* core agent logic (including basic LLM calls), integrate with the scheduler, and enable a basic end-to-end run via CLI.
 
 **Tasks:**
 
@@ -118,88 +120,83 @@ This plan elaborates on the 3-week roadmap outlined in `PLANS/integrated_plan.md
     *   `[-]` ~~Evaluate Async Adapter (`aiosqlite`):~~ Not pursued as the primary safety issue is resolved by instance-per-task strategy.
     *   `[X]` **Decision Documentation:** Decision documented here and in the high-level plan.
 
-4.  **[X] Core Agents (Ingestor, Summarizer, Synthesizer):**
-    *   `[X]` Implement `IngestorAgent`:
+4.  **[ ] Core Agents (Minimal Implementation First):**
+    *   `[-]` Implement `IngestorAgent` (**Priority: Minimal Viable**):
         *   `[X]` Basic structure and `run` method defined.
-        *   `[X]` Initial implementation using `pdfplumber` (later refactored).
-        *   `[X]` Refactored to use `pymupdf` strategy internally.
-        *   `[X]` Implemented `_process_pdf_pymupdf` helper method.
-        *   `[X]` Integrated `_chunk_text` (mocked in tests, needs real implementation).
-        *   `[X]` Integrated memory adapter `add` call (mocked in tests, needs real adapter integration).
-        *   `[X]` Unit tests added covering pymupdf, mocked mistral_ocr, mixed paths, and error handling.
-        *   `[ ]` **Define Configuration:** Add `INGESTION_STRATEGY` setting in `src/config.py` (options: `pymupdf`, `mistral_ocr`, `gemini_native`). Also add required API keys (`MISTRAL_API_KEY`, `GEMINI_API_KEY`) handling (e.g., via environment variables or config). Read this config within the agent.
-        *   `[ ]` **Input Handling:** Agent accepts PDF sources (e.g., file paths provided via constructor/config). Needs robust handling of these paths (checking existence, permissions).
-        *   `[ ]` **Strategy Selection:** Implement logic within the agent's `run` method to select the processing method based on the loaded `INGESTION_STRATEGY` configuration.
-            *   **Method 0: PyMuPDF (`pymupdf`)**
-                *   `[X]` Core text extraction logic implemented in `_process_pdf_pymupdf`.
-                *   `[ ]` Needs integration with configuration and proper error handling within the main `run` flow.
-            *   **Method 1: Mistral OCR API (`mistral_ocr`)**
-                *   `[ ]` Reference `src/arxiv_ocr.py` or similar examples.
-                *   `[ ]` Initialize `MistralClient` (requires `MISTRAL_API_KEY` from config/env).
-                *   `[ ]` Prepare PDF content (read bytes from file path).
-                *   `[ ]` Call `mistral_client.files.create_async()` to upload.
-                *   `[ ]` Call `mistral_client.ocr.process_async()` using the returned file ID.
-                *   `[ ]` Process the returned `OCRResponse` object to extract structured text content (likely iterating through `pages`).
-                *   `[ ]` Handle potential errors (API key missing, API limits, network issues, file processing errors).
-                *   `[ ]` Delete the uploaded file using `mistral_client.files.delete_async()`.
-            *   **Method 2: Gemini Native File Upload & Extraction (`gemini_native`)**
-                *   `[ ]` Reference `src/tools.py::upload_pdf_for_gemini` and related usage.
-                *   `[ ]` Initialize `genai.Client` (requires `GOOGLE_API_KEY` from config/env).
-                *   `[ ]` Use helper function (potentially adapted from `upload_pdf_for_gemini`) to upload the PDF via `client.files.upload()` and wait for `ACTIVE` state. This returns a `types.File` object.
-                *   `[ ]` **Crucially:** Send a *separate* request to the Gemini chat model (`genai.GenerativeModel` or similar, *not* the file client) including the `types.File` object and a specific prompt instructing it to extract the full text content (e.g., "Extract the entire text content of the provided PDF, maintaining structure where possible.").
-                *   `[ ]` Process the model's response (`response.text`) to get the extracted text.
-                *   `[ ]` Handle file upload errors, processing timeouts, extraction errors, and potential API key issues.
-                *   `[ ]` Consider file lifecycle management (deleting uploaded files after extraction using `client.files.delete()`).
-        *   `[ ]` **Chunking Logic:** Implement a text chunking strategy (e.g., fixed size with overlap using `textwrap` or a more sophisticated sentence-boundary based approach) on the extracted text obtained from *any* of the selected methods. This should happen *after* text extraction.
-        *   `[ ]` **Storage:** Use the *actual* `HybridSQLiteAdapter` instance (passed during agent initialization) to call `adapter.add(MemoryDoc(...))` for *each* text chunk, storing relevant metadata (source PDF path, chunk number, ingestion method used).
-        *   `[ ]` **Error Handling:** Implement robust error handling throughout the `run` method for file operations, API interactions, chunking, and adapter usage. Log errors clearly.
-    *   `[ ]` Implement `SummarizerAgent`: Use `HybridSQLiteAdapter.query/hybrid_query` to get chunks for one paper, generate a summary (initially maybe just concatenate chunks, later use a real LLM), use `HybridSQLiteAdapter.add` to store summary.
-    *   `[ ]` Implement `SynthesizerAgent`: Use `HybridSQLiteAdapter.query/hybrid_query` to get summaries/chunks across papers, generate synthesis (initially mock/placeholder, later use a real LLM), use `HybridSQLiteAdapter.add`.
+        *   `[X]` Refactored to use `pymupdf` strategy internally (`_process_pdf_pymupdf`).
+        *   `[ ]` **Implement basic text chunking logic** (e.g., fixed size, simple overlap) on the extracted text from `pymupdf`.
+        *   `[ ]` **Integrate actual `HybridSQLiteAdapter`**: Instantiate/receive adapter instance and use `adapter.add(MemoryDoc(...))` for each chunk. Replace mocks.
+        *   `[ ]` **Basic Input Handling:** Ensure agent accepts PDF path(s) and handles basic file existence checks.
+        *   `[ ]` **Basic Error Handling:** Add `try...except` blocks around file processing, chunking, and adapter calls. Log errors.
+        *   `[ ]` *(Deferred)* Define Configuration (`INGESTION_STRATEGY`, API keys).
+        *   `[ ]` *(Deferred)* Implement `mistral_ocr` strategy.
+        *   `[ ]` *(Deferred)* Implement `gemini_native` strategy.
+        *   `[ ]` *(Deferred)* Implement strategy selection logic based on configuration.
+        *   `[X]` Unit tests added covering pymupdf (continue to adapt tests for real adapter/chunking).
+    *   `[ ]` Implement `SummarizerAgent` (**Minimal Version**):
+        *   `[ ]` Define basic class structure inheriting `BaseAgent`, handling API key/client init.
+        *   `[ ]` Implement `run` method: Use passed `HybridSQLiteAdapter` instance to `query/hybrid_query` for relevant chunks (e.g., based on source PDF metadata).
+        *   `[ ]` **Format a simple prompt** with the retrieved chunks/text.
+        *   `[ ]` **Make a basic Gemini API call** (e.g., using `genai` client, similar to `src/main.py`) to generate a summary.
+        *   `[ ]` **Parse the LLM response**.
+        *   `[ ]` Use `adapter.add()` to store the generated summary `MemoryDoc`.
+        *   `[ ]` Add basic unit tests (mocking adapter and LLM call).
+    *   `[ ]` Implement `SynthesizerAgent` (**Minimal Version**):
+        *   `[ ]` Define basic class structure inheriting `BaseAgent`, handling API key/client init.
+        *   `[ ]` Implement `run` method: Use adapter to query for summaries/chunks across papers.
+        *   `[ ]` **Format a simple prompt** with the retrieved summaries/text.
+        *   `[ ]` **Make a basic Gemini API call** to generate synthesis.
+        *   `[ ]` **Parse the LLM response**.
+        *   `[ ]` Use `adapter.add()` to store the generated synthesis `MemoryDoc`.
+        *   `[ ]` Add basic unit tests (mocking adapter and LLM call).
     *   `[X]` Ensure agents correctly instantiate/receive `HybridSQLiteAdapter` instances (Decision made: instance per agent).
-    *   `[ ]` Add unit tests for these agents (mocking adapter/LLM).
-        *   `[X]` Added tests for `IngestorAgent` covering `pymupdf`, `mistral_ocr` (mocked), error handling, mixed paths.
-        *   `[ ]` Add tests for `SummarizerAgent`.
-        *   `[ ]` Add tests for `SynthesizerAgent`.
-5.  **[ ] CLI Integration:**
-    *   `[ ]` Update `src/cli.py`'s `run-pipeline` command.
-    *   `[ ]` Instantiate `TaskScheduler`.
-    *   `[ ]` Instantiate required Agent classes (passing adapter instance).
-    *   `[ ]` Submit agents to the scheduler and run it.
 
-6.  **[ ] Integration Test:**
-    *   `[ ]` Create `tests/integration/test_pipeline.py`.
-    *   `[ ]` Define a test running the full pipeline via `cli.py` (Ingestor -> Summarizer -> Synthesizer).
-    *   `[ ]` Use sample PDF(s).
-    *   `[ ]` Verify expected outputs (e.g., memories created) by querying the adapter.
-    *   `[ ]` Run with `max_concurrent=1` and `max_concurrent=3`.
+5.  **[ ] Minimal CLI Integration:**
+    *   `[ ]` Update `src/cli.py`'s `run-pipeline` command (or create a new minimal command).
+    *   `[ ]` Instantiate `TaskScheduler`.
+    *   `[ ]` Instantiate *minimal* `IngestorAgent`, `SummarizerAgent`, `SynthesizerAgent` (passing adapter instance).
+    *   `[ ]` Submit agents to the scheduler and `await scheduler.run()`.
+
+6.  **[ ] Minimal Integration Test:**
+    *   `[ ]` Create `tests/integration/test_minimal_pipeline.py`.
+    *   `[ ]` Define a test running the basic pipeline via `cli.py` command (Minimal Ingestor -> Minimal Summarizer -> Minimal Synthesizer).
+    *   `[ ]` Use a sample PDF.
+    *   `[ ]` Verify expected minimal outputs (e.g., placeholder memories created) by querying the adapter after the run.
+    *   `[ ]` Run with `max_concurrent=1`.
 
 ---
 
-## Phase 3: Refinement, API & Polish **[PLANNED]**
+## Phase 3: Enhancements, API & Polish **[PLANNED - AFTER MINIMAL PIPELINE]**
 
-**Goal:** Implement the Critic agent, add an API layer, refine performance, and complete documentation.
+**Goal:** Implement advanced agent logic (refined LLM usage, Critic), add an API layer, refine performance, and complete documentation.
 
 **Tasks:**
 
-1.  **[ ] Agent - Critic Role:**
+1.  **[ ] Agent Enhancements:**
+    *   `[ ]` Enhance `IngestorAgent`: Add configuration (`INGESTION_STRATEGY`, API keys), implement Mistral/Gemini strategies, add strategy selection logic.
+    *   `[ ]` Enhance `SummarizerAgent` & `SynthesizerAgent`: **Refine prompts, improve error handling, potentially explore different models/parameters.**
+    *   `[ ]` Add/improve unit tests for enhanced agent logic (including LLM interactions).
+
+2.  **[ ] Agent - Critic Role:**
     *   `[ ]` Create `CriticAgent` class in `src/core/agents/critic.py`.
-    *   `[ ]` Implement `run_step` logic using adapter queries and `add`.
-    *   `[ ]` Integrate `CriticAgent` into the pipeline.
+    *   `[ ]` Implement `run` logic using adapter queries and `add` (potentially LLM-assisted).
+    *   `[ ]` Integrate `CriticAgent` into the pipeline (likely via scheduler).
     *   `[ ]` Add unit tests.
 
-2.  **[ ] API Layer (FastAPI):**
+3.  **[ ] API Layer (FastAPI):**
     *   `[ ]` Add dependencies.
     *   `[ ]` Create `src/api.py`.
     *   `[ ]` Implement FastAPI app with `/run` and `/status` endpoints triggering the `TaskScheduler` pipeline.
     *   `[ ]` Add API tests.
 
-3.  **[ ] Documentation & Demo:**
+4.  **[ ] Documentation & Demo:**
     *   `[ ]` Update `README.md` (main project README) significantly.
     *   `[ ]` Create `demo.py` or `run_demo.sh`.
     *   `[ ]` Consider blog-style documentation.
 
-4.  **[ ] Performance & Polish:**
+5.  **[ ] Performance & Polish:**
     *   `[ ]` Profiling and tuning.
-    *   `[ ]` Refine scheduler timeouts.
-    *   `[ ]` Ensure final CI pipeline passes reliably and quickly.
+    *   `[ ]` Refine scheduler timeouts, agent error handling.
+    *   `[ ]` Benchmark concurrent vs sequential execution.
+    *   `[ ]` ~~Ensure final CI pipeline passes reliably and quickly.~~
     *   `[ ]` Final code cleanup.
