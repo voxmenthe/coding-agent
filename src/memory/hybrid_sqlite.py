@@ -10,8 +10,9 @@ from .adapter import MemoryAdapter, MemoryDoc
 from .embedding_manager import EmbeddingManager
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+# logging.basicConfig(level=logging.INFO) # Keep root config
+log = logging.getLogger('HybridSQLiteAdapter') # Use specific logger name
+log.setLevel(logging.DEBUG) # Set level for this logger
 
 class HybridSQLiteAdapter(MemoryAdapter):
     """Implements the MemoryAdapter interface using SQLite for metadata/FTS
@@ -22,130 +23,194 @@ class HybridSQLiteAdapter(MemoryAdapter):
                  db_path_str: str = ".memory_db/memory.db", 
                  embedding_dir_str: str = ".memory_db/embeddings",
                  embedding_model: 'SentenceTransformer | None' = None): 
+        log.debug(f"Initializing HybridSQLiteAdapter: DB='{db_path_str}', Embeddings='{embedding_dir_str}', Model provided={embedding_model is not None}")
         self.db_path = Path(db_path_str)
         self.embedding_manager = EmbeddingManager(embedding_model, embedding_dir_str)
         
+        log.debug(f"Ensuring parent directory exists: {self.db_path.parent}")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         db_uri = f"file:{self.db_path}?mode=rwc" 
-        log.info(f"Initializing HybridSQLiteAdapter. DB: {db_uri}, Embeddings via Manager: {self.embedding_manager.embedding_dir}")
+        log.info(f"Initializing HybridSQLiteAdapter. DB URI: {db_uri}, Embeddings via Manager: {self.embedding_manager.embedding_dir}")
+        self.conn = None # Initialize conn to None
         try:
+            log.debug(f"Attempting to connect to SQLite DB: {db_uri}")
             self.conn = sqlite3.connect(db_uri, uri=True, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row 
-            log.info("SQLite connection established.")
+            log.info("SQLite connection established successfully.")
             self._setup_schema()
         except sqlite3.Error as e:
-            log.error(f"Error connecting to or setting up SQLite DB at {self.db_path}: {e}")
+            log.error(f"Error connecting to or setting up SQLite DB at {self.db_path}: {e}", exc_info=True)
+            if self.conn: # Attempt to close if partially opened
+                try:
+                    self.conn.close()
+                    log.debug("Closed potentially partial connection after error.")
+                except Exception as close_err:
+                    log.error(f"Error closing connection after initial error: {close_err}")
             raise
 
     def _setup_schema(self):
-        """Creates SQLite tables including FTS and embedding path."""
+        """Sets up the necessary SQLite tables and FTS virtual table."""
+        # Use try-finally to ensure cursor is closed
+        cursor = None
         try:
-            log.info("Setting up database schema...") 
-            self.conn.execute("""
+            cursor = self.conn.cursor()
+            # Main table for metadata
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, 
                     uuid TEXT UNIQUE NOT NULL,
-                    text_content TEXT NOT NULL,
-                    embedding_path TEXT, 
-                    timestamp TEXT, 
-                    source_agent TEXT, 
-                    tags_json TEXT, 
-                    metadata_json TEXT 
-                )
+                    text_content TEXT,
+                    embedding_path TEXT, -- Path to the .npy file 
+                    timestamp TEXT NOT NULL,
+                    source_agent TEXT,
+                    tags_json TEXT,     -- JSON array of strings
+                    metadata_json TEXT  -- JSON object for other metadata
+                );
             """)
-            self.conn.execute("""
+            # Index on UUID for faster lookups
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_uuid ON memories (uuid);");
+            # Index on timestamp
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_timestamp ON memories (timestamp);");
+            
+            # FTS5 virtual table for text search
+            # Link to the main table using content_rowid='id'
+            # Revert back to 'porter unicode61' tokenizer
+            cursor.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                    text_content,
-                    tokenize = 'porter',
-                    content = memories, 
-                    content_rowid = 'id' 
-                )
+                    text_content, 
+                    content='memories', 
+                    content_rowid='id',
+                    tokenize='porter unicode61' 
+                );
             """)
-            # Add triggers for FTS synchronization (although often automatic with 'content=')
-            # It's safer to include them explicitly for robustness.
-            self.conn.execute("""
+            # Triggers to keep FTS table synchronized
+            # AFTER INSERT
+            cursor.execute("""
                 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
                     INSERT INTO memories_fts (rowid, text_content) VALUES (new.id, new.text_content);
                 END;
             """)
-            self.conn.execute("""
+            # AFTER DELETE
+            cursor.execute("""
                 CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-                    DELETE FROM memories_fts WHERE rowid = old.id;
+                    INSERT INTO memories_fts (content, rowid, text_content) VALUES ('delete', old.id, old.text_content);
                 END;
             """)
-            self.conn.execute("""
+            # AFTER UPDATE
+            cursor.execute("""
                 CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-                    UPDATE memories_fts SET text_content = new.text_content WHERE rowid = old.id;
+                    INSERT INTO memories_fts (content, rowid, text_content) VALUES ('update', new.id, new.text_content);
                 END;
             """)
             self.conn.commit()
             log.info("SQLite schema setup complete (FTS triggers added).")
         except sqlite3.Error as e:
-            log.error(f"Error setting up SQLite schema: {e}")
-            raise
+            log.error(f"SQLite error during schema setup: {e}", exc_info=True)
+            # Optional: rollback changes if needed, though table creation is often idempotent
+            # if self.conn: self.conn.rollback()
+            raise # Re-raise the exception to indicate failure
+        finally:
+            if cursor:
+                cursor.close()
+                log.debug("Schema setup cursor closed.")
 
-    def add(self, doc: MemoryDoc) -> str:
+    def add(self, doc: MemoryDoc) -> str | None: # Return None on failure
         """Adds a document to the memory store, generates embedding, saves and stores in DB."""
+        log.debug(f"Entering add method for doc (ID provided: {doc.id is not None}, Text length: {len(doc.text)})")
+        if not self.conn:
+            log.error("Cannot add document: SQLite connection is not established.")
+            return None
+
         if not doc.id:
-            doc.id = str(uuid.uuid4())
-            
-        embedding_abs_path = self.embedding_manager.generate_and_save_embedding(doc.text, doc.id)
+            doc_uuid = str(uuid.uuid4())
+            log.debug(f"No document ID provided, generated new UUID: {doc_uuid}")
+            doc.id = doc_uuid # Assign back to doc object as well
+        else:
+            doc_uuid = doc.id
+            log.debug(f"Using provided document ID (UUID): {doc_uuid}")
+        
+        log.debug(f"Calling embedding_manager.generate_and_save_embedding for UUID: {doc_uuid}")
+        embedding_abs_path = self.embedding_manager.generate_and_save_embedding(doc.text, doc_uuid)
+        if embedding_abs_path:
+             log.debug(f"Embedding generated and saved to: {embedding_abs_path}")
+        else:
+             log.warning(f"Embedding generation/saving failed or was disabled for UUID: {doc_uuid}")
         
         sql = """
             INSERT INTO memories (uuid, text_content, embedding_path, timestamp, source_agent, tags_json, metadata_json)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """
+        current_timestamp = doc.timestamp or datetime.now(timezone.utc)
         params = (
-            doc.id,
+            doc_uuid,
             doc.text,
             str(embedding_abs_path) if embedding_abs_path else None, 
-            doc.timestamp.isoformat() if doc.timestamp else datetime.now(timezone.utc).isoformat(), 
+            current_timestamp.isoformat(), 
             doc.source_agent,
             json.dumps(doc.tags or []),
             json.dumps(doc.metadata or {})
         )
         
-        log.debug(f"Adding metadata to DB for UUID: {doc.id}")
+        log.debug(f"Preparing to insert metadata into DB for UUID: {doc_uuid}")
+        log.debug(f"SQL: {sql}")
+        log.debug(f"PARAMS: UUID={params[0]}, Text Len={len(params[1])}, Embed Path={params[2]}, Timestamp={params[3]}, Agent={params[4]}, Tags={params[5]}, Meta={params[6]}")
+        
         cursor = None
         try:
             cursor = self.conn.cursor()
+            log.debug("Executing INSERT statement...")
             cursor.execute(sql, params)
+            log.debug(f"INSERT executed. Row count: {cursor.rowcount}. Committing...")
             self.conn.commit()
-            log.info(f"Successfully added document UUID: {doc.id} to DB.")
-            return doc.id
+            log.info(f"Successfully added document UUID: {doc_uuid} to DB.")
+            return doc_uuid
         except sqlite3.IntegrityError as e:
             if "UNIQUE constraint failed: memories.uuid" in str(e):
-                log.error(f"Document with UUID {doc.id} already exists in DB.")
-                raise ValueError(f"Document with UUID {doc.id} already exists.") from e
+                log.error(f"Document with UUID {doc_uuid} already exists in DB.")
+                # Consider if this should return the ID or raise a different error
+                # For now, returning None to indicate add failure due to duplication
+                return None 
             else:
-                log.error(f"SQLite integrity error adding document: {e}")
-                raise
+                log.error(f"SQLite integrity error adding document UUID {doc_uuid}: {e}", exc_info=True)
+                return None
         except Exception as e:
-            log.error(f"Unexpected error adding document: {e}")
-            raise
+            log.error(f"Unexpected error adding document UUID {doc_uuid}: {e}", exc_info=True)
+            return None # Return None on generic error
         finally:
             if cursor:
                 cursor.close()
-                log.debug("Cursor closed after add operation.") 
+                log.debug(f"Cursor closed after add operation for UUID: {doc_uuid}.") 
 
     def _row_to_memory_doc(self, row: sqlite3.Row) -> MemoryDoc:
         """Converts a database row to a MemoryDoc."""
-        return MemoryDoc(
-            id=row['uuid'],
-            text=row['text_content'],
-            embedding_path=row['embedding_path'],
-            timestamp=datetime.fromisoformat(row['timestamp']) if row['timestamp'] else None,
-            source_agent=row['source_agent'],
-            tags=json.loads(row['tags_json']) if row['tags_json'] else [],
-            metadata=json.loads(row['metadata_json']) if row['metadata_json'] else {},
-            score=row['score'] if 'score' in row.keys() else None
-        )
+        # Add logging here if conversion issues arise
+        # log.debug(f"Converting row to MemoryDoc: {dict(row)}")
+        try:
+            return MemoryDoc(
+                id=row['uuid'],
+                text=row['text_content'],
+                embedding_path=row['embedding_path'],
+                timestamp=datetime.fromisoformat(row['timestamp']) if row['timestamp'] else None,
+                source_agent=row['source_agent'],
+                tags=json.loads(row['tags_json']) if row['tags_json'] else [],
+                metadata=json.loads(row['metadata_json']) if row['metadata_json'] else {},
+                score=row['score'] if 'score' in row.keys() else None
+            )
+        except Exception as e:
+            log.error(f"Error converting row to MemoryDoc: {e}. Row data: {dict(row)}", exc_info=True)
+            raise # Re-raise after logging
 
     def query(self, query_text: str, k: int = 10,
               filter_tags: list[str] | None = None, 
               filter_source_agents: list[str] | None = None) -> list[MemoryDoc]:
         """Queries the memory store using FTS5, applying optional filters."""
+        log.debug(f"Entering query method: query='{query_text[:50]}...', k={k}, tags={filter_tags}, agents={filter_source_agents}")
+        if not self.conn:
+            log.error("Cannot query: SQLite connection is not established.")
+            return []
+            
         if not query_text:
+            log.warning("Query text is empty. Returning empty list.")
             return []
         
         # Base query joining FTS and main table
@@ -156,38 +221,40 @@ class HybridSQLiteAdapter(MemoryAdapter):
             JOIN memories m ON m.id = fts.rowid 
         """
         
-        # Sanitize query_text for FTS5 phrase search: escape double quotes and wrap in double quotes
-        fts_query_text = '"' + query_text.replace('"', '""') + '"'
+        # Sanitize query_text for FTS5: escape double quotes
+        # Don't wrap in quotes here to allow FTS parsing
+        fts_query_text = query_text.replace('"', '""') 
+        
+        # Append wildcard for prefix matching - helps with stemming variations
+        if not fts_query_text.endswith('*'):
+            fts_query_text += '*'
+            
+        log.debug(f"Sanitized FTS query text for MATCH: {fts_query_text}")
 
         where_clauses = ["fts.text_content MATCH ?"] # Query text placeholder
-        params = [fts_query_text] # Use the sanitized query text
+        params: list[str | int] = [fts_query_text] # Use the sanitized & wildcarded query text
         
         # Add tag filtering (requires ALL specified tags to be present)
         if filter_tags:
-            # This assumes tags_json stores a JSON array like '["tag1", "tag2"]'
-            # We use JSON_EACH to check for the presence of each tag.
-            # A Common Table Expression (CTE) might be cleaner for complex tag logic,
-            # but for simple AND logic, multiple JOINs or subqueries work.
-            # Using json_each and checking count:
-            # Add placeholder for each tag to params
+            log.debug(f"Adding tag filter: {filter_tags}")
             tag_placeholders = ','.join(['?'] * len(filter_tags))
-            where_clauses.append(f"""
-                m.id IN (
-                    SELECT jt.id
-                    FROM json_each(m.tags_json) AS je, memories AS jt
-                    WHERE jt.id = m.id AND je.value IN ({tag_placeholders})
-                    GROUP BY jt.id
-                    HAVING COUNT(DISTINCT je.value) = ?
-                )
-            """)
-            params.extend(filter_tags)
-            params.append(len(filter_tags))
+            # Simplified check using json_extract and LIKE for individual tags
+            # This is less efficient than json_each but simpler syntax for AND logic
+            for tag in filter_tags:
+                 # Check if tags_json contains the specific tag string
+                 # Note: This is a basic substring check, assumes tags are simple strings
+                 # and JSON format is consistent. Might need refinement for complex tags.
+                 where_clauses.append("json_valid(m.tags_json) AND instr(m.tags_json, ?)")
+                 params.append(f'"{tag}"') # Add quotes for JSON string comparison
+            log.debug(f"WHERE clauses after tags: {where_clauses}, PARAMS: {params}")
             
         # Add source agent filtering
         if filter_source_agents:
+            log.debug(f"Adding source agent filter: {filter_source_agents}")
             agent_placeholders = ','.join(['?'] * len(filter_source_agents))
             where_clauses.append(f"m.source_agent IN ({agent_placeholders})")
             params.extend(filter_source_agents)
+            log.debug(f"WHERE clauses after agents: {where_clauses}, PARAMS: {params}")
 
         # Combine WHERE clauses
         sql = sql_base + " WHERE " + " AND ".join(where_clauses)
@@ -197,90 +264,141 @@ class HybridSQLiteAdapter(MemoryAdapter):
         params.append(k)
 
         log.info(f"Executing FTS query: '{query_text[:50]}...', k={k}, tags={filter_tags}, agents={filter_source_agents}")
-        log.debug(f"Full FTS SQL: {sql} PARAMS: {params}") 
+        log.debug(f"Full FTS SQL: {sql}")
+        log.debug(f"PARAMS: {params}") 
+        
+        results = []
         cursor = None
         try:
             cursor = self.conn.cursor()
-            cursor.execute(sql, tuple(params))
+            log.debug("Executing FTS SELECT statement...")
+            cursor.execute(sql, params)
             rows = cursor.fetchall()
-            results = [self._row_to_memory_doc(row) for row in rows]
-            for doc in results:
-                if doc.score is not None:
-                    doc.score = 1.0 / (1.0 + doc.score) 
-            log.info(f"FTS query returned {len(results)} results.")
+            log.info(f"FTS query executed. Fetched {len(rows)} rows.")
+            for row in rows:
+                try:
+                    results.append(self._row_to_memory_doc(row))
+                except Exception as convert_err:
+                    log.error(f"Skipping row due to conversion error: {convert_err}. Row: {dict(row)}")
+            log.debug(f"Converted {len(results)} rows to MemoryDoc objects.")
             return results
-        except Exception as e:
-            log.error(f"Error during FTS query: {e}", exc_info=True)
+        except sqlite3.Error as e:
+            log.error(f"SQLite error during FTS query execution: {e}", exc_info=True)
             return []
+        except Exception as e:
+             log.error(f"Unexpected error during FTS query: {e}", exc_info=True)
+             return []
         finally:
             if cursor:
                 cursor.close()
-                log.debug("Cursor closed after FTS query.") 
+                log.debug("Cursor closed after FTS query operation.")
 
     def semantic_query(self, query_text: str, k: int = 10,
                        filter_tags: list[str] | None = None,
                        filter_source_agents: list[str] | None = None) -> list[MemoryDoc]:
-        """Performs semantic search using embeddings and cosine similarity via EmbeddingManager."""
-        if not self.embedding_manager or not self.embedding_manager.embedding_model:
-            log.error("Cannot perform semantic query: embedding model not available.")
-            return []
-        if not query_text:
+        """Performs semantic search using embeddings if available.
+           Applies pre-filtering based on tags/agents if provided.
+        """
+        log.debug(f"Entering semantic_query method: query='{query_text[:50]}...', k={k}, tags={filter_tags}, agents={filter_source_agents}")
+        if not self.conn:
+            log.error("Cannot semantic query: SQLite connection is not established.")
             return []
             
-        log.info(f"Starting semantic query: '{query_text[:50]}...', k={k}")
-
-        query_embedding = self.embedding_manager.generate_embedding(query_text)
-        if query_embedding is None:
-            log.error("Failed to generate embedding for query text.")
+        if not self.embedding_manager.embedding_model:
+            log.error("Cannot perform semantic query: embedding model not available.")
             return []
-        log.debug(f"Generated query embedding, shape: {query_embedding.shape}")
 
-        sql = "SELECT uuid, text_content, embedding_path, timestamp, source_agent, tags_json, metadata_json FROM memories WHERE embedding_path IS NOT NULL"
-        params = []
+        # 1. Pre-filter potential candidates from DB based on tags/agents (if provided)
+        candidate_uuids: Optional[List[str]] = None
+        if filter_tags or filter_source_agents:
+            log.debug("Performing pre-filtering based on tags/agents for semantic query...")
+            sql_filter = "SELECT uuid FROM memories" 
+            where_clauses = []
+            params: list[str] = []
+            if filter_tags:
+                # Using basic instr check again for simplicity
+                for tag in filter_tags:
+                    where_clauses.append("json_valid(tags_json) AND instr(tags_json, ?)")
+                    params.append(f'"{tag}"')
+            if filter_source_agents:
+                agent_placeholders = ','.join(['?'] * len(filter_source_agents))
+                where_clauses.append(f"source_agent IN ({agent_placeholders})")
+                params.extend(filter_source_agents)
+            
+            if where_clauses:
+                sql_filter += " WHERE " + " AND ".join(where_clauses)
+                log.debug(f"Pre-filter SQL: {sql_filter}, PARAMS: {params}")
+                cursor = None
+                try:
+                    cursor = self.conn.cursor()
+                    cursor.execute(sql_filter, params)
+                    candidate_uuids = [row['uuid'] for row in cursor.fetchall()]
+                    log.info(f"Pre-filtering yielded {len(candidate_uuids)} candidate UUIDs.")
+                    if not candidate_uuids:
+                        log.info("No candidates found after pre-filtering. Semantic search will yield no results.")
+                        return [] # No need to proceed if no candidates
+                except sqlite3.Error as e:
+                    log.error(f"SQLite error during pre-filtering for semantic query: {e}", exc_info=True)
+                    return [] # Return empty on error
+                finally:
+                    if cursor:
+                        cursor.close()
+                        log.debug("Cursor closed after pre-filtering.")
+            else:
+                 log.debug("No tags or agents provided for pre-filtering.")
+        else:
+            log.debug("No pre-filtering requested for semantic query.")
 
-        candidates: list[MemoryDoc] = []
+        # 2. Perform semantic search using EmbeddingManager
+        log.debug(f"Calling embedding_manager.search for query='{query_text[:50]}...', k={k}, filter_ids={candidate_uuids is not None}")
+        try:
+            similar_docs_info = self.embedding_manager.search(query_text, k, filter_ids=candidate_uuids)
+            log.info(f"EmbeddingManager search returned {len(similar_docs_info)} similar docs.")
+        except Exception as search_err:
+            log.error(f"Error during EmbeddingManager search: {search_err}", exc_info=True)
+            return []
+
+        if not similar_docs_info:
+            return []
+
+        # 3. Retrieve full MemoryDoc objects for the top results from DB
+        top_k_uuids = [uuid_ for uuid_, score in similar_docs_info]
+        scores_map = {uuid_: score for uuid_, score in similar_docs_info}
+        log.debug(f"Retrieving full MemoryDocs for top {len(top_k_uuids)} UUIDs: {top_k_uuids}")
+
+        if not top_k_uuids:
+             return []
+             
+        sql_retrieve = f"SELECT * FROM memories WHERE uuid IN ({','.join(['?']*len(top_k_uuids))})"
+        params_retrieve = top_k_uuids
+        log.debug(f"Retrieve SQL: {sql_retrieve}, PARAMS: {params_retrieve}")
+        
+        results_map = {}
         cursor = None
         try:
             cursor = self.conn.cursor()
-            log.debug(f"Fetching candidates for semantic search. SQL: {sql}")
-            cursor.execute(sql, tuple(params))
+            cursor.execute(sql_retrieve, params_retrieve)
             rows = cursor.fetchall()
-            candidates = [self._row_to_memory_doc(row) for row in rows]
-            log.debug(f"Fetched {len(candidates)} candidates with embeddings from DB.")
-        except Exception as e:
-            log.error(f"Error fetching candidates for semantic search: {e}", exc_info=True)
-            return []
+            log.debug(f"Retrieved {len(rows)} full docs from DB.")
+            for row in rows:
+                try:
+                    doc = self._row_to_memory_doc(row)
+                    doc.score = scores_map.get(doc.id) # Assign the semantic score
+                    results_map[doc.id] = doc
+                except Exception as convert_err:
+                    log.error(f"Skipping row due to conversion error during semantic result retrieval: {convert_err}. Row: {dict(row)}")
+        except sqlite3.Error as e:
+            log.error(f"SQLite error retrieving full docs for semantic query: {e}", exc_info=True)
+            return [] # Return empty list on DB error
         finally:
             if cursor:
                 cursor.close()
-                log.debug("Cursor closed after fetching semantic candidates.")
+                log.debug("Cursor closed after retrieving semantic results.")
 
-        results_with_scores: list[tuple[MemoryDoc, float]] = []
-        for candidate_doc in candidates:
-            passes_filter = True
-            if filter_tags and not set(filter_tags).issubset(set(candidate_doc.tags or [])):
-                passes_filter = False
-            if filter_source_agents and candidate_doc.source_agent not in filter_source_agents:
-                passes_filter = False
-
-            if passes_filter and candidate_doc.embedding_path:
-                doc_embedding = self.embedding_manager.load_embedding(candidate_doc.embedding_path)
-                if doc_embedding is not None:
-                    similarity = self.embedding_manager.calculate_similarity(query_embedding, doc_embedding)
-                    results_with_scores.append((candidate_doc, similarity))
-                else:
-                    log.warning(f"Could not load embedding for doc {candidate_doc.id} from path {candidate_doc.embedding_path}")
-
-        results_with_scores.sort(key=lambda item: item[1], reverse=True)
-        top_k_results = results_with_scores[:k]
-
-        final_results = []
-        for doc, score in top_k_results:
-            doc.score = score
-            final_results.append(doc)
-
-        log.info(f"Semantic query returned {len(final_results)} results.")
-        return final_results
+        # Re-order results according to the semantic search score order
+        ordered_results = [results_map[uuid_] for uuid_ in top_k_uuids if uuid_ in results_map]
+        log.info(f"Semantic query finished. Returning {len(ordered_results)} MemoryDoc objects.")
+        return ordered_results
 
     def hybrid_query(
         self,
@@ -289,91 +407,133 @@ class HybridSQLiteAdapter(MemoryAdapter):
         filter_tags: Optional[List[str]] = None,
         filter_source_agents: Optional[List[str]] = None,
         rrf_k: int = 60,  # RRF constant, common default is 60
+        alpha: float = 0.5 # Weight for FTS vs Semantic (0=FTS only, 1=Semantic only)
     ) -> List[Tuple[MemoryDoc, float]]:
-        """Perform a hybrid search combining FTS and semantic search using RRF.
+        """Performs hybrid search (FTS + Semantic) using Reciprocal Rank Fusion (RRF)."""
+        log.debug(f"Entering hybrid_query method: query='{query_text[:50]}...', k={k}, tags={filter_tags}, agents={filter_source_agents}, alpha={alpha}, rrf_k={rrf_k}")
+        if not self.conn:
+            log.error("Cannot hybrid query: SQLite connection is not established.")
+            return []
 
-        Args:
-            query_text: The text to search for.
-            k: The final number of results to return.
-            filter_tags: Optional list of tags to filter results by.
-            filter_source_agents: Optional list of source agents to filter results by.
-            rrf_k: The constant used in the RRF calculation (default: 60).
+        # Ensure alpha is within valid range
+        alpha = max(0.0, min(1.0, alpha))
+        log.debug(f"Using alpha (semantic weight): {alpha}")
 
-        Returns:
-            A list of tuples, each containing a MemoryDoc and its RRF score,
-            sorted by score in descending order.
-        """
-        # 1. Perform FTS query
-        # We fetch more results initially to give RRF a good pool to work with
-        fts_results = self.query(
-            query_text,
-            k=k * 5,  # Fetch more for ranking
-            filter_tags=filter_tags,
-            filter_source_agents=filter_source_agents,
-        )
+        # Determine how many results to fetch from each method (fetch more for RRF)
+        fetch_k = max(k * 2, 50) # Fetch more results for better ranking potential
+        log.debug(f"Fetching top {fetch_k} results from FTS and Semantic searches.")
 
-        # 2. Perform Semantic query
-        semantic_results = self.semantic_query(
-            query_text,
-            k=k * 5,  # Fetch more for ranking
-            filter_tags=filter_tags,
-            filter_source_agents=filter_source_agents,
-        )
+        # 1. FTS Query
+        log.debug("Performing FTS query part of hybrid search...")
+        fts_results_docs = self.query(query_text, fetch_k, filter_tags, filter_source_agents)
+        fts_results = {doc.id: rank + 1 for rank, doc in enumerate(fts_results_docs)}
+        log.info(f"Hybrid Query: FTS returned {len(fts_results)} results.")
+        # Assign FTS scores (lower rank is better)
+        # fts_scores = {doc.id: 1.0 / (rrf_k + rank + 1) for rank, doc in enumerate(fts_results)}
 
-        # 3. Combine results using Reciprocal Rank Fusion (RRF)
-        ranked_results: Dict[str, float] = {}
+        # 2. Semantic Query
+        semantic_results_docs = []
+        semantic_results = {}
+        if self.embedding_manager.embedding_model is not None and alpha > 0:
+            log.debug("Performing Semantic query part of hybrid search...")
+            semantic_results_docs = self.semantic_query(query_text, fetch_k, filter_tags, filter_source_agents)
+            # semantic_scores = {doc.id: 1.0 / (rrf_k + rank + 1) for rank, doc in enumerate(semantic_results)}
+            semantic_results = {doc.id: rank + 1 for rank, doc in enumerate(semantic_results_docs)}
+            log.info(f"Hybrid Query: Semantic returned {len(semantic_results)} results.")
+        elif alpha > 0:
+            log.warning("Semantic query requested (alpha > 0) but model not available. Hybrid search will only use FTS.")
+        else:
+            log.info("Semantic query skipped (alpha == 0).")
 
-        # Process FTS results
-        for rank, doc in enumerate(fts_results):
-            doc_id = str(doc.id)
-            if doc_id not in ranked_results:
-                ranked_results[doc_id] = 0.0
-            ranked_results[doc_id] += 1.0 / (rrf_k + rank)
+        # 3. Combine results using Weighted RRF or Simple Weighting
+        log.debug("Combining FTS and Semantic results...")
+        combined_scores: Dict[str, float] = {}
+        all_doc_ids = set(fts_results.keys()) | set(semantic_results.keys())
+        log.debug(f"Total unique documents from both searches: {len(all_doc_ids)}")
 
-        # Process Semantic results
-        for rank, doc in enumerate(semantic_results):
-            doc_id = str(doc.id)
-            if doc_id not in ranked_results:
-                ranked_results[doc_id] = 0.0
-            ranked_results[doc_id] += 1.0 / (rrf_k + rank)
+        for doc_id in all_doc_ids:
+            fts_rank = fts_results.get(doc_id)
+            semantic_rank = semantic_results.get(doc_id)
+            
+            fts_score = 1.0 / (rrf_k + fts_rank) if fts_rank is not None else 0.0
+            semantic_score = 1.0 / (rrf_k + semantic_rank) if semantic_rank is not None else 0.0
+            
+            # Weighted combination
+            combined_scores[doc_id] = (1 - alpha) * fts_score + alpha * semantic_score
+            # log.debug(f"Doc ID: {doc_id}, FTS Rank: {fts_rank}, Sem Rank: {semantic_rank}, FTS Score: {fts_score:.4f}, Sem Score: {semantic_score:.4f}, Combined: {combined_scores[doc_id]:.4f}")
 
-        # 4. Sort by RRF score
-        sorted_doc_ids = sorted(ranked_results.keys(), key=lambda doc_id: ranked_results[doc_id], reverse=True)
 
-        # 5. Retrieve full MemoryDoc objects for the top K results
+        # 4. Sort by combined score and retrieve top K documents
+        sorted_doc_ids = sorted(combined_scores, key=combined_scores.get, reverse=True)
+        top_k_ids = sorted_doc_ids[:k]
+        log.info(f"Combined scores calculated for {len(combined_scores)} docs. Returning top {len(top_k_ids)}.")
+        log.debug(f"Top {k} combined doc IDs: {top_k_ids}")
+
+        if not top_k_ids:
+            return []
+
+        # Retrieve full documents for the top K IDs
+        # We can reuse the docs we already fetched if available
+        results_map = {doc.id: doc for doc in fts_results_docs}
+        results_map.update({doc.id: doc for doc in semantic_results_docs}) # Overwrite with semantic if present, though content is same
+
         final_results: List[Tuple[MemoryDoc, float]] = []
-        doc_map = {str(doc.id): doc for doc in fts_results + semantic_results}
-
-        for doc_id in sorted_doc_ids[:k]:
-            if doc_id in doc_map:
-                # Add the doc and its score, ensuring no duplicates if a doc was only in one list initially
-                if not any(res[0].id == doc_map[doc_id].id for res in final_results):
-                     final_results.append((doc_map[doc_id], ranked_results[doc_id]))
+        retrieved_count = 0
+        missing_ids = []
+        for doc_id in top_k_ids:
+            if doc_id in results_map:
+                 final_results.append((results_map[doc_id], combined_scores[doc_id]))
+                 retrieved_count += 1
             else:
-                # This case might happen if filters were applied differently or
-                # if a doc appeared very low in both lists and wasn't fetched.
-                # Fetch the doc explicitly if needed, though less likely with k*5 fetch.
-                # For simplicity here, we rely on the combined list. If a doc_id isn't
-                # in doc_map, it means it wasn't in the top k*5 of either search.
-                pass # Or log a warning
+                missing_ids.append(doc_id)
+                log.warning(f"Document ID {doc_id} from top hybrid results not found in initially fetched docs. This might indicate an issue.")
+        
+        # If any top IDs were missing, fetch them directly (should be rare)
+        if missing_ids:
+            log.warning(f"Fetching {len(missing_ids)} missing top-k documents directly from DB...")
+            sql_retrieve_missing = f"SELECT * FROM memories WHERE uuid IN ({','.join(['?']*len(missing_ids))})"
+            cursor = None
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(sql_retrieve_missing, missing_ids)
+                rows = cursor.fetchall()
+                log.debug(f"Retrieved {len(rows)} missing docs.")
+                for row in rows:
+                    try:
+                        doc = self._row_to_memory_doc(row)
+                        final_results.append((doc, combined_scores[doc.id]))
+                        retrieved_count += 1
+                    except Exception as convert_err:
+                        log.error(f"Skipping row due to conversion error during missing doc retrieval: {convert_err}. Row: {dict(row)}")
+            except sqlite3.Error as e:
+                log.error(f"SQLite error retrieving missing docs for hybrid query: {e}", exc_info=True)
+            finally:
+                if cursor:
+                    cursor.close()
+                    log.debug("Cursor closed after retrieving missing docs.")
+            # Re-sort final results potentially including newly fetched ones
+            final_results.sort(key=lambda item: item[1], reverse=True)
 
-        # Ensure we don't exceed k due to potential rounding/tie issues (unlikely with float scores)
-        return final_results[:k]
+        log.info(f"Hybrid query finished. Returning {len(final_results)} documents.")
+        return final_results[:k] # Ensure we only return k
 
     def close(self):
-        """Closes the SQLite database connection."""
+        """Closes the SQLite connection."""
+        log.info("Attempting to close SQLite connection...")
         if self.conn:
             try:
                 self.conn.close()
-                log.info(f"Closed SQLite DB connection: {self.db_path}")
+                log.info("SQLite connection closed successfully.")
                 self.conn = None
             except sqlite3.Error as e:
-                log.error(f"Error closing SQLite DB connection: {e}")
+                log.error(f"Error closing SQLite connection: {e}")
+        else:
+            log.warning("Close called but SQLite connection was not established or already closed.")
 
     def __del__(self):
-        """Ensure connection is closed when object is garbage collected."""
-        if hasattr(self, 'conn') and self.conn:
-            self.close()
+        """Ensure connection is closed when the object is deleted."""
+        # log.debug("HybridSQLiteAdapter __del__ called. Attempting to close connection.") # Can be noisy
+        self.close()
 
 # Example usage (for testing)
 if __name__ == '__main__':
