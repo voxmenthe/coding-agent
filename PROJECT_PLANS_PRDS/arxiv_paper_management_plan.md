@@ -42,80 +42,8 @@ So we will need some specific tools for this.
 *   **Accessibility:** The stored text and metadata should be easily accessible, ideally for both the agent (via commands) and the user (potentially via direct file inspection/editing).
 *   **Lightweight & VCS-Friendly:** Avoid heavy database dependencies if possible. The storage format should work reasonably well with Git (e.g., produce meaningful diffs).
 
-## 3. Proposed Storage Options
-
-Here are a few options, considering the requirements:
-
-### Option A: One Directory Per PDF (YAML Metadata + Markdown Text)
-
-*   **Structure:**
-    ```
-    processed_pdfs/
-    └── <unique_pdf_id>/      # e.g., timestamp-slug or UUID
-        ├── meta.yaml         # Stores all structured metadata
-        └── text.md           # Stores full extracted text (Markdown format)
-    ```
-*   **`meta.yaml` Example:**
-    ```yaml
-    source_filename: paper_v1.pdf
-    processed_timestamp: 2025-05-03T20:30:00Z
-    title: "Attention Is All You Need"
-    authors: ["Vaswani, A.", "..."]
-    abstract: "The dominant sequence transduction models..."
-    references: "- Author (Year). Title...\n- ..."
-    arxiv_url: "[https://arxiv.org/abs/1706.03762"](https://arxiv.org/abs/1706.03762")
-    tags: ["nlp", "transformer", "2017"]
-    notes: "Initial implementation used..."
-    ```
-*   **Pros:**
-    *   Very human-readable and directly editable.
-    *   Clean separation of text and metadata.
-    *   Good Git diffs for both metadata (`meta.yaml`) and text (`text.md`) changes.
-    *   Simple to implement the saving logic.
-*   **Cons:**
-    *   Querying requires scanning all `meta.yaml` files in the `processed_pdfs` directory, which might become slow with thousands of entries (though likely fine for hundreds).
-*   **Query Implementation:** A helper function would iterate through subdirectories, load each `meta.yaml`, parse it, and filter based on the query criteria (e.g., check if `tags` list contains the desired tag).
-
-### Option B: Central Catalog (JSONL) + Text Blobs
-
-*   **Structure:**
-    ```
-    processed_pdfs/
-    ├── catalog.jsonl     # Metadata store, one JSON object per line
-    └── blobs/
-        └── <unique_pdf_id>.txt  # Raw extracted text
-    ```
-*   **`catalog.jsonl` Line Example:**
-    ```json
-    {"id": "...", "source_filename": "paper.pdf", "processed_timestamp": "...", "title": "...", "tags": ["nlp"], "blob_path": "blobs/<unique_pdf_id>.txt", ...}
-    ```
-*   **Pros:**
-    *   Querying metadata is fast: read and parse a single `catalog.jsonl` file line by line.
-    *   Appending new entries is straightforward.
-    *   Separates large text blobs from the queryable index.
-*   **Cons:**
-    *   Updating existing metadata requires reading the file, finding the line, modifying it, and writing the whole file back (or using temporary files), which is slightly more complex than editing a YAML file.
-    *   Git diffs for metadata changes might show the entire line changing, even for small edits.
-*   **Query Implementation:** Read `catalog.jsonl` line by line, parse each JSON object, and apply filtering logic.
-
-### Option C: Single JSON File Catalog + Text Blobs
-
-*   **Structure:** Similar to Option B, but uses a single, large JSON file (`catalog.json`) instead of JSONL.
-    ```
-    processed_pdfs/
-    ├── catalog.json      # Metadata store, e.g., {"pdf_id1": {...}, "pdf_id2": {...}}
-    └── blobs/
-        └── <unique_pdf_id>.txt
-    ```
-*   **Pros:**
-    *   Very easy to load and query the entire metadata set using standard JSON libraries.
-*   **Cons:**
-    *   Requires loading the entire `catalog.json` into memory for any read or write operation, which can become inefficient with many entries.
-    *   High risk of merge conflicts in Git if multiple processes or users modify the file.
-    *   Atomicity: A crash during writing could corrupt the entire file.
-*   **Query Implementation:** Load the entire JSON file, then filter the resulting Python dictionary/list.
-
-### Option D: Lightweight DB (SQLite)
+## 3. Proposed Storage Option
+### Lightweight DB (SQLite)
 
 *   **Structure:**
     ```
@@ -141,8 +69,6 @@ Here are a few options, considering the requirements:
 
 We will proceed with **Option D**. This involves using a central SQLite database (`paper_metadata.db`) to store metadata and storing the extracted text content in separate files (`blobs/<unique_id>.txt`) within a designated directory (`processed_pdfs/`). This approach leverages the built-in `sqlite3` module, provides robust querying capabilities, and handles data integrity well. While the database file itself isn't ideal for Git diffs, the separation of large text blobs helps mitigate this.
 
-*(Options A, B, and C are superseded by this decision.)*
-
 ## 5. Implementation Plan
 
 This plan integrates the PDF processing and storage into the existing agent structure (`src/main.py`, `src/tools.py`) in a modular way.
@@ -167,9 +93,10 @@ This plan integrates the PDF processing and storage into the existing agent stru
             *   `notes` (TEXT).
             *   `last_accessed` (TEXT ISO8601).
     *   Implement `add_paper(metadata)`: Inserts a new paper record. Takes a dictionary of metadata. Generates `unique_paper_id` and `blob_path`. Returns the `id` or `unique_paper_id`.
+    *   Implement `get_paper_by_fuzzy_string_match(string)`: Retrieves a paper record.
     *   Implement `get_paper_by_id(unique_paper_id)`: Retrieves a paper record.
     *   Implement `update_paper(unique_paper_id, updates)`: Updates specific fields for a paper.
-    *   Implement basic query functions (e.g., `find_papers_by_tag(tag)`).
+    *   Implement basic query functions (e.g., `find_papers_by_tag(tag)`, `find_papers_by_abstract_keyword(keyword)`, etc.).
 
 2.  **Create Text Blob Saving Function (`src/tools.py`):**
     *   Implement `save_text_blob(unique_id, text_content)`: Saves the extracted text to `processed_pdfs/blobs/<unique_id>.txt`. Uses the path defined in `db_utils.py`.
@@ -179,7 +106,7 @@ This plan integrates the PDF processing and storage into the existing agent stru
     *   After successful text extraction using `upload_pdf_for_gemini`:
         *   Import functions from `db_utils` and `tools`.
         *   Call `init_db()` (it's safe to call repeatedly).
-        *   Generate a `unique_paper_id` (e.g., using `uuid.uuid4().hex`).
+        *   Generate a `unique_paper_id` (should be a unique hash of the source filename).
         *   Call `save_text_blob(unique_paper_id, extracted_text)`.
         *   Prepare a basic `metadata` dictionary:
             *   `unique_paper_id`: The generated ID.
@@ -191,19 +118,22 @@ This plan integrates the PDF processing and storage into the existing agent stru
             *   Other fields initially `None` or extracted if possible (basic title/author extraction can be added later).
         *   Call `add_paper(metadata)`.
         *   Provide feedback to the user: "Processed and saved `<filename>` with ID `<unique_paper_id>`."
-    *   **Important:** Ensure the `upload_pdf_for_gemini` in `tools.py` is modified or wrapped to return the *extracted text content* itself, not just the `File` object or status message. Currently, it seems focused only on the upload/processing status and doesn't explicitly fetch/return the text. This might require adding a separate call to Gemini using the uploaded file reference to get the text.
+    *   **Important:** Ensure the `upload_pdf_for_gemini` in `tools.py` is modified or wrapped to return the *extracted text content* itself, not just the `File` object or status message. Currently, it seems focused only on the upload/processing status and doesn't explicitly fetch/return the text. This might require adding a separate call to Gemini using the uploaded file reference to get the text. Check the google.genai docs for more info here: https://googleapis.github.io/python-genai/index.html and here: https://ai.google.dev/gemini-api/docs/document-processing?lang=python . Make sure to read the relevant documentation on the web before attempting to implement.
+
 
 **Phase 2: Basic Querying and Retrieval**
 
+Note: All sqlite db-related slash commands should start with `db_`.
+
 1.  **Implement Query Function (`src/db_utils.py`):**
-    *   Enhance `find_papers_by_tag(tag)`: Returns a list of paper metadata dictionaries matching the tag. Handles JSON parsing for the `tags` column.
-    *   Add `find_papers(criteria)`: More general query function (e.g., by author, title keyword).
-2.  **Create `/find_papers` Command (`src/main.py`):**
+    *   Enhance `db_find_papers_by_tag(tag)`: Returns a list of paper metadata dictionaries matching the tag. Handles JSON parsing for the `tags` column.
+    *   Add `db_find_papers(criteria)`: More general query function (e.g., by author, title keyword).
+2.  **Create `/db_find_papers` Command (`src/main.py`):**
     *   Add a new command handler (e.g., `_handle_find_papers`).
     *   Parse arguments (e.g., `--tag <tag>`, `--author <author>`).
     *   Call the appropriate query function from `db_utils.py`.
     *   Format and display the results (e.g., list of IDs, titles, tags).
-3.  **Create `/load_paper` Command (`src/main.py`):**
+3.  **Create `/db_load_paper` Command (`src/main.py`):**
     *   Add a new command handler (e.g., `_handle_load_paper`).
     *   Takes a `unique_paper_id` as argument.
     *   Calls `get_paper_by_id` from `db_utils.py`.
