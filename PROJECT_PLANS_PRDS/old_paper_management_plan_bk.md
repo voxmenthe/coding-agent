@@ -1,7 +1,5 @@
 # Plan: Persistent Storage and Querying for Processed PDFs
 
-**Author:** Cascade
-**Date:** 2025-05-03
 
 ## 1. Context
 
