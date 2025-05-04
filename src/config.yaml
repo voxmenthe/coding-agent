@@ -1,0 +1,6 @@
+api_key: None #  YOUR_API_KEY_HERE  # Replace with your actual Gemini API key if you need to - the default is to load it from your ~/.env file
+model_name: "gemini-2.5-flash-preview-04-17" # Or other compatible model
+verbose: false
+default_thinking_budget: 256 # Default token budget for tool use / thinking
+PDFS_TO_CHAT_WITH_DIRECTORY: "PDFS/" # Relative path from project root
+SAVED_CONVERSATIONS_DIRECTORY: "SAVED_CONVERSATIONS/" # Relative path from project root
