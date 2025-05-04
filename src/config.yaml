@@ -4,3 +4,5 @@ verbose: false
 default_thinking_budget: 256 # Default token budget for tool use / thinking
 PDFS_TO_CHAT_WITH_DIRECTORY: "PDFS/" # Relative path from project root
 SAVED_CONVERSATIONS_DIRECTORY: "SAVED_CONVERSATIONS/" # Relative path from project root
+PAPER_DB_PATH: "processed_papers/metadata.db" # Relative path for paper database
+PAPER_BLOBS_DIR: "processed_papers/blobs/"    # Relative path for text blobs

@@ -38,6 +38,7 @@ weasyprint = "*"
 ruff = "*"
 black = "*"
 feedparser = "*"
+pypdf = "*"
 
 [tool.poetry.group.dev.dependencies]
 mypy = "*"

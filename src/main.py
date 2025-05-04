@@ -3,11 +3,8 @@ from google.genai import types
 import os
 import sys
 from pathlib import Path
-from src.tools import (
-    read_file, list_files, edit_file, execute_bash_command,
-    run_in_sandbox, find_arxiv_papers, get_current_date_and_time,
-    upload_pdf_for_gemini, google_search, open_url
-)
+from . import database
+from . import tools
 import traceback
 import argparse
 import functools
@@ -17,6 +14,11 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
 import bisect # Added for efficient searching
 import yaml
+
+# Setup basic logging
+# TODO: Configure logging more robustly (e.g., level, format, handler) if needed
+logging.basicConfig(level=logging.INFO) # Basic config for now
+logger = logging.getLogger(__name__) # Define module-level logger
 
 # Choose your Gemini model - unless you want something crazy "gemini-2.5-flash-preview-04-17" is the default model
 MODEL_NAME = "gemini-2.5-flash-preview-04-17"
@@ -29,7 +31,9 @@ DEFAULT_CONFIG = {
     'verbose': False,
     'default_thinking_budget': 256,
     'PDFS_TO_CHAT_WITH_DIRECTORY': 'PDFS/',
-    'SAVED_CONVERSATIONS_DIRECTORY': 'SAVED_CONVERSATIONS/'
+    'SAVED_CONVERSATIONS_DIRECTORY': 'SAVED_CONVERSATIONS/',
+    'PAPER_DB_PATH': 'paper_database.db',
+    'PAPER_BLOBS_DIR': 'paper_blobs/'
 }
 
 # --- Utility Functions ---
@@ -42,6 +46,19 @@ def load_config():
         try:
             with open(config_path, 'r') as f:
                 config.update(yaml.safe_load(f))
+            # Resolve relative paths to absolute paths based on project root
+            if 'PDFS_TO_CHAT_WITH_DIRECTORY' in config:
+                config['PDFS_TO_CHAT_WITH_DIRECTORY'] = project_root / config['PDFS_TO_CHAT_WITH_DIRECTORY']
+                config['PDFS_TO_CHAT_WITH_DIRECTORY'].mkdir(parents=True, exist_ok=True)
+            if 'SAVED_CONVERSATIONS_DIRECTORY' in config:
+                config['SAVED_CONVERSATIONS_DIRECTORY'] = project_root / config['SAVED_CONVERSATIONS_DIRECTORY']
+                config['SAVED_CONVERSATIONS_DIRECTORY'].mkdir(parents=True, exist_ok=True)
+            if 'PAPER_DB_PATH' in config:
+                config['PAPER_DB_PATH'] = project_root / config['PAPER_DB_PATH']
+                # Directory creation handled by get_db_connection
+            if 'PAPER_BLOBS_DIR' in config:
+                config['PAPER_BLOBS_DIR'] = project_root / config['PAPER_BLOBS_DIR']
+                config['PAPER_BLOBS_DIR'].mkdir(parents=True, exist_ok=True) # Ensure blob dir exists
         except Exception as e:
             print(f"Error loading config: {e}")
     return config
@@ -50,7 +67,7 @@ def load_config():
 class CodeAgent:
     """A simple coding agent using Google Gemini (google-genai SDK)."""
 
-    def __init__(self, model_name: str, verbose: bool, api_key: str, default_thinking_budget: int, pdf_dir: str):
+    def __init__(self, model_name: str, verbose: bool, api_key: str, default_thinking_budget: int, pdf_dir: str, db_path: str, blob_dir: str):
         """Initializes the agent with API key and model name."""
         self.model_name = model_name
         self.verbose = verbose
@@ -58,15 +75,15 @@ class CodeAgent:
         self.model_name = f'models/{model_name}' # Add 'models/' prefix
         # Use imported tool functions
         self.tool_functions = [
-            read_file,
-            list_files,
-            edit_file,
-            execute_bash_command,
-            run_in_sandbox,
-            find_arxiv_papers,
-            get_current_date_and_time,
-            google_search,
-            open_url
+            tools.read_file,
+            tools.list_files,
+            tools.edit_file,
+            tools.execute_bash_command,
+            tools.run_in_sandbox,
+            tools.find_arxiv_papers,
+            tools.get_current_date_and_time,
+            tools.google_search,
+            tools.open_url
         ]
         if self.verbose:
             self.tool_functions = [self._make_verbose_tool(f) for f in self.tool_functions]
@@ -81,6 +98,8 @@ class CodeAgent:
         self.thinking_budget = default_thinking_budget
         self.thinking_config = None
         self.pdfs_dir_abs_path = Path(pdf_dir).resolve() # Store absolute path to PDF dir
+        self.db_path = db_path
+        self.blob_dir = blob_dir
         # Load saved conversations dir from config
         config = load_config()
         project_root = Path(__file__).parent.parent
@@ -264,54 +283,16 @@ class CodeAgent:
                         print("\n⚠️ Usage: /thinking_budget <number_of_tokens>")
                     continue # Skip sending command to model
 
-                if user_input.lower().startswith("/pdf "):
-                    # Decrement message counter as this command 'message' doesn't persist initially
-                    self._messages_this_interval -= 1
-                    pdf_filenames_str = user_input[len("/pdf "):].strip()
-                    filenames = pdf_filenames_str.split() # Split potential multiple filenames
-                    processed_one = False
-
-                    if not filenames:
-                         print("\n⚠️ Usage: /pdf <filename1> [filename2] ...")
-                         continue
-
-                    # --- Process the FIRST valid PDF filename provided --- 
-                    target_filename = filenames[0]
-                    pdf_path = self.pdfs_dir_abs_path / target_filename
-
-                    if not pdf_path.is_file() or not target_filename.lower().endswith('.pdf'):
-                         print(f"\n❌ Error: PDF file '{target_filename}' not found or invalid in {self.pdfs_dir_abs_path}.")
-                         # Ensure PDF list for completer is up-to-date if needed (complex)
-                         # For now, just inform the user.
-                         continue
-
-                    pdf_path_str = str(pdf_path)
-                    print(f"\n⬆️ Processing PDF: {target_filename}...")
-                    # Account for messages added by upload/extraction process
-                    # User command doesn't count, but the upload/extraction request/response do.
-                    self._messages_this_interval += 2 # Estimate 2 messages (req+resp)
-
-                    # Use the existing upload_pdf_for_gemini tool function
-                    uploaded_file = upload_pdf_for_gemini(pdf_path_str)
-                    if uploaded_file:
-                        print("\n⚒️ Extracting text from PDF to seed context...")
-                        extraction_response = self.chat.send_message(
-                            message=[uploaded_file, "\n\nExtract the entire text of this PDF, organized by section. Include all tables, and figures (full descriptions where appropriate in place of images)."],
-                            config=types.GenerateContentConfig(tools=self.tool_functions, thinking_config=self.thinking_config)
-                        )
-                        extraction_content = extraction_response.candidates[0].content
-                        self.conversation_history.append(extraction_content)
-                        # Stop attaching the file after ingestion
-                        self.active_files = []
-                        print("\n✅ PDF context seeded.")
-                        processed_one = True
-                    # No else needed, upload_pdf_for_gemini prints errors
-
-                    # If multiple filenames were given, inform user only first was processed
-                    if processed_one and len(filenames) > 1:
-                        print(f"\nℹ️ Note: Processed '{filenames[0]}'. Multiple file processing per command not yet supported.")
-
-                    continue # Skip sending this command to the model
+                # --- Refactored PDF command handling ---
+                # Check if the user input starts with '/pdf '
+                elif user_input.lower().startswith("/pdf "):
+                    # The user's command itself was already counted by self._messages_this_interval += 1
+                    # Extract arguments (everything after the first space)
+                    command_args = user_input.split()[1:] 
+                    # Call the dedicated handler method with the arguments
+                    self._handle_pdf_command(command_args)
+                    # Skip sending the '/pdf ...' command string to the model
+                    continue 
 
                 elif user_input.lower() == "/reset":
                     print("\n🎯 Resetting context and starting a new chat session...")
@@ -454,7 +435,7 @@ class CodeAgent:
                     # Get token count via the models endpoint
                     token_count_response = self.client.models.count_tokens(
                         model=self.model_name,
-                        contents=self.conversation_history
+                        contents=self.chat.history
                     )
                     self.current_token_count = token_count_response.total_tokens
                 except Exception as count_error:
@@ -477,6 +458,151 @@ class CodeAgent:
             print(f"\n▶️ Tool result ({func.__name__}): {result}")
             return result
         return wrapper
+
+    def _handle_pdf_command(self, args: list):
+        """Handles the /pdf command to process a PDF file and save metadata/text.
+
+        Returns:
+            Optional[int]: The paper_id if processing is successful, otherwise None.
+        """
+        if not self.pdfs_dir_abs_path:
+            print("\n⚠️ PDF directory not configured. Cannot process PDFs.")
+            return None
+        # Ensure db_path and blob_dir are Path objects if loaded from config
+        db_path = self.db_path if isinstance(self.db_path, Path) else Path(self.db_path)
+        blob_dir = self.blob_dir if isinstance(self.blob_dir, Path) else Path(self.blob_dir)
+
+        if not db_path:
+             print("\n⚠️ Database path not configured. Cannot save PDF metadata.")
+             return None
+        if not blob_dir:
+             print("\n⚠️ Blob directory not configured. Cannot save extracted text.")
+             return None
+        # Gemini client check might depend on whether processing happens here or elsewhere
+        # if not self.client:
+        #     print("Gemini client not initialized. Cannot process PDF.")
+        #     return
+
+        if len(args) < 1:
+            print("\n⚠️ Usage: /pdf <filename> [optional: arxiv_id]")
+            # Consider adding a call to list available PDFs here if useful
+            # self._list_available_pdfs() # If such a method exists
+            return None
+
+        filename_arg = args[0]
+        # Basic security: Ensure filename doesn't contain path separators
+        filename = Path(filename_arg).name
+        if filename != filename_arg:
+             print(f"\n⚠️ Invalid filename '{filename_arg}'. Please provide only the filename, not a path.")
+             return None
+
+        pdf_path = self.pdfs_dir_abs_path / filename
+
+        if not pdf_path.exists() or not pdf_path.is_file():
+            print(f"\n⚠️ Error: PDF file '{filename}' not found in {self.pdfs_dir_abs_path}.")
+            # self._list_available_pdfs() # If exists
+            return None
+
+        arxiv_id_arg = args[1] if len(args) > 1 else None
+
+        print(f"\n⏳ Processing PDF: {filename}...")
+
+        paper_id = None
+        conn = None
+        try:
+            conn = database.get_db_connection(db_path)
+            if not conn:
+                print("\n⚠️ Error: Failed to connect to the database.")
+                return None
+
+            paper_id = database.add_minimal_paper(conn, filename)
+            if not paper_id:
+                print("\n⚠️ Error: Failed to create initial database record.")
+                return None 
+
+            print(f"  📄 Created database record with ID: {paper_id}")
+
+            if arxiv_id_arg:
+                if isinstance(arxiv_id_arg, str) and len(arxiv_id_arg) > 5: 
+                    database.update_paper_field(conn, paper_id, 'arxiv_id', arxiv_id_arg)
+                    print(f"     Updated record with provided arXiv ID: {arxiv_id_arg}")
+                else:
+                    print(f"  ⚠️ Warning: Provided arXiv ID '{arxiv_id_arg}' seems invalid. Skipping update.")
+
+            print(f"  ⚙️  Extracting text from '{filename}' (using placeholder)...")
+            extracted_text = None
+            try:
+                try:
+                    from pypdf import PdfReader
+                    reader = PdfReader(pdf_path)
+                    extracted_text = ""
+                    for page in reader.pages:
+                        extracted_text += page.extract_text() + "\n"
+                    if not extracted_text:
+                        print("  ⚠️ Warning: PyPDF fallback extracted no text.")
+                        extracted_text = f"Placeholder: No text extracted via PyPDF for {filename}" 
+                except Exception as pypdf_err:
+                    print(f"  ⚠️ PyPDF fallback failed: {pypdf_err}. Using basic placeholder.")
+                    extracted_text = f"Placeholder: Error during PyPDF extraction for {filename}"
+
+                if not extracted_text: 
+                    raise ValueError("Text extraction resulted in empty content.")
+
+            except Exception as extract_err:
+                print(f"\n⚠️ Error during text extraction: {extract_err}")
+                database.update_paper_field(conn, paper_id, 'status', 'error_process')
+                conn.close()
+                return None 
+
+            print(f"  💬 Successfully extracted text ({len(extracted_text)} chars) [Placeholder/Fallback].")
+
+            blob_filename = f"paper_{paper_id}_text.txt"
+            blob_full_path = blob_dir / blob_filename
+            blob_rel_path = blob_filename 
+
+            print(f"  💾 Saving extracted text to {blob_full_path}...")
+            save_success = tools.save_text_blob(blob_full_path, extracted_text)
+
+            if not save_success:
+                print("\n⚠️ Error: Failed to save text blob.")
+                database.update_paper_field(conn, paper_id, 'status', 'error_blob')
+                conn.close()
+                return None
+            else:
+                print(f"     Successfully saved text blob.")
+                update_success = database.update_paper_field(conn, paper_id, 'blob_path', blob_rel_path)
+                if not update_success:
+                    print(f"  ⚠️ Warning: Failed to update blob_path in database for ID {paper_id}.")
+                    # Log and continue, as text is saved locally
+
+            update_success = database.update_paper_field(conn, paper_id, 'status', 'complete')
+            if update_success:
+                print(f"\n✅ Processing complete for '{filename}' (ID: {paper_id}).")
+            else:
+                print(f"\n⚠️ Warning: Failed to update final status to 'complete' for ID {paper_id}.")
+
+            conn.close() 
+            return paper_id 
+
+        except Exception as e:
+            logger.error(f"An error occurred during PDF processing for '{filename}' (ID: {paper_id}): {e}", exc_info=True)
+            print(f"\n❌ An unexpected error occurred during processing: {e}")
+            if conn and paper_id:
+                try:
+                    database.update_paper_field(conn, paper_id, 'status', 'error_generic')
+                except Exception as db_err:
+                    logger.error(f"Failed to update error status for {paper_id}: {db_err}", exc_info=True)
+            if conn:
+                conn.close()
+            return None 
+
+        finally:
+            if conn:
+                conn.close()
+
+    def _handle_list_command(self, args: list):
+        """Handles the /list command to show papers in the database."""
+        # ... (rest of the code remains the same)
 
 # --- Main Execution ---
 def main():
@@ -516,7 +642,9 @@ def main():
         verbose=args.verbose or config.get('verbose', DEFAULT_CONFIG['verbose']),
         api_key=api_key,
         default_thinking_budget=config.get('default_thinking_budget', DEFAULT_CONFIG['default_thinking_budget']),
-        pdf_dir=str(pdf_dir_path) # Pass absolute path to agent
+        pdf_dir=str(pdf_dir_path), # Pass absolute path to agent
+        db_path=config.get('PAPER_DB_PATH', DEFAULT_CONFIG['PAPER_DB_PATH']),
+        blob_dir=config.get('PAPER_BLOBS_DIR', DEFAULT_CONFIG['PAPER_BLOBS_DIR'])
     )
     agent.start_interaction()
 

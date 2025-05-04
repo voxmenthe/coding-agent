@@ -17,6 +17,8 @@ import asyncio
 from pydantic import SecretStr
 from langchain_google_genai import ChatGoogleGenerativeAI
 from src.browser_use import setup_browser, agent_loop
+import logging
+logger = logging.getLogger(__name__)
 
 # --- Helper Functions ---
 def _check_docker_running() -> tuple[bool, docker.DockerClient | None, str]:
@@ -139,7 +141,33 @@ def execute_bash_command(command: str) -> str:
         return output.strip()
 
     except Exception as e:
-        return f"Error executing command '{command}': {e}"
+        return f"Error executing command: {e}"
+
+# --- File System Operations ---
+
+def save_text_blob(file_path: Path, content: str) -> bool:
+    """Saves the given text content to the specified file path.
+
+    Args:
+        file_path: The absolute Path object for the file.
+        content: The string content to save.
+
+    Returns:
+        True if saving was successful, False otherwise.
+    """
+    try:
+        # Ensure the parent directory exists
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        logger.info(f"Successfully saved text blob to {file_path}")
+        return True
+    except IOError as e:
+        logger.error(f"IOError saving text blob to {file_path}: {e}", exc_info=True)
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error saving text blob to {file_path}: {e}", exc_info=True)
+        return False
 
 def run_in_sandbox(command: str) -> str:
     """Executes a command inside a sandboxed Docker container.
