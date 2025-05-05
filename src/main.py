@@ -9,6 +9,8 @@ import traceback
 import argparse
 import functools
 import logging
+import asyncio, threading
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
 from prompt_toolkit.completion import WordCompleter, NestedCompleter, PathCompleter, Completer, Completion
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
@@ -17,7 +19,7 @@ import yaml
 import sqlite3
 from typing import Optional
 from dotenv import load_dotenv # Import dotenv
-import google.ai.generativelanguage as glm # Correct import for Content/Part types
+
 
 # Setup basic logging
 # TODO: Configure logging more robustly (e.g., level, format, handler) if needed
@@ -32,7 +34,7 @@ MAX_PDF_CONTEXT_LENGTH = None # Max chars from PDF to prepend - TODO: get this f
 # Default configuration values
 DEFAULT_CONFIG = {
     'gemini_api_key': None,
-    'model_name': 'gemini-2.5-flash-preview-04-17', # Defaulting to Haiku
+    'model_name': 'gemini-2.5-flash-preview-04-17',
     'verbose': False,
     'default_thinking_budget': 256,
     'PDFS_TO_CHAT_WITH_DIRECTORY': 'PDFS/',
@@ -125,6 +127,13 @@ class CodeAgent:
         self.pdf_processing_method = config.get('pdf_processing_method', 'Gemini') # Default method
         self.client = None
         self.chat = None
+        
+        # # Background asyncio loop (daemon so app exits cleanly)
+        # self.loop = asyncio.new_event_loop()
+        # threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        # # Async GenAI client that lives on that loop
+        # self.async_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY")).aio
+        
         self.conversation_history = [] # Manual history for token counting ONLY
         self.current_token_count = 0 # Store token count for the next prompt
         self.active_files = [] # List to store active File objects
@@ -307,51 +316,43 @@ class CodeAgent:
 
         while True:
             try:
-                # --- Update Tracking Lists Before Prompt --- 
-                # Store the current total count and the number of messages added since last prompt
+                # ─── 1 · house‑keeping before we prompt ──────────────────────────
                 self.prompt_time_counts.append(self.current_token_count)
                 self.messages_per_interval.append(self._messages_this_interval)
-                self._messages_this_interval = 0 # Reset counter for next interval
-                # --- End Update --- 
+                self._messages_this_interval = 0
 
-                # Display token count from *previous* turn in the prompt
-                # Also show number of active files
                 active_files_info = f" [{len(self.active_files)} files]" if self.active_files else ""
-                # Use the latest calculated total for the prompt display
                 prompt_text = f"\n🔵 You ({self.current_token_count}{active_files_info}): "
                 user_input = session.prompt(prompt_text).strip()
 
-                if user_input.lower() in ["exit", "quit", "/exit", "/quit", "/q"]:
+                # ─── 2 · trivial exits / empty line ─────────────────────────────
+                if user_input.lower() in {"exit", "quit", "/exit", "/quit", "/q"}:
                     print("\n👋 Goodbye!")
                     break
+
                 if not user_input:
-                    # No input, reset interval message counter as no messages were added
-                    self._messages_this_interval = 0 
-                    # Remove the entries added at the start of this loop iteration
-                    if len(self.prompt_time_counts) > 1:
-                        self.prompt_time_counts.pop()
-                        self.messages_per_interval.pop()
+                    # unwind the stats we pushed at the top of the loop
+                    self.prompt_time_counts.pop()
+                    self.messages_per_interval.pop()
                     continue
 
-                # Increment message counter for user input
-                self._messages_this_interval += 1 
-
-                # Check for and prepend pending prompt
-                message_to_send = user_input
+                # count this turn
+                self._messages_this_interval += 1
+                message_to_send = user_input                 # ← default
+                
+                # ─── 3 · prompt injection ─────────────────────────────────────
                 prompt_len = len(self.pending_prompt) if self.pending_prompt else 0
                 if self.pending_prompt:
-                    print("[Including loaded prompt...]\n")
-                    # Simpler concatenation
-                    message_to_send = f"{self.pending_prompt}\n\n{user_input}"
-                    self.pending_prompt = None # Clear after use
+                    print("[Including loaded prompt.]\n")
+                    message_to_send = f"{self.pending_prompt}\n\n{message_to_send}"
+                    self.pending_prompt = None
                 
                 # Check for PDF context AFTER prompt (so prompt comes first)
                 pdf_context_len = len(self.pending_pdf_context) if self.pending_pdf_context else 0
                 if self.pending_pdf_context:
-                    print("[Including context from previously processed PDF...]\n")
-                    # Prepend PDF context to the potentially prompt-modified message
-                    message_to_send = f"{self.pending_pdf_context}\n\n{message_to_send}" 
-                    self.pending_pdf_context = None # Clear after use
+                    print("[Including context from previously processed PDF.]\n")
+                    message_to_send = f"{self.pending_pdf_context}\n\n{message_to_send}"
+                    self.pending_pdf_context = None        # consume exactly once
                 
                 
                 # --- Log message details before sending --- 
@@ -431,9 +432,9 @@ class CodeAgent:
                             for item in load_state['conversation_history']:
                                 if isinstance(item, dict) and 'role' in item and 'parts' in item and isinstance(item['parts'], list):
                                     # Recreate Parts from the list of text strings
-                                    parts = [glm.Part(text=part_text) for part_text in item['parts'] if isinstance(part_text, str)]
+                                    parts = [types.Part(text=part_text) for part_text in item['parts'] if isinstance(part_text, str)]
                                     # Recreate Content object
-                                    content = glm.Content(role=item['role'], parts=parts)
+                                    content = types.Content(role=item['role'], parts=parts)
                                     reconstructed_history.append(content)
                                 else:
                                     logger.warning(f"Skipping invalid item in loaded history: {item}")
@@ -472,16 +473,11 @@ class CodeAgent:
                         print("\n⚠️ Usage: /thinking_budget <number_of_tokens>")
                     continue # Skip sending command to model
 
-                # --- Refactored PDF command handling ---
                 # Check if the user input starts with '/pdf '
-                elif user_input.lower().startswith("/pdf "):
-                    # The user's command itself was already counted by self._messages_this_interval += 1
-                    # Extract arguments (everything after the first space)
-                    command_args = user_input.split()[1:] 
-                    # Call the dedicated handler method with the arguments
-                    self._handle_pdf_command(command_args)
-                    # Skip sending the '/pdf ...' command string to the model
-                    continue 
+                if user_input.lower().startswith("/pdf"):
+                    args = user_input.split()[1:]
+                    self._handle_pdf_command(args)
+                    continue  
 
                 elif user_input.lower() == "/reset":
                     print("\n🎯 Resetting context and starting a new chat session...")
@@ -567,54 +563,47 @@ class CodeAgent:
                                 self.prompt_time_counts = [0]
                                 self.messages_per_interval = [0]
 
-                        print(f"✅ Approximately cleared {messages_to_remove} message(s) (up to {tokens_actually_cleared} tokens). New total tokens: {self.current_token_count}")
+                        print(f"\n✅ Approximately cleared {messages_to_remove} message(s) "
+                              f"(up to {tokens_actually_cleared} tokens). "
+                              f"New total tokens: {self.current_token_count}")
 
-                    except ValueError as e:
-                        print(f"⚠️ Error processing /clear command: {e}")
                     except Exception as e:
-                        print(f"🚨 An unexpected error occurred during /clear: {e}")
+                        print(f"⚠️ Error processing /clear command: {e}")
                     continue # Skip sending this command to the model
 
                 # --- /prompt command ---
-                elif user_input.lower().startswith("/prompt "):
-                    if len(user_input.split()) == 2:
-                        prompt_name = user_input.split()[1]
-                        prompt_content = self._load_prompt(prompt_name)
-                        if prompt_content:
-                             self.pending_prompt = prompt_content
-                             print(f"\n✅ Prompt '{prompt_name}' loaded. It will be included in your next message.")
-                             # Optionally print truncated prompt:
-                             # print(f"   Content: {prompt_content[:100]}...")
-                        else:
-                             available = self._list_available_prompts()
-                             print(f"\n❌ Prompt '{prompt_name}' not found.")
-                             if available:
-                                 print(f"   Available prompts: {', '.join(available)}")
-                             else:
-                                 print("   No prompts found in the prompts directory.")
+                if user_input.lower().startswith("/prompt "):
+                    parts = user_input.split(maxsplit=1)
+                    prompt_name = parts[1] if len(parts) == 2 else ""
+                    prompt_content = self._load_prompt(prompt_name)
+                    if prompt_content:
+                        self.pending_prompt = prompt_content
+                        print(f"\n✅ Prompt '{prompt_name}' loaded. "
+                              "It will be included in your next message.")
                     else:
-                        print("\nUsage: /prompt <prompt_name>")
-                    continue # Skip sending command to model
+                        print(f"\n❌ Prompt '{prompt_name}' not found.")
+                    continue                           # <‑‑ early return # Skip sending command to model
 
                 # --- Prepare message content (Text + Files) ---
-                message_content = [message_to_send] # Start with user text
+                message_content = [message_to_send]
                 if self.active_files:
-                    message_content.extend(self.active_files) # Add file objects
+                    message_content.extend(self.active_files)
                     if self.config.get('verbose', DEFAULT_CONFIG['verbose']):
                         print(f"\n📎 Attaching {len(self.active_files)} files to the prompt:")
                         for f in self.active_files:
                             print(f"   - {f.display_name} ({f.name})")
 
                 # --- Update manual history (for token counting ONLY - Use Text Only) --- 
-                # Add user message BEFORE sending to model
-                # Store only the text part for history counting simplicity
-                new_user_content = glm.Content(parts=[glm.Part(text=message_to_send)], role="user")
+                new_user_content =types.Content(parts=[types.Part(text=message_to_send)], role="user")
                 self.conversation_history.append(new_user_content)
 
                 # --- Send Message --- 
                 print("\n⏳ Sending message and processing...")
                 # Prepare tool configuration **inside the loop** to use the latest budget
-                tool_config = types.GenerateContentConfig(tools=self.tool_functions, thinking_config=self.thinking_config)
+                tool_config = types.GenerateContentConfig(
+                    tools=self.tool_functions, 
+                    thinking_config=self.thinking_config
+                )
 
                 # Send message using the chat object's send_message method
                 # Pass the potentially combined list of text and files
@@ -625,19 +614,15 @@ class CodeAgent:
 
                 agent_response_text = ""
                 if response.candidates and response.candidates[0].content:
-                    agent_response_content = response.candidates[0].content
-                    # Extract text from all parts for printing
-                    agent_response_text = " ".join(p.text for p in agent_response_content.parts if hasattr(p, 'text'))
+                    agent_parts = response.candidates[0].content.parts
+                    agent_response_text = " ".join(p.text for p in agent_parts
+                                                   if hasattr(p, "text"))
 
-                if agent_response_text: # Only append if there's text
-                    history_agent_content = glm.Content(role="model", parts=[glm.Part(text=agent_response_text)])
-                    self.conversation_history.append(history_agent_content)
-                    logger.debug(f"Appended model text response to history: Role={history_agent_content.role}")
-                else:
-                    # Log if the response had candidates/content but no text could be extracted
-                    logger.warning("Agent response content found, but no text parts to add to history.")
+                if agent_response_text:
+                    hist_agent_content = types.Content(role="model",
+                                                     parts=[types.Part(text=agent_response_text)])
+                    self.conversation_history.append(hist_agent_content)
 
-                # Print agent's response text to user
                 print(f"\n🟢 \x1b[92mAgent:\x1b[0m {agent_response_text or '[No response text]'}")
 
                 # --- Detailed History Logging Before Token Count --- 
@@ -673,13 +658,13 @@ class CodeAgent:
                 # --- End Detailed History Logging --- 
 
                 # Calculate and display token count using client.models
-                try: # Inner try specifically for token counting
-                    token_count_response = self.client.models.count_tokens(
+                try:
+                    token_info = self.client.models.count_tokens(
                         model=self.model_name,
                         contents=self.conversation_history
                     )
-                    self.current_token_count = token_count_response.total_tokens
-                    print(f"\n[Token Count: {self.current_token_count}]" )
+                    self.current_token_count = token_info.total_tokens
+                    print(f"\n[Token Count: {self.current_token_count}]")
                 except Exception as count_err:
                     logger.error(f"Error calculating token count: {count_err}", exc_info=True)
                     print("🚨 Error: Failed to calculate token count.")
@@ -688,8 +673,8 @@ class CodeAgent:
                 print("\n👋 Goodbye!")
                 break
             except Exception as e:
-                print(f"\n🔴 \x1b[91mAn error occurred during interaction: {e}\x1b[0m")
-                traceback.print_exc() # Print traceback for debugging
+                print(f"\n🔴 An error occurred during interaction: {e}")
+                traceback.print_exc()
 
     def _make_verbose_tool(self, func):
         """Wrap tool function to print verbose info when called."""
