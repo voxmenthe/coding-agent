@@ -34,20 +34,19 @@ So we will need some specific tools for this.
 ## 2. Requirements
 
 *   **Persistence:** Store the extracted text content of each successfully processed PDF.
-*   **Metadata Storage:** Store structured metadata associated with each PDF.
-
-    *Baseline (MVP) fields*  
-    *   `source_filename`
-    *   `processed_timestamp`
-    *   `blob_path`  <!-- path to the raw text file -->
-
-    *Optional / future fields* (TBD)  
-    *   `title`, `authors`, `abstract`, `references`
-    *   `arxiv_id` / `arxiv_url`
-    *   `github_repo`
-    *   `last_updated`, `last_accessed`
-    *   `tags`
-    *   `notes`
+*   **Metadata Storage:** Store structured metadata associated with each PDF. Core fields should include:
+    *   `source_filename`: Original PDF filename.
+    *   `processed_timestamp`: When the PDF was processed.
+    *   `title` (potentially extracted).
+    *   `authors` (potentially extracted).
+    *   `abstract` (potentially extracted).
+    *   `references` (potentially extracted).
+    *   `arxiv_url` (if applicable, will be available if arxiv search returns it).
+    *   `github_repo` (if applicable, user-added).
+    *   `last_updated`: When the metadata was last updated.
+    *   `last_accessed`: When the paper was last read into chat context (starts with initial processing).
+    *   `tags`: A list of user-defined tags (e.g., `["vision", "transformer", "2024"]`). The user can edit tags at any time
+    *   `notes`: Free-form user notes. Can call up and edit at any time.
 *   **Extensibility:** Allow adding new, optional metadata fields easily in the future without breaking the system.
 *   **Querying:** Enable querying the stored metadata. A key use case is retrieving information based on tags (e.g., "list all abstracts for papers tagged 'vision'").
 *   **Accessibility:** The stored text and metadata should be easily accessible, ideally for both the agent (via commands) and the user (potentially via direct file inspection/editing).
@@ -87,89 +86,61 @@ This plan integrates the PDF processing and storage into the existing agent stru
 
 **Phase 1: Database Setup [✅ COMPLETE]**
 
-*   **Status:** The core database module ([src/database.py](src/database.py)) has been created with functions for connection management, table creation, and CRUD operations. Unit tests ([tests/test_database.py](tests/test_database.py)) have been written and are passing.
-*   **Implemented Schema ([papers](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:136:0-140:27) table in `src/database.py`):**
-    *   [id](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:117:0-129:79) (INTEGER PRIMARY KEY AUTOINCREMENT)
-    *   [arxiv_id](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:117:0-129:79) (TEXT UNIQUE NOT NULL) - e.g., '2310.06825v1'
-    *   `title` (TEXT NOT NULL)
-    *   `authors` (TEXT) - Stored as JSON string list
-    *   `summary` (TEXT)
-    *   `source_pdf_url` (TEXT UNIQUE) - Direct link to arXiv PDF
-    *   `download_path` (TEXT) - Local path where PDF is saved
-    *   `publication_date` (TIMESTAMP)
-    *   `last_updated_date` (TIMESTAMP) - From arXiv metadata
-    *   `categories` (TEXT) - Stored as JSON string list
-    *   [status](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:152:0-166:42) (TEXT DEFAULT 'pending') - e.g., pending, downloaded, processing, summarized, complete, error
-    *   `notes` (TEXT)
+*   **Status:** The core database module (`src/database.py`) has been created with functions for connection management, table creation (`init_db`), adding minimal paper records (`add_minimal_paper`), and updating specific fields (`update_paper_field`). Unit tests (`tests/test_database.py`) have been written and are passing.
+*   **Implemented Schema (`papers` table in `src/database.py` - fields used by `/pdf` command):**
+    *   `id` (INTEGER PRIMARY KEY AUTOINCREMENT)
+    *   `source_filename` (TEXT)
+    *   `arxiv_id` (TEXT UNIQUE) - *Optionally added by `/pdf` command if provided as argument.* 
+    *   `blob_path` (TEXT) - Relative path to the saved text blob (e.g., `paper_<id>_text.txt`).
+    *   `status` (TEXT DEFAULT 'pending') - Updated by `/pdf` command (e.g., 'complete', 'error_process', 'error_blob').
     *   `added_date` (TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
-    *   `updated_date` (TIMESTAMP DEFAULT CURRENT_TIMESTAMP) - Tracks local record updates
+    *   `updated_date` (TIMESTAMP DEFAULT CURRENT_TIMESTAMP) - Tracks local record updates.
+    *   *Note: Fields like `title`, `authors`, `summary`, `source_pdf_url`, `publication_date`, `last_updated_date`, `categories`, `notes` exist in the schema but are **not** populated by the basic `/pdf` command.* 
 
+**Phase 1.5: Core Saving Logic Integration [✅ COMPLETE]**
 
-**Phase 1.5: Database Setup and Core Saving Logic part 2**
+1.  **Database Functions (`src/database.py`):** Core functions (`get_db_connection`, `add_minimal_paper`, `update_paper_field`) are implemented and used directly.
+2.  **Text Blob Saving Function (`src/tools.py`):** `save_text_blob(blob_full_path, text_content)` implemented and working.
+3.  **Integration into `/pdf` Command (`src/main.py`):**
+    *   The `/pdf` command handler (`_handle_pdf_command`) now orchestrates the process:
+        *   Connects to the database.
+        *   Calls `database.add_minimal_paper` to create a record, getting the `paper_id`.
+        *   Optionally updates `arxiv_id` if provided.
+        *   Calls `tools.extract_text_from_pdf_gemini` (which correctly returns the extracted text content).
+        *   Calls `tools.save_text_blob` to save the text to `<blob_dir>/paper_<id>_text.txt`.
+        *   Calls `database.update_paper_field` multiple times to update `blob_path` and `status`.
+        *   Provides feedback to the user.
+    *   **Gemini Integration:** The `extract_text_from_pdf_gemini` function in `tools.py` was successfully refactored to use the `google-genai` SDK (including `client.files.upload` and `client.models.generate_content`) and returns the extracted text. Manual integration tests confirmed this is working.
 
-1.  **Create Database Helper Module (`src/db_utils.py`):**
-    *   Define the SQLite database path (e.g., `PROJECT_ROOT/processed_pdfs/paper_metadata.db`).
-    *   Define the blobs directory path (e.g., `PROJECT_ROOT/processed_pdfs/blobs/`).
-    *   Implement `get_paper_by_fuzzy_string_match(string)`: Retrieves a paper record.
-    *   Implement `get_paper_by_id(unique_paper_id)`: Retrieves a paper record.
-    *   Implement `update_paper(unique_paper_id, updates)`: Updates specific fields for a paper.
-    *   Implement basic query functions (e.g., `find_papers_by_tag(tag)`, `find_papers_by_abstract_keyword(keyword)`, etc.).
+**Phase 2: Optional ArXiv API Integration [▶️ NEXT STEP]**
 
-2.  **Create Text Blob Saving Function (`src/tools.py`):**
-    *   Implement `save_text_blob(unique_id, text_content)`: Saves the extracted text to `processed_pdfs/blobs/<unique_id>.txt`. Uses the path defined in `db_utils.py`.
+*Goal: Implement functionality to fetch metadata for a given ArXiv ID using the official API.* 
 
-3.  **Integrate into `/pdf` Command (`src/main.py`):**
-    *   Modify the `/pdf` command handler (`_handle_pdf_command` or similar).
-    *   After successful text extraction using `upload_pdf_for_gemini`:
-        *   Import functions from `db_utils` and `tools`.
-        *   Call `init_db()` (it's safe to call repeatedly).
-        *   Generate a `unique_paper_id` (should be a unique hash of the source filename).
-        *   Call `save_text_blob(unique_paper_id, extracted_text)`.
-        *   Prepare a basic `metadata` dictionary:
-            *   `unique_paper_id`: The generated ID.
-            *   `source_filename`: The input filename.
-            *   `blob_path`: Construct the relative path (e.g., `f"blobs/{unique_paper_id}.txt"`).
-            *   `processed_timestamp`: Use `get_current_date_and_time`.
-            *   `last_accessed`: Same as `processed_timestamp`.
-            *   `tags`: `[]` (empty list initially).
-            *   Other fields initially `None` or extracted if possible (basic title/author extraction can be added later).
-        *   Call `add_paper(metadata)`.
-        *   Provide feedback to the user: "Processed and saved `<filename>` with ID `<unique_paper_id>`."
-    *   **Important:** Ensure the `upload_pdf_for_gemini` in `tools.py` is modified or wrapped to return the *extracted text content* itself, not just the `File` object or status message. Currently, it seems focused only on the upload/processing status and doesn't explicitly fetch/return the text. This might require adding a separate call to Gemini using the uploaded file reference to get the text. Check the google.genai docs for more info here: https://googleapis.github.io/python-genai/index.html and here: https://ai.google.dev/gemini-api/docs/document-processing?lang=python . Make sure to read the relevant documentation on the web before attempting to implement.
-
-**Phase 2 (TBD): Optional ArXiv API Integration**
-
-1.  **Create ArXiv Service Module (`src/arxiv_service.py`):**
-    *   Install the [arxiv](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:117:0-129:79) library (`pip install arxiv`).
-    * Basic readme with how to use instructions is here: https://github.com/lukasschwab/arxiv.py/blob/master/README.md - need to revisit this to make sure we're implementing correctly
+1.  **Install Dependency:** Add the `arxiv` library to the project's dependencies (e.g., in `requirements.txt` or `pyproject.toml`) and install it (`pip install arxiv`).
+2.  **Create ArXiv Service Module (`src/arxiv_service.py`):**
     *   Implement `fetch_paper_metadata(arxiv_id)`:
-        *   Uses `arxiv.Client().results(id_list=[arxiv_id])` to query the API.
-        *   Parses the `arxiv.Result` object to extract key metadata: title, authors (list of strings), summary, categories (list of strings), published (datetime), updated (datetime), pdf_url.
-        *   Handles cases where the paper is not found or the API call fails.
-        *   Returns a dictionary containing the extracted metadata or `None` on failure.
-    *   Implement `search_papers(query, max_results=10)`:
-        *   Uses `arxiv.Client().results(Search(query=query, max_results=max_results, sort_by=SortCriterion.Relevance))`.
-        *   Returns a list of dictionaries, each containing metadata for a found paper (similar structure to `fetch_paper_metadata` output).
+        *   Use `arxiv.Client().results(id_list=[arxiv_id])`.
+        *   Parse the `arxiv.Result` object (title, authors, summary, categories, published, updated, pdf_url).
+        *   Handle errors (not found, API issues).
+        *   Return a dictionary of metadata or `None`.
+3.  **Create Basic Tests (`tests/test_arxiv_service.py`):**
+    *   Use `pytest` and `unittest.mock` to mock `arxiv.Client`.
+    *   Test successful data extraction and error handling for `fetch_paper_metadata`.
 
-2.  **Create Tests (`tests/test_arxiv_service.py`):**
-    *   Use `pytest` and `unittest.mock`.
-    *   Mock `arxiv.Client` and its `results` method.
-    *   Create mock `arxiv.Result` objects to simulate API responses (success, paper not found, multiple results for search).
-    *   Test `fetch_paper_metadata` for successful data extraction and error handling.
-    *   Test `search_papers` for correct parsing of multiple results.
+*(The `search_papers` function and its tests can be deferred to a later part of this phase if desired).* 
 
-**Phase 3: Paper Downloading and Database Integration**
+**Phase 3: Paper Downloading and Database Integration [Planned]**
+
+*Goal: Add a command to download the PDF from ArXiv using the fetched metadata and update the database.* 
 
 1.  **Implement `/download_arxiv <arxiv_id>` Command (`src/main.py`):**
-    *   Create a new command handler function (e.g., `_handle_download_arxiv`).
-    *   Import `arxiv_service` and `database`. Load necessary config (e.g., download directory).
-    *   Call `arxiv_service.fetch_paper_metadata(arxiv_id)`. If `None`, inform the user the paper wasn't found.
+    *   Call `arxiv_service.fetch_paper_metadata`.
     *   If metadata is found:
         *   Extract the `pdf_url`.
         *   Define the local `download_path` using a configured directory and a consistent naming scheme (e.g., `<PAPER_DOWNLOAD_DIR>/<arxiv_id>.pdf`).
         *   Use the `requests` library (`pip install requests`) to download the PDF from `pdf_url` and save it to `download_path`. Handle potential download errors.
         *   If download succeeds:
-            *   Prepare a [paper_data](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:43:0-56:5) dictionary using the metadata fetched from arXiv (title, authors, summary, categories, publication_date, last_updated_date, source_pdf_url) and add [arxiv_id](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:117:0-129:79), `download_path`, and set [status](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:152:0-166:42) to `'downloaded'`.
+            *   Prepare a paper data dictionary using the metadata fetched from arXiv (title, authors, summary, categories, publication_date, last_updated_date, source_pdf_url) and add arxiv_id, download_path, and set status to 'downloaded'.
             *   Establish a database connection (`conn = database.get_db_connection()`).
             *   Call `database.add_paper(conn, paper_data)`. Handle potential integrity errors if the paper already exists.
             *   Close the connection (`database.close_db_connection(conn)`).
@@ -195,39 +166,70 @@ Note: All sqlite db-related slash commands should start with [db_](cci:1://file:
     *   Format and display the results (e.g., list of IDs, titles, status, tags).
 3.  **Create `/db_load_paper` Command (`src/main.py`):**
     *   Add a new command handler (e.g., `_handle_load_paper`).
-    *   Takes an [arxiv_id](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:117:0-129:79) as argument.
-    *   Calls [get_paper_by_arxiv_id](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:117:0-129:79) from [database.py](cci:7://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:0:0-0:0).
+    *   Takes an `arxiv_id` or `paper_id`.
+    *   Calls `database.get_paper_by_arxiv_id` or `database.get_paper_by_id`.
     *   If found, display key metadata (Title, Authors, Abstract, Status, Tags, Notes).
-    *   Update the `last_accessed` timestamp for the paper using [update_paper_field](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:168:0-196:48). *(Need to implement `last_accessed` update logic)*.
-    *   *(Loading actual text content will depend on future text extraction implementation)*.
+    *   Update the `last_accessed` timestamp field (which needs to be added to the schema first).
 
-**Phase 5: Metadata Extraction and Editing**
+## History Management & Token Counting
 
-(This corresponds to the original Phase 3)
+**Current Situation:**
 
-1.  **Metadata Extraction (`src/tools.py` or `src/metadata_extractor.py`):**
-    *   *(Deferred until text extraction from PDF is implemented)* Implement `extract_metadata_from_text(text_content)`: Uses heuristics or potentially a simpler LLM call to extract Title, Authors, Abstract from the first page(s) of the text.
-    *   *(Deferred)* Modify the processing workflow (whether it's `/pdf` or `/download_arxiv` post-processing) to call this and potentially update the DB record.
-2.  **Implement Update Functions (`src/database.py`):**
-    *   Refine [update_paper_field](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:168:0-196:48) or add specific helpers (e.g., `update_paper_tags`) to handle modifying list-based fields like `tags`. Requires reading current tags, modifying the list, and writing back the JSON string.
-3.  **Create `/db_tag_paper` Command (`src/main.py`):**
-    *   Add handler `_handle_tag_paper`.
-    *   Takes [arxiv_id](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:117:0-129:79), `--add <tag>`, `--remove <tag>`, or `--set <tag1>,<tag2>`.
-    *   Calls [update_paper_field](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:168:0-196:48) (or a dedicated tag helper) to modify the `tags` list in the database.
-4.  **Create `/db_add_note` Command (`src/main.py`):**
-    *   Add handler `_handle_add_note`.
-    *   Takes [arxiv_id](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:117:0-129:79) and the note text (potentially multi-line).
-    *   Calls [update_paper_field](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:168:0-196:48) to set or replace the `notes` field.
+1.  **Gemini's Internal History:** The `self.chat` object (`google.genai.chats.Chat`) manages conversation history internally for context awareness during `send_message` calls. PDF context is injected by modifying the *next* message sent to this object.
+2.  **Manual History (`self.conversation_history`):** A separate list (`MutableSequence[types.Content]`) maintained within `CodeAgent` specifically for token counting (`self.model.count_tokens(self.conversation_history)`).
+3.  **The Problem:** The `_update_token_count` function currently attempts to access `self.chat.history` to get the history for token counting. This fails with `AttributeError: 'Chat' object has no attribute 'history'`. While the official documentation for `google.generativeai.Chat` *does* specify a `history` attribute, we are encountering this error in practice after the response stream is processed.
 
-**Phase 6: Integration with ArXiv Search**
+**Recommended Approach:**
 
-(This corresponds to the original Phase 4)
+Given the unreliability (in our current execution context) of accessing `self.chat.history`, we should rely **solely** on our manually managed `self.conversation_history` for token counting. This gives us direct control and avoids relying on potentially inconsistent internal state or access patterns of the `Chat` object.
 
-1.  **Modify `/find_arxiv_papers` (`src/tools.py`):**
-    *   When displaying results from the [arxiv](cci:1://file:///Volumes/bdrive/repos/coding-agent/tests/test_database.py:117:0-129:79) library search, for each result, call `database.get_paper_by_arxiv_id` to check if it's already in the local DB.
-    *   Append status information to the display (e.g., `[Status: Downloaded]`, `[Status: Pending]`, `[Not in DB]`).
-2.  **Enhance `/download_arxiv <arxiv_id>` Command (`src/main.py`):**
-    *   Before attempting download, check if the paper already exists using `database.get_paper_by_arxiv_id`. If it exists, inform the user and perhaps show the current status/metadata instead of re-downloading. Allow an option to force re-download/overwrite.
+**Implementation Plan (History Fix):**
+
+1.  **Modify `_process_response_stream`:** After successfully accumulating the full model response (`full_response_text`), create a `types.Content` object for the model's response (`role="model"`) and append it to `self.conversation_history`.
+2.  **Modify `_update_token_count`:** Change the function to use `self.conversation_history` instead of `self.chat.history` when calling `self.model.count_tokens()`.
+3.  **Verification:** Test the `/pdf` command followed by a query, ensuring the token count updates correctly after both the user message (with PDF context) and the model's response.
+
+## Prompt Management Feature (`/prompt`)
+
+**Goal:** Allow users to quickly load and use predefined prompts stored in files.
+
+**Requirements:**
+
+1.  **Prompt Storage:** Create a `prompts/` directory in the project root.
+2.  **Prompt Files:** Store prompts as plain text (`.txt`) or markdown (`.md`) files within `prompts/`. The filename (without extension) will serve as the prompt name (e.g., `summarize.txt` -> prompt name `summarize`).
+3.  **Slash Command:** Implement `/prompt <prompt_name>`.
+4.  **Autocompletion:** Provide nested autocompletion for `/prompt`, showing available prompt names from the `prompts/` directory.
+5.  **Functionality:** When `/prompt <name>` is used:
+    *   Load the content of `prompts/<name>.txt` or `prompts/<name>.md`.
+    *   Display the loaded prompt content to the user (optional, maybe truncated).
+    *   Prepend the loaded prompt content to the *next* user message sent to the model (similar mechanism to PDF context injection using a `self.pending_prompt` variable).
+
+**Implementation Plan (`/prompt` command):**
+
+1.  **Create Directory:** Add an empty `prompts/` directory to the repository.
+2.  **Add Sample Prompts:** Create 1-2 sample prompt files (e.g., `prompts/summarize.txt`, `prompts/explain_code.md`).
+3.  **Modify `CodeAgent.__init__`:** Add `self.pending_prompt: Optional[str] = None`.
+4.  **Implement Prompt Loading Logic:** Create a helper function `_load_prompt(prompt_name: str) -> Optional[str]` that:
+    *   Constructs paths to `prompts/<prompt_name>.txt` and `prompts/<prompt_name>.md`.
+    *   Checks if either file exists.
+    *   Reads and returns the content of the first one found, or `None` if neither exists.
+5.  **Implement Prompt Listing Logic:** Create a helper function `_list_available_prompts() -> List[str]` that:
+    *   Lists files in `prompts/`.
+    *   Filters for `.txt` and `.md` extensions.
+    *   Returns a list of filenames without extensions.
+6.  **Update `_build_completer`:** Modify the `NestedCompleter` definition:
+    *   Add `/prompt` as a top-level command.
+    *   For `/prompt`, use a dictionary where keys are dynamically generated by `_list_available_prompts()` and values are `None` (or another Completer if further nesting is needed later).
+7.  **Modify `_handle_command`:**
+    *   Add a case for `user_input.startswith('/prompt ')`.
+    *   Parse the `<prompt_name>`.
+    *   Call `_load_prompt()`.
+    *   If successful, store the loaded content in `self.pending_prompt` and print a confirmation message.
+    *   If not found, print an error message listing available prompts using `_list_available_prompts()`.
+8.  **Modify `start_interaction` Loop:**
+    *   *Before* checking for `self.pending_pdf_context`, check for `self.pending_prompt`.
+    *   If `self.pending_prompt` exists, prepend it to `message_to_send` (e.g., `f"PROMPT:\n---\n{self.pending_prompt}\n---\n\nUSER QUERY:\n{user_input}"`), print a confirmation, and clear `self.pending_prompt`.
+    *   Ensure the PDF context logic runs *after* the prompt logic if both are pending (prompt takes precedence or they combine appropriately).
 
 ## 6. Configuration
 

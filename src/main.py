@@ -14,6 +14,10 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
 import bisect # Added for efficient searching
 import yaml
+import sqlite3
+from typing import Optional
+from dotenv import load_dotenv # Import dotenv
+import google.ai.generativelanguage as glm # Correct import for Content/Part types
 
 # Setup basic logging
 # TODO: Configure logging more robustly (e.g., level, format, handler) if needed
@@ -23,10 +27,11 @@ logger = logging.getLogger(__name__) # Define module-level logger
 # Choose your Gemini model - unless you want something crazy "gemini-2.5-flash-preview-04-17" is the default model
 MODEL_NAME = "gemini-2.5-flash-preview-04-17"
 DEFAULT_THINKING_BUDGET = 256
+MAX_PDF_CONTEXT_LENGTH = None # Max chars from PDF to prepend - TODO: get this from config.yaml
 
 # Default configuration values
 DEFAULT_CONFIG = {
-    'api_key': None,
+    'gemini_api_key': None,
     'model_name': 'gemini-2.5-flash-preview-04-17', # Defaulting to Haiku
     'verbose': False,
     'default_thinking_budget': 256,
@@ -37,42 +42,103 @@ DEFAULT_CONFIG = {
 }
 
 # --- Utility Functions ---
-def load_config():
+def load_config(config_path: Path):
+    """Loads configuration, prioritizing environment variables for API key."""
+    # 1. Load environment variables from ~/.env (if it exists)
+    # find_dotenv will search directories upwards from the script location
+    # for a .env file. We specify the home directory explicitly.
+    dotenv_home_path = Path.home() / '.env'
+    if dotenv_home_path.is_file():
+        load_dotenv(dotenv_path=dotenv_home_path)
+        logger.info(f"Loaded environment variables from {dotenv_home_path}")
+    else:
+        logger.info(f"No .env file found at {dotenv_home_path}, checking system environment variables.")
+
+    # 2. Check for API key in environment variables first
+    env_api_key = os.getenv('GEMINI_API_KEY')
+
+    # 3. Load base configuration from YAML
     config = DEFAULT_CONFIG.copy()
-    project_root = Path(__file__).parent.parent # Assuming script is in src/
-    config_path = project_root / 'src/config.yaml'
-    
+    yaml_data = {}
     if config_path.is_file():
         try:
             with open(config_path, 'r') as f:
-                config.update(yaml.safe_load(f))
-            # Resolve relative paths to absolute paths based on project root
-            if 'PDFS_TO_CHAT_WITH_DIRECTORY' in config:
-                config['PDFS_TO_CHAT_WITH_DIRECTORY'] = project_root / config['PDFS_TO_CHAT_WITH_DIRECTORY']
-                config['PDFS_TO_CHAT_WITH_DIRECTORY'].mkdir(parents=True, exist_ok=True)
-            if 'SAVED_CONVERSATIONS_DIRECTORY' in config:
-                config['SAVED_CONVERSATIONS_DIRECTORY'] = project_root / config['SAVED_CONVERSATIONS_DIRECTORY']
-                config['SAVED_CONVERSATIONS_DIRECTORY'].mkdir(parents=True, exist_ok=True)
-            if 'PAPER_DB_PATH' in config:
-                config['PAPER_DB_PATH'] = project_root / config['PAPER_DB_PATH']
-                # Directory creation handled by get_db_connection
-            if 'PAPER_BLOBS_DIR' in config:
-                config['PAPER_BLOBS_DIR'] = project_root / config['PAPER_BLOBS_DIR']
-                config['PAPER_BLOBS_DIR'].mkdir(parents=True, exist_ok=True) # Ensure blob dir exists
+                yaml_data = yaml.safe_load(f) or {}
+                config.update(yaml_data)
+                logger.info(f"Loaded configuration overrides from {config_path}")
         except Exception as e:
-            print(f"Error loading config: {e}")
+            logger.error(f"Error loading config file {config_path}: {e}", exc_info=True)
+            # Continue with defaults and environment variables
+    else:
+         logger.info(f"Config file {config_path} not found. Using defaults and environment variables.")
+
+    # 4. Prioritize environment variable for API key
+    if env_api_key:
+        config['gemini_api_key'] = env_api_key
+        logger.info("Using GEMINI_API_KEY from environment.")
+    elif 'gemini_api_key' in yaml_data and yaml_data['gemini_api_key']:
+        logger.info("Using gemini_api_key from config.yaml (environment variable not set).")
+        # It's already in config from the update() step
+    else:
+        logger.warning("GEMINI_API_KEY not found in environment or config.yaml.")
+        # config['gemini_api_key'] will remain None from DEFAULT_CONFIG
+
+    # 5. Resolve paths (relative to project root, which is parent of src/)
+    project_root = Path(__file__).parent.parent 
+    for key in ['PDFS_TO_CHAT_WITH_DIRECTORY', 
+                'SAVED_CONVERSATIONS_DIRECTORY', 
+                'PAPER_DB_PATH', 
+                'PAPER_BLOBS_DIR']:
+        if key in config and isinstance(config[key], str):
+            resolved_path = project_root / config[key]
+            if key == 'PAPER_DB_PATH':
+                 # Ensure parent dir exists for DB path
+                 resolved_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                 # Ensure the directory itself exists for others
+                 resolved_path.mkdir(parents=True, exist_ok=True)
+            config[key] = resolved_path
+            logger.info(f"Resolved path for {key}: {config[key]}")
+        elif key in config and isinstance(config[key], Path):
+             # Path might already be resolved if loaded from previous runs/complex config
+             logger.info(f"Path for {key} already resolved: {config[key]}")
+             # Ensure directories exist even if path was pre-resolved
+             if key == 'PAPER_DB_PATH':
+                  config[key].parent.mkdir(parents=True, exist_ok=True)
+             else:
+                  config[key].mkdir(parents=True, exist_ok=True)
+
     return config
+
+def print_welcome_message(config):
+    """Prints the initial welcome and help message."""
+    print("\n🚀 Starting Code Agent...")
+    # Add other initial prints if needed
 
 # --- Agent Class ---
 class CodeAgent:
-    """A simple coding agent using Google Gemini (google-genai SDK)."""
-
-    def __init__(self, model_name: str, verbose: bool, api_key: str, default_thinking_budget: int, pdf_dir: str, db_path: str, blob_dir: str):
-        """Initializes the agent with API key and model name."""
-        self.model_name = model_name
-        self.verbose = verbose
-        self.api_key = api_key
-        self.model_name = f'models/{model_name}' # Add 'models/' prefix
+    def __init__(self, config: dict, conn: Optional[sqlite3.Connection]):
+        """Initializes the CodeAgent."""
+        self.config = config
+        self.api_key = config.get('gemini_api_key') # Correct key name
+        self.model_name = config.get('model_name', 'gemini-2.5-flash-preview-04-17') # Default model
+        self.pdf_processing_method = config.get('pdf_processing_method', 'Gemini') # Default method
+        self.client = None
+        self.chat = None
+        self.conversation_history = [] # Manual history for token counting ONLY
+        self.current_token_count = 0 # Store token count for the next prompt
+        self.active_files = [] # List to store active File objects
+        self.prompt_time_counts = [0] # Stores total tokens just before prompt
+        self.messages_per_interval = [0] # Stores # messages added in the last interval
+        self._messages_this_interval = 0 # Temporary counter
+        self.thinking_budget = config.get('default_thinking_budget', DEFAULT_THINKING_BUDGET)
+        self.thinking_config = None # Will be set in start_interaction
+        self.pdfs_dir_rel_path = config.get('PDFS_TO_CHAT_WITH_DIRECTORY') # Relative path from config
+        self.pdfs_dir_abs_path = Path(self.pdfs_dir_rel_path).resolve() if self.pdfs_dir_rel_path else None
+        self.blob_dir_rel_path = config.get('PAPER_BLOBS_DIR')
+        self.blob_dir = Path(self.blob_dir_rel_path).resolve() if self.blob_dir_rel_path else None
+        # Store the database connection passed from main
+        self.conn = conn 
         # Use imported tool functions
         self.tool_functions = [
             tools.read_file,
@@ -85,27 +151,41 @@ class CodeAgent:
             tools.google_search,
             tools.open_url
         ]
-        if self.verbose:
+        if self.config.get('verbose', DEFAULT_CONFIG['verbose']):
             self.tool_functions = [self._make_verbose_tool(f) for f in self.tool_functions]
-        self.client = None
-        self.chat = None
-        self.conversation_history = [] # Manual history for token counting ONLY
-        self.current_token_count = 0 # Store token count for the next prompt
-        self.active_files = [] # List to store active File objects
-        self.prompt_time_counts = [0] # Stores total tokens just before prompt
-        self.messages_per_interval = [0] # Stores # messages added in the last interval
-        self._messages_this_interval = 0 # Temporary counter
-        self.thinking_budget = default_thinking_budget
-        self.thinking_config = None
-        self.pdfs_dir_abs_path = Path(pdf_dir).resolve() # Store absolute path to PDF dir
-        self.db_path = db_path
-        self.blob_dir = blob_dir
-        # Load saved conversations dir from config
-        config = load_config()
-        project_root = Path(__file__).parent.parent
-        self.saved_conversations_dir = (project_root / config.get('SAVED_CONVERSATIONS_DIRECTORY', 'SAVED_CONVERSATIONS/')).resolve()
-        self.saved_conversations_dir.mkdir(parents=True, exist_ok=True)  # Ensure directory exists
-        self._configure_client()
+        if self.pdfs_dir_abs_path:
+            self.pdfs_dir_abs_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"PDF directory set to: {self.pdfs_dir_abs_path}")
+        else:
+            logger.warning("PDF directory not configured in config.yaml. /pdf command will be disabled.")
+
+        if self.blob_dir:
+            self.blob_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Blob directory set to: {self.blob_dir}")
+        else:
+            logger.warning("Blob directory not configured in config.yaml. Saving extracted text will be disabled.")
+
+        if not self.conn:
+             logger.warning("Database connection not established. Database operations will be disabled.")
+
+        if not self.api_key:
+            logger.warning("GEMINI_API_KEY not found in config or environment. Gemini features disabled.")
+        else:
+            self._configure_client()
+            if self.client:
+                self._initialize_chat()
+
+        self.pending_pdf_context: Optional[str] = None # For prepending PDF context
+        self.pending_prompt: Optional[str] = None # For prepending loaded prompt
+        self.prompts_dir = Path('src/prompts').resolve()
+
+        # Ensure directories exist (moved from load_config for clarity)
+        if self.pdfs_dir_abs_path:
+            self.pdfs_dir_abs_path.mkdir(parents=True, exist_ok=True)
+        if self.blob_dir:
+            self.blob_dir.mkdir(parents=True, exist_ok=True)
+        if self.prompts_dir:
+            self.prompts_dir.mkdir(parents=True, exist_ok=True)
 
     def _configure_client(self):
         """Configures the Google Generative AI client."""
@@ -119,12 +199,8 @@ class CodeAgent:
             traceback.print_exc()
             sys.exit(1)
 
-    def start_interaction(self):
-        """Starts the main interaction loop using a stateful ChatSession via client.chats.create."""
-        if not self.client:
-            print("\n\u274c Client not configured. Exiting.")
-            return
-
+    def _initialize_chat(self):
+        """Initializes the chat session."""
         print("\n\u2692\ufe0f Initializing chat session...")
         try:
             # Create a chat session using the client
@@ -134,6 +210,46 @@ class CodeAgent:
             print(f"\u274c Error initializing chat session: {e}")
             traceback.print_exc()
             sys.exit(1)
+
+    # --- Prompt Helper Methods ---
+    def _list_available_prompts(self) -> list[str]:
+        """Lists available prompt names from the prompts directory."""
+        if not self.prompts_dir.is_dir():
+            return []
+        prompt_files = [f.stem for f in self.prompts_dir.glob('*.txt')] + \
+                       [f.stem for f in self.prompts_dir.glob('*.md')]
+        return sorted(list(set(prompt_files))) # Sort and remove duplicates
+
+    def _load_prompt(self, prompt_name: str) -> Optional[str]:
+        """Loads the content of a prompt file."""
+        if not self.prompts_dir.is_dir():
+            return None
+        
+        # Check for .txt first, then .md
+        txt_path = self.prompts_dir / f"{prompt_name}.txt"
+        md_path = self.prompts_dir / f"{prompt_name}.md"
+
+        path_to_load = None
+        if txt_path.is_file():
+            path_to_load = txt_path
+        elif md_path.is_file():
+            path_to_load = md_path
+        
+        if path_to_load:
+            try:
+                return path_to_load.read_text()
+            except Exception as e:
+                logger.error(f"Error reading prompt file {path_to_load}: {e}", exc_info=True)
+                return None
+        else:
+             return None
+    # ---------------------------
+
+    def start_interaction(self):
+        """Starts the main interaction loop using a stateful ChatSession via client.chats.create."""
+        if not self.client:
+            print("\n\u274c Client not configured. Exiting.")
+            return
 
         print("\n\u2692\ufe0f Agent ready. Ask me anything. Type '/exit' or '/q' to quit.")
         print("   Use '/pdf <filename>' to seed PDF into context from the specified directory.")
@@ -159,12 +275,30 @@ class CodeAgent:
             print(f"\n⚠️ PDF directory not found: {self.pdfs_dir_abs_path}. /pdf command may not work correctly.")
 
         # List saved conversations for /load autocomplete
-        saved_files = [f.name for f in self.saved_conversations_dir.glob('*.json') if f.is_file()]
+        saved_conversations_dir_path = self.config.get('SAVED_CONVERSATIONS_DIRECTORY')
+        saved_files = []
+        if saved_conversations_dir_path and isinstance(saved_conversations_dir_path, Path) and saved_conversations_dir_path.is_dir():
+             saved_files = [f.name for f in saved_conversations_dir_path.glob('*.json') if f.is_file()]
+        elif isinstance(saved_conversations_dir_path, str): # Fallback if somehow it's still a string
+             # This case should ideally not happen due to load_config resolving paths
+             logger.warning("SAVED_CONVERSATIONS_DIRECTORY was a string, expected Path. Attempting to resolve.")
+             try:
+                  resolved_path = Path(__file__).parent.parent / saved_conversations_dir_path
+                  if resolved_path.is_dir():
+                       saved_files = [f.name for f in resolved_path.glob('*.json') if f.is_file()]
+             except Exception as e:
+                  logger.error(f"Error resolving string path for saved conversations: {e}")
+        else: 
+             # Use default relative path if config value is missing or invalid type
+             default_save_dir = Path(__file__).parent.parent / 'SAVED_CONVERSATIONS/'
+             if default_save_dir.is_dir():
+                  saved_files = [f.name for f in default_save_dir.glob('*.json') if f.is_file()]
 
         # Nested completer for commands and their potential arguments (like PDF files)
         completer_dict = {cmd: None for cmd in slash_commands}
         completer_dict['/pdf'] = WordCompleter(pdf_files, ignore_case=True)
         completer_dict['/load'] = WordCompleter(saved_files, ignore_case=True)
+        completer_dict['/prompt'] = WordCompleter(self._list_available_prompts(), ignore_case=True)
 
         command_completer = NestedCompleter.from_nested_dict(completer_dict)
 
@@ -202,6 +336,36 @@ class CodeAgent:
                 # Increment message counter for user input
                 self._messages_this_interval += 1 
 
+                # Check for and prepend pending prompt
+                message_to_send = user_input
+                prompt_len = len(self.pending_prompt) if self.pending_prompt else 0
+                if self.pending_prompt:
+                    print("[Including loaded prompt...]\n")
+                    # Simpler concatenation
+                    message_to_send = f"{self.pending_prompt}\n\n{user_input}"
+                    self.pending_prompt = None # Clear after use
+                
+                # Check for PDF context AFTER prompt (so prompt comes first)
+                pdf_context_len = len(self.pending_pdf_context) if self.pending_pdf_context else 0
+                if self.pending_pdf_context:
+                    print("[Including context from previously processed PDF...]\n")
+                    # Prepend PDF context to the potentially prompt-modified message
+                    message_to_send = f"{self.pending_pdf_context}\n\n{message_to_send}" 
+                    self.pending_pdf_context = None # Clear after use
+                
+                
+                # --- Log message details before sending --- 
+                final_message_len = len(message_to_send)
+                logger.info(f"Preparing to send message.")
+                logger.info(f"  - Original user input length: {len(user_input)}")
+                logger.info(f"  - Pending prompt length (before clear): {prompt_len}")
+                logger.info(f"  - Pending PDF context length (before clear): {pdf_context_len}")
+                logger.info(f"  - Final message_to_send length: {final_message_len}")
+                # Log snippets for verification
+                if final_message_len > 200:
+                    logger.info(f"  - Final message start: {message_to_send[:100]}...")
+                    logger.info(f"  - Final message end: ...{message_to_send[-100:]}")
+                
                 # --- Handle User Commands --- 
                 # --- /save command ---
                 if user_input.lower().startswith("/save"):
@@ -213,12 +377,13 @@ class CodeAgent:
                         if not filename.endswith('.json'):
                             filename += '.json'
                     else:
-                        now = datetime.datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
-                        filename = f'{now}.json'
-                    save_path = self.saved_conversations_dir / filename
+                            now = datetime.datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
+                            filename = f'{now}.json'
+
+                    save_path = Path(__file__).parent.parent / self.config.get('SAVED_CONVERSATIONS_DIRECTORY', 'SAVED_CONVERSATIONS/') / filename
                     # Prepare state dict
                     save_state = {
-                        'conversation_history': [c.to_dict() if hasattr(c, 'to_dict') else str(c) for c in self.conversation_history],
+                        'conversation_history': [],
                         'current_token_count': self.current_token_count,
                         'prompt_time_counts': self.prompt_time_counts,
                         'messages_per_interval': self.messages_per_interval,
@@ -226,6 +391,16 @@ class CodeAgent:
                         'active_files': [getattr(f, 'name', str(f)) for f in self.active_files],
                         'thinking_budget': self.thinking_budget,
                     }
+                    # Convert Content objects to serializable dictionaries
+                    serializable_history = []
+                    for content in self.conversation_history:
+                        # Ensure parts is a list of strings
+                        parts_text = [part.text for part in content.parts if hasattr(part, 'text') and part.text is not None]
+                        serializable_history.append({
+                            'role': content.role,
+                            'parts': parts_text
+                        })
+                    save_state['conversation_history'] = serializable_history
                     try:
                         with open(save_path, 'w') as f:
                             json.dump(save_state, f, indent=2)
@@ -243,7 +418,7 @@ class CodeAgent:
                     else:
                         print("\n⚠️ Usage: /load <filename>")
                         continue
-                    load_path = self.saved_conversations_dir / filename
+                    load_path = Path(__file__).parent.parent / self.config.get('SAVED_CONVERSATIONS_DIRECTORY', 'SAVED_CONVERSATIONS/') / filename
                     if not load_path.is_file():
                         print(f"\n❌ File not found: {filename}")
                         continue
@@ -251,7 +426,21 @@ class CodeAgent:
                         with open(load_path, 'r') as f:
                             load_state = json.load(f)
                         # Restore state
-                        self.conversation_history = load_state.get('conversation_history', [])
+                        reconstructed_history = []
+                        if 'conversation_history' in load_state and isinstance(load_state['conversation_history'], list):
+                            for item in load_state['conversation_history']:
+                                if isinstance(item, dict) and 'role' in item and 'parts' in item and isinstance(item['parts'], list):
+                                    # Recreate Parts from the list of text strings
+                                    parts = [glm.Part(text=part_text) for part_text in item['parts'] if isinstance(part_text, str)]
+                                    # Recreate Content object
+                                    content = glm.Content(role=item['role'], parts=parts)
+                                    reconstructed_history.append(content)
+                                else:
+                                    logger.warning(f"Skipping invalid item in loaded history: {item}")
+                        else:
+                             logger.warning(f"'conversation_history' key missing or not a list in {filename}")
+
+                        self.conversation_history = reconstructed_history
                         self.current_token_count = load_state.get('current_token_count', 0)
                         self.prompt_time_counts = load_state.get('prompt_time_counts', [0])
                         self.messages_per_interval = load_state.get('messages_per_interval', [0])
@@ -386,11 +575,32 @@ class CodeAgent:
                         print(f"🚨 An unexpected error occurred during /clear: {e}")
                     continue # Skip sending this command to the model
 
+                # --- /prompt command ---
+                elif user_input.lower().startswith("/prompt "):
+                    if len(user_input.split()) == 2:
+                        prompt_name = user_input.split()[1]
+                        prompt_content = self._load_prompt(prompt_name)
+                        if prompt_content:
+                             self.pending_prompt = prompt_content
+                             print(f"\n✅ Prompt '{prompt_name}' loaded. It will be included in your next message.")
+                             # Optionally print truncated prompt:
+                             # print(f"   Content: {prompt_content[:100]}...")
+                        else:
+                             available = self._list_available_prompts()
+                             print(f"\n❌ Prompt '{prompt_name}' not found.")
+                             if available:
+                                 print(f"   Available prompts: {', '.join(available)}")
+                             else:
+                                 print("   No prompts found in the prompts directory.")
+                    else:
+                        print("\nUsage: /prompt <prompt_name>")
+                    continue # Skip sending command to model
+
                 # --- Prepare message content (Text + Files) ---
-                message_content = [user_input] # Start with user text
+                message_content = [message_to_send] # Start with user text
                 if self.active_files:
                     message_content.extend(self.active_files) # Add file objects
-                    if self.verbose:
+                    if self.config.get('verbose', DEFAULT_CONFIG['verbose']):
                         print(f"\n📎 Attaching {len(self.active_files)} files to the prompt:")
                         for f in self.active_files:
                             print(f"   - {f.display_name} ({f.name})")
@@ -398,7 +608,7 @@ class CodeAgent:
                 # --- Update manual history (for token counting ONLY - Use Text Only) --- 
                 # Add user message BEFORE sending to model
                 # Store only the text part for history counting simplicity
-                new_user_content = types.Content(parts=[types.Part(text=user_input)], role="user")
+                new_user_content = glm.Content(parts=[glm.Part(text=message_to_send)], role="user")
                 self.conversation_history.append(new_user_content)
 
                 # --- Send Message --- 
@@ -413,34 +623,66 @@ class CodeAgent:
                     config=tool_config
                 )
 
-                # --- Update manual history and calculate new token count AFTER response --- 
-                agent_response_content = None
-                response_text = "" # Initialize empty response text
+                agent_response_text = ""
                 if response.candidates and response.candidates[0].content:
                     agent_response_content = response.candidates[0].content
-                    # Ensure we extract text even if other parts exist (e.g., tool calls)
-                    if agent_response_content.parts:
-                         # Simple concatenation of text parts for history
-                         response_text = " ".join(p.text for p in agent_response_content.parts if hasattr(p, 'text'))
-                    self.conversation_history.append(agent_response_content)
+                    # Extract text from all parts for printing
+                    agent_response_text = " ".join(p.text for p in agent_response_content.parts if hasattr(p, 'text'))
+
+                if agent_response_text: # Only append if there's text
+                    history_agent_content = glm.Content(role="model", parts=[glm.Part(text=agent_response_text)])
+                    self.conversation_history.append(history_agent_content)
+                    logger.debug(f"Appended model text response to history: Role={history_agent_content.role}")
                 else:
-                    print("\n⚠️ Agent response did not contain content for history/counting.")
+                    # Log if the response had candidates/content but no text could be extracted
+                    logger.warning("Agent response content found, but no text parts to add to history.")
 
                 # Print agent's response text to user
-                # Use the extracted response_text or response.text as fallback
-                print(f"\n🟢 \x1b[92mAgent:\x1b[0m {response_text or response.text}")
+                print(f"\n🟢 \x1b[92mAgent:\x1b[0m {agent_response_text or '[No response text]'}")
 
-                # Calculate and store token count for the *next* prompt
-                try:
-                    # Get token count via the models endpoint
+                # --- Detailed History Logging Before Token Count --- 
+                logger.debug(f"Inspecting conversation_history (length: {len(self.conversation_history)}) before count_tokens:")
+                history_seems_ok = True
+                for i, content in enumerate(self.conversation_history):
+                    logger.debug(f"  [{i}] Role: {getattr(content, 'role', 'N/A')}")
+                    if hasattr(content, 'parts'):
+                        for j, part in enumerate(content.parts):
+                            part_type = type(part)
+                            part_info = f"Part {j}: Type={part_type.__name__}"
+                            if hasattr(part, 'text'):
+                                part_info += f", Text='{part.text[:50]}...'"
+                            elif hasattr(part, 'file_data'):
+                                part_info += f", FileData URI='{getattr(part.file_data, 'file_uri', 'N/A')}'"
+                                history_seems_ok = False # Found a file part!
+                                logger.error(f"    🚨 ERROR: Found unexpected file_data part in history for token counting: {part_info}")
+                            elif hasattr(part, 'function_call'):
+                                part_info += f", FunctionCall Name='{getattr(part.function_call, 'name', 'N/A')}'"
+                                history_seems_ok = False # Found a function call part!
+                                logger.error(f"    🚨 ERROR: Found unexpected function_call part in history for token counting: {part_info}")
+                            else:
+                                # Log other unexpected part types
+                                history_seems_ok = False
+                                logger.error(f"    🚨 ERROR: Found unexpected part type in history for token counting: {part_info}")
+                            logger.debug(f"    {part_info}")
+                    else:
+                        logger.warning(f"  [{i}] Content object has no 'parts' attribute.")
+                if history_seems_ok:
+                    logger.debug("History inspection passed: Only text parts found.")
+                else:
+                    logger.error("History inspection FAILED: Non-text parts found. Token counting will likely fail.")
+                # --- End Detailed History Logging --- 
+
+                # Calculate and display token count using client.models
+                try: # Inner try specifically for token counting
                     token_count_response = self.client.models.count_tokens(
                         model=self.model_name,
-                        contents=self.chat.history
+                        contents=self.conversation_history
                     )
                     self.current_token_count = token_count_response.total_tokens
-                except Exception as count_error:
-                    # Don't block interaction if counting fails, just report it and keep old count
-                    print(f"\n⚠️ \x1b[93mCould not update token count: {count_error}\x1b[0m")
+                    print(f"\n[Token Count: {self.current_token_count}]" )
+                except Exception as count_err:
+                    logger.error(f"Error calculating token count: {count_err}", exc_info=True)
+                    print("🚨 Error: Failed to calculate token count.")
 
             except KeyboardInterrupt:
                 print("\n👋 Goodbye!")
@@ -468,20 +710,22 @@ class CodeAgent:
         if not self.pdfs_dir_abs_path:
             print("\n⚠️ PDF directory not configured. Cannot process PDFs.")
             return None
-        # Ensure db_path and blob_dir are Path objects if loaded from config
-        db_path = self.db_path if isinstance(self.db_path, Path) else Path(self.db_path)
-        blob_dir = self.blob_dir if isinstance(self.blob_dir, Path) else Path(self.blob_dir)
+        
+        # Ensure blob_dir is a Path object (already resolved in __init__)
+        blob_dir = self.blob_dir 
 
-        if not db_path:
-             print("\n⚠️ Database path not configured. Cannot save PDF metadata.")
+        # Use the connection established during initialization
+        if not self.conn:
+             print("\n⚠️ Database connection not available. Cannot save PDF metadata.")
              return None
         if not blob_dir:
              print("\n⚠️ Blob directory not configured. Cannot save extracted text.")
              return None
-        # Gemini client check might depend on whether processing happens here or elsewhere
-        # if not self.client:
-        #     print("Gemini client not initialized. Cannot process PDF.")
-        #     return
+        
+        # Gemini client check - ensure it's ready if needed
+        if self.pdf_processing_method == 'Gemini' and not self.client:
+            print("\n⚠️ Gemini client not initialized, but required for Gemini processing. Cannot process PDF.")
+            return None
 
         if len(args) < 1:
             print("\n⚠️ Usage: /pdf <filename> [optional: arxiv_id]")
@@ -508,145 +752,148 @@ class CodeAgent:
         print(f"\n⏳ Processing PDF: {filename}...")
 
         paper_id = None
-        conn = None
+        # Remove the local try/except for connection, use self.conn directly
         try:
-            conn = database.get_db_connection(db_path)
-            if not conn:
-                print("\n⚠️ Error: Failed to connect to the database.")
-                return None
-
-            paper_id = database.add_minimal_paper(conn, filename)
+            # --- Database Operations using self.conn --- 
+            paper_id = database.add_minimal_paper(self.conn, filename)
             if not paper_id:
                 print("\n⚠️ Error: Failed to create initial database record.")
+                # No connection to close here
                 return None 
 
             print(f"  📄 Created database record with ID: {paper_id}")
 
             if arxiv_id_arg:
                 if isinstance(arxiv_id_arg, str) and len(arxiv_id_arg) > 5: 
-                    database.update_paper_field(conn, paper_id, 'arxiv_id', arxiv_id_arg)
+                    database.update_paper_field(self.conn, paper_id, 'arxiv_id', arxiv_id_arg)
                     print(f"     Updated record with provided arXiv ID: {arxiv_id_arg}")
                 else:
                     print(f"  ⚠️ Warning: Provided arXiv ID '{arxiv_id_arg}' seems invalid. Skipping update.")
+            # --- End Database Operations ---
 
-            print(f"  ⚙️  Extracting text from '{filename}' (using placeholder)...")
+            print(f"  ⚙️  Extracting text from '{filename}' (using {self.pdf_processing_method})...")
             extracted_text = None
             try:
-                try:
-                    from pypdf import PdfReader
-                    reader = PdfReader(pdf_path)
-                    extracted_text = ""
-                    for page in reader.pages:
-                        extracted_text += page.extract_text() + "\n"
-                    if not extracted_text:
-                        print("  ⚠️ Warning: PyPDF fallback extracted no text.")
-                        extracted_text = f"Placeholder: No text extracted via PyPDF for {filename}" 
-                except Exception as pypdf_err:
-                    print(f"  ⚠️ PyPDF fallback failed: {pypdf_err}. Using basic placeholder.")
-                    extracted_text = f"Placeholder: Error during PyPDF extraction for {filename}"
-
-                if not extracted_text: 
-                    raise ValueError("Text extraction resulted in empty content.")
+                # TODO: Implement fallback to pypdf if configured or if gemini fails?
+                if self.pdf_processing_method == 'Gemini':
+                     extracted_text = tools.extract_text_from_pdf_gemini(pdf_path, self.client, self.model_name)
+                # Add other methods like pypdf here if needed
+                # elif self.pdf_processing_method == 'pypdf':
+                #    extracted_text = tools.extract_text_from_pdf_pypdf(pdf_path) # Assuming this exists
+                else:
+                    raise ValueError(f"Unsupported pdf_processing_method: {self.pdf_processing_method}")
+                
+                if not extracted_text: # Check if extraction failed
+                    raise ValueError("Text extraction resulted in empty or failed content.")
 
             except Exception as extract_err:
-                print(f"\n⚠️ Error during text extraction: {extract_err}")
-                database.update_paper_field(conn, paper_id, 'status', 'error_process')
-                conn.close()
+                print(f"\n⚠️ Error during text extraction ({self.pdf_processing_method}): {extract_err}")
+                database.update_paper_field(self.conn, paper_id, 'status', 'error_process')
+                # No conn.close() needed here
                 return None 
 
-            print(f"  💬 Successfully extracted text ({len(extracted_text)} chars) [Placeholder/Fallback].")
+            print(f"  💬 Successfully extracted text ({len(extracted_text)} chars) [{self.pdf_processing_method}].")
 
             blob_filename = f"paper_{paper_id}_text.txt"
             blob_full_path = blob_dir / blob_filename
-            blob_rel_path = blob_filename 
+            blob_rel_path = blob_filename # Store relative path in DB
 
             print(f"  💾 Saving extracted text to {blob_full_path}...")
             save_success = tools.save_text_blob(blob_full_path, extracted_text)
 
             if not save_success:
                 print("\n⚠️ Error: Failed to save text blob.")
-                database.update_paper_field(conn, paper_id, 'status', 'error_blob')
-                conn.close()
+                database.update_paper_field(self.conn, paper_id, 'status', 'error_blob')
+                # No conn.close() needed here
                 return None
             else:
                 print(f"     Successfully saved text blob.")
-                update_success = database.update_paper_field(conn, paper_id, 'blob_path', blob_rel_path)
+                update_success = database.update_paper_field(self.conn, paper_id, 'blob_path', blob_rel_path)
                 if not update_success:
                     print(f"  ⚠️ Warning: Failed to update blob_path in database for ID {paper_id}.")
                     # Log and continue, as text is saved locally
 
-            update_success = database.update_paper_field(conn, paper_id, 'status', 'complete')
-            if update_success:
-                print(f"\n✅ Processing complete for '{filename}' (ID: {paper_id}).")
+            update_success = database.update_paper_field(self.conn, paper_id, 'status', 'processed') # Mark as processed before adding to history
+            if not update_success:
+                 logger.warning(f"Failed to update status to processed for paper ID {paper_id}")
+                 # Continue anyway, try to add to history
+
+            # Store context to be prepended next turn
+            context_header = f"CONTEXT FROM PDF ('{filename}', ID: {paper_id}):\n---"
+            if MAX_PDF_CONTEXT_LENGTH:
+                max_text_len = MAX_PDF_CONTEXT_LENGTH - len(context_header) - 50 # Reserve space for header and separators
+                truncated_text = extracted_text[:max_text_len]
+                if len(extracted_text) > max_text_len:
+                    truncated_text += "\n... [TRUNCATED]" 
             else:
-                print(f"\n⚠️ Warning: Failed to update final status to 'complete' for ID {paper_id}.")
+                truncated_text = extracted_text
+            
+            self.pending_pdf_context = f"{context_header}\n{truncated_text}\n---"
+            logger.info(f"Stored context from {filename} (ID: {paper_id}) to be prepended next turn ({len(self.pending_pdf_context)} chars).")
+            print(f"\n✅ PDF processed. Content will be added to context on your next message. (ID: {paper_id}) ")
+            database.update_paper_field(self.conn, paper_id, 'status', 'processed_pending_context')
 
-            conn.close() 
-            return paper_id 
-
-        except Exception as e:
-            logger.error(f"An error occurred during PDF processing for '{filename}' (ID: {paper_id}): {e}", exc_info=True)
-            print(f"\n❌ An unexpected error occurred during processing: {e}")
-            if conn and paper_id:
+            return paper_id
+        except Exception as e: # Reinstate the main exception handler for the function's try block
+            logger.error(f"An error occurred during PDF processing for '{filename}': {e}", exc_info=True)
+            if paper_id and self.conn:
                 try:
-                    database.update_paper_field(conn, paper_id, 'status', 'error_generic')
+                    # Attempt to mark as error if possible
+                    database.update_paper_field(self.conn, paper_id, 'status', 'error_process')
                 except Exception as db_err:
-                    logger.error(f"Failed to update error status for {paper_id}: {db_err}", exc_info=True)
-            if conn:
-                conn.close()
-            return None 
+                    logger.error(f"Additionally failed to update status to error for paper {paper_id}: {db_err}")
+            # No conn.close() needed here
+            print(f"\n❌ An unexpected error occurred: {e}")
+            return None # Return None on major processing error
 
-        finally:
-            if conn:
-                conn.close()
-
-    def _handle_list_command(self, args: list):
-        """Handles the /list command to show papers in the database."""
-        # ... (rest of the code remains the same)
-
-# --- Main Execution ---
 def main():
-    parser = argparse.ArgumentParser(description="Run the Code Agent")
-    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose tool logging')
-    args = parser.parse_args()
-    config = load_config()
-    print("🚀 Starting Code Agent...")
-    api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key:
-        print("\n⚠️ No API key found in env, trying config.yaml.")
-        api_key = config.get('api_key', DEFAULT_CONFIG['api_key'])
-    if not api_key:
-        print("\n❌ No API key found. Please set the GEMINI_API_KEY environment variable.")
+    config_path = Path('src/config.yaml')
+    config = load_config(config_path)
+    if not config:
         sys.exit(1)
 
-    # Make project_root available to the tools module if needed indirectly
-    # (Though direct definition in tools.py is preferred)
-    # import src.tools
-    # src.tools.project_root = project_root
+    print_welcome_message(config)
 
-    # Configure logging level based on verbose flag
-    level = logging.DEBUG if args.verbose else logging.WARNING
-    logging.basicConfig(format="%(levelname)s:%(name)s:%(message)s", level=level)
-    # Suppress verbose logs from external libraries
-    logging.getLogger('google_genai').setLevel(level)
-    logging.getLogger('browser_use').setLevel(level)
-    logging.getLogger('agent').setLevel(level)
-    logging.getLogger('controller').setLevel(level)
+    # --- Database Setup --- 
+    db_path_str = config.get('PAPER_DB_PATH')
+    conn = None
+    if db_path_str:
+        db_path = Path(db_path_str).resolve()
+        logger.info(f"Attempting to connect to database: {db_path}")
+        conn = database.get_db_connection(db_path)
+        if conn:
+            try:
+                 # Ensure tables exist
+                 database.create_tables(conn)
+                 logger.info("Database tables checked/created successfully.")
+            except Exception as db_init_err:
+                 logger.error(f"Failed to initialize database tables: {db_init_err}", exc_info=True)
+                 database.close_db_connection(conn)
+                 conn = None # Prevent agent from using bad connection
+                 print("\n⚠️ CRITICAL: Failed to initialize database. Exiting.")
+                 sys.exit(1)
+        else:
+            print("\n⚠️ Warning: Failed to establish database connection. Proceeding without database features.")
+    else:
+        print("\n⚠️ Warning: 'PAPER_DB_PATH' not specified in config.yaml. Proceeding without database features.")
+    # --- End Database Setup ---
 
-    # Resolve PDF directory relative to project root
-    project_root = Path(__file__).parent.parent # Assuming script is in src/
-    pdf_dir_path = project_root / config.get('PDFS_TO_CHAT_WITH_DIRECTORY', DEFAULT_CONFIG['PDFS_TO_CHAT_WITH_DIRECTORY'])
-
-    agent = CodeAgent(
-        model_name=config.get('model_name', DEFAULT_CONFIG['model_name']),
-        verbose=args.verbose or config.get('verbose', DEFAULT_CONFIG['verbose']),
-        api_key=api_key,
-        default_thinking_budget=config.get('default_thinking_budget', DEFAULT_CONFIG['default_thinking_budget']),
-        pdf_dir=str(pdf_dir_path), # Pass absolute path to agent
-        db_path=config.get('PAPER_DB_PATH', DEFAULT_CONFIG['PAPER_DB_PATH']),
-        blob_dir=config.get('PAPER_BLOBS_DIR', DEFAULT_CONFIG['PAPER_BLOBS_DIR'])
-    )
-    agent.start_interaction()
+    try:
+        # Pass the established connection (or None) to the agent
+        agent = CodeAgent(config=config, conn=conn)
+        agent.start_interaction()
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
+        print(f"\n❌ An unexpected error occurred: {e}")
+    finally:
+        # Ensure database connection is closed on exit
+        if conn:
+             logger.info("Closing database connection...")
+             database.close_db_connection(conn)
+             logger.info("Database connection closed.")
+        print("\nGoodbye!")
 
 if __name__ == "__main__":
     main()

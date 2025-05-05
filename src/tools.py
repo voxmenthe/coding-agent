@@ -10,22 +10,55 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from src.find_arxiv_papers import build_query, fetch_entries # build_query now in find_arxiv_papers.py
-from google import genai # Current import pattern
-from google.genai import types # Current import pattern
-import time # Added import
+from google import genai
+from google.api_core import exceptions as google_exceptions
+from pypdf import PdfReader
+import yaml
+
+import time
 import asyncio
 from pydantic import SecretStr
-from langchain_google_genai import ChatGoogleGenerativeAI
-from src.browser_use import setup_browser, agent_loop
+from dotenv import load_dotenv
+from src.agent_browser_utils import setup_browser, agent_loop
 import logging
+
 logger = logging.getLogger(__name__)
 
+# Load config
+config_path = Path(__file__).parent / "config.yaml"
+with open(config_path) as f:
+    config = yaml.safe_load(f)
+
+# --- Constants ---
+MAX_GEMINI_PDF_SIZE_BYTES = 200 * 1024 * 1024 # 200 MB, adjust as needed
+GEMINI_SUPPORTED_MIME_TYPES = [
+    "application/pdf",
+]
+GEMINI_PROCESSING_TIMEOUT_SECONDS = 300 # 5 minutes
+GEMINI_POLLING_INTERVAL_SECONDS = 5
+
 # --- Helper Functions ---
+
+def check_pdf_size(pdf_path: Path) -> bool:
+    """Checks if the PDF file size is within Gemini's limits."""
+    if not pdf_path.exists():
+        logger.error(f"PDF file not found: {pdf_path}")
+        return False
+    size = pdf_path.stat().st_size
+    if size > MAX_GEMINI_PDF_SIZE_BYTES:
+        logger.warning(
+            f"PDF file {pdf_path.name} exceeds maximum size "
+            f"({size / (1024*1024):.2f}MB > "
+            f"{MAX_GEMINI_PDF_SIZE_BYTES / (1024*1024):.2f}MB)."
+        )
+        return False
+    return True
+
 def _check_docker_running() -> tuple[bool, docker.DockerClient | None, str]:
     """Checks if the Docker daemon is running and returns client or error."""
     try:
         client = docker.from_env()
-        client.ping() # Verify connection
+        client.ping() 
         return True, client, "Docker daemon is running."
     except DockerException as e:
         error_msg = (
@@ -34,18 +67,91 @@ def _check_docker_running() -> tuple[bool, docker.DockerClient | None, str]:
         )
         return False, None, error_msg
     except Exception as e:
-        # Catch other potential issues like docker library not installed
         return False, None, f"Error checking Docker status: {e}"
+
+# --- Gemini PDF Processing --- 
+
+def extract_text_from_pdf_gemini(
+    pdf_path: Path,
+    genai_client: genai.client.Client,
+    model_name: str,
+) -> str | None:
+    """
+    Uploads a PDF to Gemini, extracts text using the specified model,
+    and cleans up the uploaded file.
+
+    Args:
+        pdf_path: Path to the local PDF file.
+        genai_client: An initialized google.genai.client.Client instance.
+        model_name: The name of the Gemini model to use (e.g., 'gemini-1.5-flash-latest').
+
+    Returns:
+        The extracted text content as a string, or None if extraction fails.
+    """
+    # Re-adding size check logic (assuming it was correct before)
+    if not check_pdf_size(pdf_path):
+         return None
+
+    logger.info(f"Uploading PDF {pdf_path.name} to Gemini...")
+    uploaded_file: genai.types.File | None = None 
+    try:
+        # 1. Upload the file synchronously
+        uploaded_file = genai_client.files.upload(
+            file=pdf_path,
+        )
+        logger.info(
+            f"Successfully uploaded {pdf_path.name} as Gemini file: "
+            f"{uploaded_file.name} ({uploaded_file.uri})"
+        )
+
+        # 2. Generate content using the uploaded file
+        logger.info(f"Requesting text extraction using model {model_name}...")
+        prompt = "Extract all text content from this PDF document."
+        response = genai_client.models.generate_content(
+            model=model_name,
+            contents=[prompt, uploaded_file]
+        )
+
+        # 3. Process the response
+        # Using the same response processing logic as before
+        if response.candidates and response.candidates[0].content.parts:
+            extracted_text = "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text'))
+            if extracted_text:
+                logger.info(f"Successfully extracted text from {pdf_path.name}.")
+                return extracted_text.strip()
+            else:
+                logger.warning(f"Gemini returned no text for {pdf_path.name}.")
+                return None
+        else:
+            logger.warning(f"Gemini response format unexpected or empty for {pdf_path.name}. Response: {response}")
+            return None
+
+    except google_exceptions.GoogleAPIError as e: 
+        logger.error(f"Gemini API error during processing {pdf_path.name}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error during Gemini processing for {pdf_path.name}: {e}", exc_info=True)
+        return None
+    finally:
+        # 4. Clean up the uploaded file
+        if uploaded_file:
+            try:
+                logger.info(f"Deleting Gemini file {uploaded_file.name}...")
+                genai_client.files.delete(name=uploaded_file.name)
+                logger.info(f"Successfully deleted Gemini file {uploaded_file.name}.")
+            except google_exceptions.GoogleAPIError as e: 
+                logger.error(f"Failed to delete Gemini file {uploaded_file.name}: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error deleting Gemini file {uploaded_file.name}: {e}", exc_info=True)
+
 
 # --- Tool Functions ---
 def read_file(path: str) -> str:
     """Reads the content of a file at the given path relative to the current working directory."""
     print(f"\n\u2692\ufe0f Tool: Reading file: {path}")
     try:
-        # Security check: Ensure path is within the current working directory
         cwd = Path(os.getcwd())
         target_path = (cwd / path).resolve()
-        # Ensure the resolved path is still within the intended CWD scope
         if not target_path.is_relative_to(cwd):
             return "Error: Access denied. Path is outside the current working directory."
         if not target_path.is_file():
@@ -60,7 +166,6 @@ def list_files(directory: str) -> str:
     try:
         cwd = Path(os.getcwd())
         target_dir = (cwd / directory).resolve()
-        # Security check: Ensure path is within the current working directory
         if not target_dir.is_relative_to(cwd):
             return "Error: Access denied. Path is outside the current working directory."
         if not target_dir.is_dir():
@@ -75,13 +180,11 @@ def edit_file(path: str, content: str) -> str:
     """Writes or overwrites content to a file at the given path relative to the current working directory."""
     print(f"\n\u2692\ufe0f Tool: Editing file: {path}")
     try:
-        # Security check: Ensure path is within the current working directory
         cwd = Path(os.getcwd())
         target_path = (cwd / path).resolve()
         if not target_path.is_relative_to(cwd):
             return "Error: Access denied. Path is outside the current working directory."
 
-        # Create parent directories if they don't exist
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(content)
         return f"File '{path}' saved successfully."
@@ -109,7 +212,6 @@ def execute_bash_command(command: str) -> str:
 
     whitelist = ["ls", "cat", "git add", "git status", "git commit", "git push"]
 
-    # Check if the command starts with any whitelisted prefix
     is_whitelisted = False
     for prefix in whitelist:
         if command.strip().startswith(prefix):
@@ -120,21 +222,16 @@ def execute_bash_command(command: str) -> str:
         return f"Error: Command '{command}' is not allowed. Only specific commands (ls, cat, git add/status/commit/push) are permitted."
 
     try:
-        # Execute the command in the current working directory
-        # Use shell=True cautiously, but it's simpler for handling complex commands/args here.
-        # The whitelist check provides the primary security boundary.
         result = subprocess.run(
             command, 
             shell=True, 
             capture_output=True, 
             text=True, 
-            cwd=os.getcwd(), # Ensure command runs in the current working directory
-            check=False # Don't raise exception on non-zero exit code, handle manually
+            cwd=os.getcwd(), 
+            check=False 
         )
-        # --- Print stdout directly to console for visibility ---
         if result.stdout:
             print(f"\n\u25b6\ufe0f Command Output (stdout):\n{result.stdout.strip()}")
-        # --- Format output for LLM --- 
         output = f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
         if result.returncode != 0:
             output += f"\n--- Command exited with code: {result.returncode} ---"
@@ -156,7 +253,6 @@ def save_text_blob(file_path: Path, content: str) -> bool:
         True if saving was successful, False otherwise.
     """
     try:
-        # Ensure the parent directory exists
         file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(content)
@@ -183,7 +279,6 @@ def run_in_sandbox(command: str) -> str:
     Returns:
         The combined stdout/stderr from the container, or an error message.
     """
-    # Hardcode the image name
     image = "python:3.12-slim"
     print(f"\n\u2692\ufe0f Tool: Running in sandbox (Image: {image}): {command}")
 
@@ -194,14 +289,14 @@ def run_in_sandbox(command: str) -> str:
     try:
         print(f"\n\u23f3 Starting Docker container (image: {image})...")
         container_output = client.containers.run(
-            image=image, # Use the hardcoded image variable
-            command=f"sh -c '{command}'", # Execute command within a shell in the container
+            image=image, 
+            command=f"sh -c '{command}'", 
             working_dir="/app",
             volumes={os.getcwd(): {'bind': '/app', 'mode': 'rw'}},
-            remove=True,        # Remove container after execution
-            network_mode='none',# Disable networking
-            mem_limit='512m',   # Limit memory
-            detach=False,       # Run synchronously
+            remove=True,       # Remove container after execution
+            network_mode='none', # Disable network access
+            mem_limit='512m',   # Limit memory to 512MB
+            detach=False,       # Run in foreground
             stdout=True,        # Capture stdout
             stderr=True         # Capture stderr
         )
@@ -212,7 +307,6 @@ def run_in_sandbox(command: str) -> str:
     except DockerException as e:
         error_msg = f"Docker error during sandbox execution: {e}"
         print(f"\n\u274c {error_msg}")
-        # Provide more specific feedback if image not found
         if "not found" in str(e).lower() or "no such image" in str(e).lower():
              error_msg += f"\nPlease ensure the image '{image}' exists locally or can be pulled."
         return f"Error: {error_msg}"
@@ -245,23 +339,18 @@ def find_arxiv_papers(keywords: str, start_date: str, end_date: str, max_results
 
     Returns:
         JSON string of papers with title, link, summary, and published date."""
-    # Parse date range
     try:
         start_dt = datetime.fromisoformat(start_date)
         end_dt = datetime.fromisoformat(end_date)
     except Exception:
         raise ValueError("start_date and end_date must be in YYYY-MM-DD format")
-    # Define categories and keywords
     categories = ['cs.*', 'stat.*']
-    # Split by ' OR ', convert to lowercase, and strip whitespace
     raw_keywords = [kw.strip().lower() for kw in keywords.split(' OR ') if kw.strip()]
     processed_keywords = [kw for kw in raw_keywords if kw not in ('and', 'or')]
-    # Build query and fetch entries
     query = build_query(categories, processed_keywords)
     print(f"\n🔍 Arxiv search query: {query} | dates: {start_date} to {end_date} | max_results: {max_results}")
     entries = fetch_entries(query, max_results=max_results, verbose=False)
     print(f"\n🔍 Raw entries fetched: {len(entries)}")
-    # Filter by publication date and format
     results = []
     for entry in entries:
         pub_str = entry.published[:10]
@@ -279,7 +368,7 @@ def find_arxiv_papers(keywords: str, start_date: str, end_date: str, max_results
     print(f"\n🔍 Filtered entries count: {len(results)}")
     return json.dumps(results, indent=2)
 
-def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
+def upload_pdf_for_gemini(pdf_path_str: str) -> genai.types.File | None:
     """
     Uploads a PDF file relative to the project root to Google Gemini
     using the File API and waits for it to be processed.
@@ -288,22 +377,19 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
         pdf_path_str: The path to the PDF file, relative to the project root.
 
     Returns:
-        A google.generativeai.types.File object if successful, None otherwise.
+        A google.genai.types.File object if successful, None otherwise.
         Prints errors to console.
     """
-    # Ensure project_root is accessible. Define it globally or pass it.
-    # For now, assuming it's defined globally in this module like in main.py
     global project_root
     if 'project_root' not in globals():
-         # Attempt to define it if not present (adjust path as needed)
          project_root = Path(__file__).resolve().parents[1]
          print("⚠️ 'project_root' was not defined globally in tools.py, attempting definition.")
-         # If this fails, you might need a more robust way to share project_root
+         if not project_root:
+             print("Error: Could not define project_root. Please ensure it's set correctly.")
 
     try:
         target_path = (project_root / pdf_path_str).resolve()
 
-        # Security check: Ensure path is within the project directory
         if not target_path.is_relative_to(project_root):
             print(f"\n\u274c Error: Access denied. Path '{pdf_path_str}' is outside the project directory.")
             return None
@@ -315,25 +401,21 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
             return None
 
         print(f"\n\u2692\ufe0f Uploading '{target_path.name}'...")
-        # Initialize Gemini client with API key
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             print(f"\n\u001b[31mError: GEMINI_API_KEY environment variable not set.\nPlease export your API key before uploading PDFs.\u001b[0m")
             return None
         client = genai.Client(api_key=api_key)
 
-        # Use display_name for user-friendliness
         pdf_file = client.files.upload(file=target_path)
         print(f"\u2705 Uploaded '{pdf_file.display_name}' as: {pdf_file.name}")
         print("⏳ Waiting for processing...")
 
-        # Wait for the file to be processed. Add a timeout?
         start_time = time.time()
-        timeout_seconds = 120 # 2 minutes timeout for processing
+        timeout_seconds = 120 
         while pdf_file.state.name == "PROCESSING":
             if time.time() - start_time > timeout_seconds:
                  print(f"\n\u274c Error: File processing timed out after {timeout_seconds} seconds for {pdf_file.name}.")
-                 # Attempt to delete the potentially stuck file
                  try:
                      client.files.delete(name=pdf_file.name)
                      print(f"🧹 Cleaned up timed-out file: {pdf_file.name}")
@@ -341,16 +423,14 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
                      print(f"⚠️ Could not delete timed-out file {pdf_file.name}: {delete_e}")
                  return None
 
-            time.sleep(5) # Wait 5 seconds before checking again
-            pdf_file = client.files.get(name=pdf_file.name) # Refresh file state
-            print(f"   Current state: {pdf_file.state.name}")
+            time.sleep(5) 
+            pdf_file = client.files.get(name=pdf_file.name) 
 
         if pdf_file.state.name == "ACTIVE":
             print(f"\u2705 File '{pdf_file.display_name}' is ready.")
             return pdf_file
         else:
             print(f"\n\u274c Error: File processing failed for '{pdf_file.display_name}'. Final State: {pdf_file.state.name}")
-            # Consider deleting the failed file
             try:
                  client.files.delete(name=pdf_file.name)
                  print(f"🧹 Cleaned up failed file: {pdf_file.name}")
@@ -360,7 +440,6 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> types.File | None:
 
     except Exception as e:
         print(f"\n\u274c An error occurred during PDF upload/processing: {e}")
-        # Attempt to clean up if a file object was created but failed later
         if 'pdf_file' in locals() and hasattr(pdf_file, 'name'):
              try:
                  print(f"🧹 Attempting to delete potentially failed upload: {pdf_file.name}")
@@ -404,6 +483,3 @@ def open_url(url: str) -> str:
         return result or "No content."
     except Exception as e:
         return f"Error during open_url: {e}"
-
-# Note: This function should NOT be added to the list of tools passed to Gemini
-# as it's meant to be called directly by the agent application logic.

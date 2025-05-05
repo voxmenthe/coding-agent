@@ -1,0 +1,3506 @@
+Physics of Language Models: Part 4.1,
+Architecture Design and the Magic of Canon Layers
+
+Zeyuan Allen-Zhu
+zeyuanallenzhu@meta.com
+FAIR at Meta
+
+Alberto Alfarano
+albealfa@meta.com
+FAIR at Meta
+
+May 2, 2025
+(version 1)*
+
+Abstract
+
+Understanding architectural differences between large language models (LLMs) remains chal-
+lenging, particularly at academic-scale pretraining (e.g., 1.3B parameters on 100B tokens), where
+results are often dominated by noise and randomness. To overcome this, we introduce controlled,
+synthetic pretraining tasks to isolate and evaluate key model capabilities. Leveraging this frame-
+work, we discover Canon layers: lightweight architectural components named after the musical
+term "canon" that promote horizontal information flow across neighboring tokens. Canon lay-
+ers compute weighted combinations of nearby token representations and integrate seamlessly
+into Transformers, linear attention, state-space architectures, or any general sequence model.
+We present 12 key results. This includes how Canon layers enhance reasoning depth (e.g.,
+by 2x), reasoning breadth, knowledge manipulation, etc. Remarkably, Canon layers transform
+weak architectures like NoPE to match ROPE, linear attention to match state-space models
+(like Mamba2), as validated both in our synthetic playground and real-world academic-scale
+pretraining. Leveraging infinitely high-quality data, we hope our framework can predict how
+future architectures may evolve as training pipelines improve-e.g., through better data curation
+or RL-based post-training—unlocking deeper reasoning and hierarchical inference capabilities.
+
+*ZA sincerely thanks Vahab Mirrokni for the invitation to the Yale workshop in October 2023, where this research
+was sparked through enlightening discussions with Vahab Mirrokni and Peilin Zhong. At Meta, we extend our
+heartfelt gratitude to Lin Xiao and Kristin Lauter for their insightful discussions and unwavering supports, which
+made this research possible. Special thanks go to Wangzhi Dai, Dinesh Kannappan, Niki Kim, Junjie Qian, Ammar
+Rizvi, Travis Seevers, and Stephen Hartken at Meta, as well as Abraham Leal from W&B; without their invaluable
+technical assistance, the experiments presented in this paper would not have been feasible. We are deeply grateful
+to Songlin Yang and Ali Behrouz for providing detailed instructions on replicating their academic-scale pretraining
+experiments, and Fangcheng Sun for many helpful conversations on architecture design in general.
+
+1 Introduction
+R
+ecent advances in large language models (LLMs) have sparked transformative progress
+across numerous tasks, including question answering, summarization, translation, code
+generation [13, 15, 38, 59]. Despite rapid progress, systematic understanding of effective
+neural architecture design has remained elusive, fundamentally hindered by some major challenges.
+Challenge 1: Pretraining loss as an unreliable proxy for intelligence. Architectural
+comparisons sometimes rely on metrics like perplexity or cross-entropy loss. These metrics, however,
+do not necessarily correlate reliably with real-world capabilities, especially considering that real-
+world data is skills-mixed. For example, state-space architectures such as Mamba [18, 25] frequently
+exhibit lower perplexity early in training due to rapid memorization but often perform poorly on
+complex reasoning tasks. Furthermore, reliance on early stopping via perplexity risks premature
+halting, as models typically master superficial linguistic features from this skills-mixed data before
+developing deep reasoning skills or robust factual knowledge [30].
+
+Challenge 2: Noise below emergence thresholds. Emergent abilities complex skills that
+only manifest in sufficiently large models (e.g., 7B parameters trained on 10T tokens [1])—complicate
+architectural comparisons at smaller scales. Academic studies often focus on 1.3B-parameter mod-
+els trained on 100B tokens [9, 24, 67], where small benchmark improvements (e.g., 2%) frequently
+stem from random initialization or data ordering variance that can produce accuracy fluctuations
+exceeding 2-4%, as shown in Figure 1. At this limited scale, models fail at even simplest 2-hop
+reasoning tasks, performing no better than random guessing.¹ This problem is compounded by the
+prohibitive cost of extensive ablations or hyperparameter sweeps, even in industry settings where
+compute resources are less restricted. As a result, architecture decisions often rely on heuristics,
+informal consensus, or limited empirical validation rather than rigorous scientific analysis.
+
+Challenge 3: Grokking, Data Quality, and Curriculum Learning. Failures in complex
+reasoning tasks typically stem from deficiencies in training data, not architectural limitations.
+Too few challenging samples and a lack of intermediate-complexity data often force models to
+rely on unstable grokking behavior-where abrupt generalization only emerges after unnecessarily
+long pretraining [42]—and disrupt curriculum learning [10]. For instance, models lacking 2-hop
+reasoning data may unpredictably learn 3-hop tasks after extensive exposure to 1-hop and 3-hop
+examples. This makes training highly sensitive to randomness, further complicating architectural
+comparisons. Reinforcement learning (RL)-based post-training methods, such as GRPO [52] and
+PPO [51], aim to address this by delivering tailored data at optimal difficulty levels. While effective,
+these approaches introduce new experimental confounds—it becomes unclear whether performance
+gains are due to pretraining, RL fine-tuning, stochastic training dynamics, or architectural strength.
+
+Our approach: Atomic decomposition of intelligence. To address the challenges, we pro-
+pose decomposing intelligence into atomic components—such as reasoning depth and reasoning
+breadth and constructing synthetic, highly controllable pretrain tasks to isolate and evaluate
+these capabilities independently. This systematic framework allows us to sharply characterize ar-
+chitectural strengths and scalability under clean and idealized conditions (see Figure 1).
+
+This approach addresses Challenge 1 by enabling single-skill evaluations to eliminate confound-
+ing factors in real-world pretraining data. For example, it allows rigorous comparisons of whether
+architecture A outperforms architecture B in reasoning depth, while ensuring modifications do not
+¹In our simplest 2-hop reasoning tasks, birth years for 3 individuals are presented, followed by 3 "[name2] was
+born in the same year as [namel]" equivalences linking. The model is prompted to answer the latter group's birth
+years. Models pretrained at academic scales can only random guess. See Result 12.
+
+Real-life Pretraining Obscures Architecture Differences
+At academic scale (1.3B parms, 100B tokens):
+SlimPajama
+Llama-seed 27 -53.3% 71.4% 56.2% 58.5% 59.1% 29.9% 40.9% 61.2%
+Llama - seed 26 52.3% 71.2% 56.1% 58.7% 59.3% 29.0% 40.9% 60.8%
+Llama-seed 25-50.7% 72.1% 56.0% 57.9% 59.5% 29.6% 40.8% 61.1%
+Llama - seed 24 -53.1% 71.9% 56.5% 59.2% 60.8% 29.2% 41.3% 61.8%
+Llama seed 23 52.8% 72.1% 56.0% 58.8% 58.5% 29.0% 41.0% 60.7%
+Llama - seed 22 52.3% 71.6% 56.7% 58.2% 59.4% 31.0% 42.1% 62.9%
+Llama-seed 21 55.0% 72.0% 56.0% 57.7% 58.9% 29.1% 41.1% 62.3%
+Llama - seed 20-50.8% 72.3% 55.8% 57.2% 59.1% 29.6% 41.1% 63.5%
+LMB PIQA Hella wino ARC-e ARC-C SIQA Boola
+across models: 1-2%
+78.
+60.5% 34.3% 55.3% 61.0% 36.6%
+82.7% 56.5% 33.0% 55.1% 62.5% 34.9%
+76.8% 52.6% 34.1% 57.4% 63.6% 37.3%
+79.7% 54.7% 33.7% 58.2% 61.8% 37.4%
+73.4% 54.7% 31.5% 55.3% 61.3% 38.2%
+77.8% 52.3% 33.9% 56.3% 61.9% 34.5%
+82.1% 56.9% 34.0% 56.1% 62.8% 37.6%
+81.5% 56.8% 31.2% 57.2% 61.8% 36.3%
+Trivi
+FineWeb-edu
+FDA SWDE
+NO qua viaQA Drop
+architectural differences lost in noise
+across random seeds: ≥2-4%
+insufficient to see architectural strengths
+models fail simplest 2-hop reasoning:
+X born in 1970. Y same birth year as X. When was Y born?
+real-world data: too skill-mixed, delays "emergent" skills
+Beyond this scale: controlled study ≈ computationally infeasible
+Synthetic Pretraining Enables Reliable Comparison
+Our solution: synthetic pretraining playground
+reasoning depth (Depo)
+reasoning breadth (Brevo)
+knowledge capacity (Capo)
+knowledge manipulation (Mano)
+hierarchical structures (Lano)
+each task isolates an atomic cognitive skill (5 in this work)
+Clear & controlled outcomes
+data difficulty
+Mini scaling-laws reveal model limits
+Sharply reveal model differences (e.g., 2x reasoning depth)
+Llama (ROPE)
+N=75-2/1% 2/1% 1/1% 30/99%
+N=100-1/1% 1/90% 1/3% 21/96%
+N=125-1/2% 1/92% 1/3% 1/50%
+8L512D 8L768D 12L512D 12L768D
+model size
+this paper
+N-75-91/99% 97/100% 98/100% 99/100%
+N-100-98/100% 98/100% 99/100% 98/100%
+N-125- 71/98% 90/100% 94/99% 96/100%
+8L512D 8L768D 12L512D 12L768D
+Early emergence of advanced skills
+Low cost supports rigorous studies
+High-quality data predicts future architectures
+GPT2-
+small size
+Figure 1: Architecture search in noisy real-life pretraining (good luck!) vs. our synthetic playground (scientific rigor).
+
+degrade other capabilities. By isolating intrinsic architectural biases, synthetic pretrain tasks reveal
+properties often obscured by noise in conventional setups.
+Challenge 2 is mitigated by lowering resource requirements while maintaining rigorous com-
+parisons. Synthetic benchmarks enable infinite high-quality data generation, providing meaningful
+evaluations even for smaller-scale models (e.g., GPT2-small). In these controlled environments,
+capabilities such as deep multi-hop reasoning emerge clearly, allowing us to rapidly identify archi-
+tectural limitations, investigate mini scaling-laws, and uncover trends that real-world pretrained
+1.3B-parameter models often fail to reveal despite extensive training.
+
+For Challenge 3, we manage data difficulty distributions to ensure adequate representation of
+intermediate-complexity samples, smoothing learning curves, enabling the early emergence of ad-
+vanced skills, and avoiding grokking-driven instability. As training pipelines continue to improve
+through better data curation or reinforcement learning (RL)-based continued pre-training-synthetic
+pretrain benchmarks can provide predictive insight into which architectures will best support scaling
+to more advanced tasks in the future.
+
+We draw inspiration from the physical sciences, where idealized settings such as friction-
+less planes or vacuum chambers—reveal first principles by stripping away confounding factors.
+Similarly, synthetic tasks eliminate the noise, randomness, and data contamination of real-world
+datasets, enabling clean architectural comparisons under ideal pretraining regimes.
+
+This paper's key contributions are summarized below:
+
+Result 0: Building the Synthetic Playground (Section 2+3). We introduce five synthetic
+pretraining tasks to systematically evaluate key cognitive capabilities in language models:
+• DEPO: reasoning depth via multi-hop information retrieval.
+• BREVO: reasoning breadth across multi-branch dependency graphs.
+• CAPO: knowledge capacity quantified as stored bits per parameter.
+• MANO: multi-step reasoning for knowledge manipulation.
+• LANO: hierarchical structure learning to resolve ambiguity.
+This playground reveals clear architectural trends at smaller scales: linear attention models (e.g.,
+GLA [66]) consistently underperform across tasks, recurrent models like Mamba2 [18] excel at
+memory-based tasks, and full Transformers dominate reasoning. These controlled benchmarks pro-
+vide a rigorous framework for analyzing intrinsic biases and scalability across diverse architectures.
+
+2
+
+Result 1: Canon Layers Add Horizontal Information Flow (Section 4). Transformers
+lack horizontal information flow within layers, leading to inefficiencies even on simple tasks like
+associative recall. Drawing on the musical canon (overlapping repetition), we introduce Canon
+layers, horizontal “residual links" across neighboring tokens that can be flexibly inserted at multiple
+points before attention (Canon-A), inside attention (Canon-B), before MLP (Canon-C), inside
+MLP (Canon-D). While Canon layers can be implemented in many ways—even simple random
+averaging is highly effective—this paper focuses on trainable 1-d linear convolutions of kernel size
+4. This is lightweight and integrates seamlessly into any architecture with minimal code.
+
+Results 2-5: When Transformer Meets Canon (Section 5).
+• BOOST PERFORMANCE. In our playground, Canon layers improve reasoning depth (200-400%),
+reasoning breadth (30%), knowledge manipulation length (30%), and more. These stem from
+enhanced hierarchical learning dynamics and come with minimal computational overhead.
+• REVIVING NOPE. Integrating Canon layers transforms NoPE models into strong performers,
+often matching or surpassing RoPE(+Canon). Canon layers outperform positional fixes like
+ALiBi [43] or H-Alibi [29], and reducing/removing RoPE usage improves length generalization.
+• ABLATION STUDY. Canon layers contribute cumulatively across sublayer positions (Canon-
+A/B/C/D), independently of attention or MLP components. Residual links improve training
+efficiency; minimal parameter tuning is required without compromising stability.
+• MLP AND MOE. Canon layers can recover some knowledge capacity lost in gated MLP or
+mixture-of-expert (MoE) architectures, via improved training efficiency and stability.
+
+Results 6-7: When Linear Attention Meets Canon (Section 6).
+• BOOST PERFORMANCE. Canon layers elevate Gated Linear Attention (GLA [66]) from 1-hop
+to 4-hop reasoning depth, double its reasoning breadth and knowledge manipulation length,
+making it comparable to Mamba2 and even surpassing it on tasks like BREVO.
+• ABLATION STUDY. Residual links and full Canon (A/B/C/D) are essential for maximizing
+effectiveness for linear-attention models, partial implementations may underperform.
+
+Results 8–9: When Mamba Meets Canon (Section 7).
+• SECRET OF SUCCESS. Mamba2's performance is driven by its built-in conv1d mechanism,
+which acts as a non-linear Canon-B layer applied to selective coordinates. Removing convid
+drops performance to match GLA, while replacing it with full Canon layers further boosts
+results, highlighting the importance of horizontal information flow over SSM design.
+• ABLATION STUDY. Canon choices—such as integration points and residual links can influence
+Mamba2's performance. Mimetic initialization [61], while optimized for length generalization,
+harms shorter-context tasks, underscoring the need for diverse pretraining environments.
+
+Results 10–11: Comparing Architectures (Section 8).
+• CONTROLLED COMPARISONS. Applying full Canon layers consistently across ROPE, NOPE,
+Mamba2, and GLA allows controlled comparisons, revealing that full transformers outperform
+linear models in hierarchical reasoning tasks, achieving twice the reasoning depth.
+• REASONING DEPTH CHALLENGES. Linear models like GLA and Mamba2 face limitations
+in reasoning depth caused by accumulated errors in compression and retrieval, not memory
+capacity. Hybrid architectures, such as sliding-window transformers combined with linear
+models, offer scalable solutions for deeper reasoning tasks.
+
+3
+
+Design Criteria for Synthetic Pretrain Tasks
+Challenge architectural depth: ---
+avoid shallow tasks (e.g., associative recall) ---
+Test mental reasoning (system-1):
+mental depth 4 × 8 CoT steps = 32 total steps.
+Focus on short (e.g., 4096) context length
+long context (e.g., 1M tokens)
+mental reasoning
+system 2 reasoning (CoT)
+summarization (CoT)
+context length 4096
+Ensure real-world relevance
+avoid tasks solvable by external tools
+"452352 + 547647 = 999999"
+X
+our focus for architecture design
+long context often summarized to
+short windows for deep reasoning
+Figure 2: Our design criteria for synthetic pretrain tasks.
+
+Result 12: Academic-scale Real-Life Pretraining (Section 9). Training 1.3B-parameter
+models on 100B tokens with a context length of 4096 reveals high noise and limited resolution, mak-
+ing most architectural differences statistically insignificant. However, consistent findings emerge:
+• Linear architectures consistently lag behind full Transformers on retrieval-heavy tasks, even
+when equipped with Canon layers.
+• Canon layers significantly improve GLA and NoPE, elevating GLA to match Mamba2 and
+NOPE to match RoPE; removing conv1d, however, degrades Mamba2 to match GLA.
+• All models struggle with 2-hop reasoning tasks even in short contexts (e.g., 100 tokens), em-
+phasizing the limitations of academic-scale pretraining.
+• Reducing or removing RoPE (especially when Canons are added) enhances long-context gen-
+eralization without compromising overall performance.
+These findings confirm architectural insights from Results 3, 6, 8, 10, and 11, highlighting consistent
+trends across synthetic and real-world benchmarks.
+
+In summary, Canon layers fundamentally improve horizontal information flow across diverse
+architectures, enabling deeper reasoning and efficient scalability. Combined with synthetic bench-
+marks, they provide systematic insights into future opportunities in model design.
+
+2 Synthetic Tasks for Decomposing Intelligence
+2.1 Criteria for Task Selection
+We design synthetic tasks to systematically evaluate specific capabilities of language model archi-
+tectures under controlled conditions, ensuring clean comparisons by reducing confounding factors.
+The following criteria guide task selection:
+
+Criterion 1: Tasks must not be shallow. Shallow tasks such as associative recall or sequence
+copying are easily solved by small-scale models or minimal-layer architectures, making them in-
+adequate for evaluating deeper architectural capabilities. Deep learning relies on stacked layers
+to progressively learn abstract features [4]. Tasks involving hierarchical reasoning provide better
+benchmarks for testing scalability and efficiency.
+
+Criterion 2: Emphasis on mental thinking. Tasks should evaluate a model's ability to per-
+form complex mental reasoning, without relying on Chain-of-Thought (CoT). While CoT simplifies
+problems by breaking them into sequential subtasks, intrinsic "mental reasoning depth" remains
+an essential architectural property. For instance, a model that can reason 3 steps internally and
+perform 8 steps via CoT achieves a combined computational depth of 24. Distinguishing intrinsic
+4
+
+Five Synthetic Tasks Isolating Atomic Skills
+(DEPO): Mental reasoning depth
+What's the k-th successor of A?
+(BREVO): Mental reasoning breadth
+(MANO): Knowledge manipulation
+X
+(directed path given
+in random order)
++
+13 20 15
+2
+(DAG given in
+random order)
+⇒ What does A depend on, list in topological order?
+(CAPO): Knowledge capacity
+[name] was born in [year], hometown is [city], works for [company]...
+01010
+010110
+1110
+00110
+How many bit-per-parameter can a model store?
+⇒ What's answer mod 23?
+mental reasoning on knowledge
+(i.e., 23 x 23 lookup tables)
+manipulate →
+knowledge → manipulate → knowledge
+(LANO): Hierarchical language structure
+Structural reasoning: resolving ambiguity via global
+dynamic programming on CFG languages
+parse tree 2
+parse tree 1
+1 2 3 3 1 3 3 1 2 1 2 2 1 1 1 1 2
+Figure 3: Overview of our five synthetic tasks, each isolating an atomic skill for rigorous architectural comparison.
+
+reasoning ("system 1") from decomposition-based reasoning ("system 2") is crucial for understand-
+ing scalability [71]. Current models, such as o3 or R1, resort to verbose reasoning traces even for
+trivial prompts (e.g., “Hello”), exposing inefficiencies in system 1 reasoning. Designing tasks that
+test intrinsic reasoning depth is essential for guiding architectural improvements.
+
+Criterion 3: Avoid emphasis on length generalization. Length generalization benchmarks
+tend to be noisy, sensitive to random initialization and training order [75], thereby limiting their
+reliability for architectural evaluations. While length generalization is crucial, models optimized
+for long contexts (e.g., 100k tokens) may exhibit reduced performance on tasks within standard
+context lengths, such as 4096 tokens. In real-world applications, even long inputs are typically
+condensed into shorter windows (e.g., using summarization or CoT), where final reasoning occurs.
+Thus, in this version of the paper, we prioritize evaluating architectures within dense, 4096-token
+contexts, where critical reasoning unfolds.
+
+Criterion 4: Relevance to real-world skills. Tasks should prioritize broadly applicable skills
+while avoiding capabilities better suited to external tools. For example, large-number arithmetic
+(e.g., adding 10-digit numbers) is theoretically interesting but can be delegated to Python in-
+terpreters; failures in this area typically reflect limited data exposure rather than architectural
+weaknesses (e.g., Llama3 70B miscalculates 452352 + 547647). Synthetic tasks should focus on
+universally relevant skills, aligned with real-world applications, to ensure meaningful assessments.
+
+2.2 Our First Set of Five Synthetic Pretrain Tasks
+To operationalize the criteria above, we design five synthetic tasks each targeting a distinct di-
+mension of language model capability. We name them DEPO, BREO, CAPO, MANO, and LANO.
+
+Task Depo: Mental reasoning depth. Reasoning depth represents a fundamental capability
+for LLMs, requiring models to retrieve information through multi-step computation. Task DEPO
+evaluates reasoning depth as k-hop traversal over directed permutations, where models compute the
+k-th successor for each query q entirely internally, without intermediate steps like Chain-of-Thought
+(COT).2 Each instance is formatted as:
+
+<eos>
+<bos> x1 y1 x2 y2
+xn yn <query_k1> q1 a1 <query_k2> q2 a2
+
+Here, 2n tokens encode n directed edges xi → Yi, forming a random permutation of n nodes.
+2Using CoT would reduce the k-hop task to simpler 1-hop associative recall.
+
+5
+
+The dataset is controlled by two parameters: N, the maximum permutation size, and K, the
+maximum reasoning depth. During training, n is sampled from [3, N], while k ∈ [1, K]. Context
+lengths are fixed to 2048 tokens. We employ two variants of DEPO:
+• DEPO1: Each node spans 1-2 tokens from vocab size 50, with N = 225, 300, 375 and K = 8.
+• DEPO2: Each node spans 5-7 tokens from vocab size 4, with N = 75, 100, 125 and K = 16.
+
+Evaluation focuses on both the hardest cases (n = N, k = K) and intermediate difficulty (k = K/2).
+For weaker models, we utilize reduced training setups with K = 4, denoted DEPO1(K = 4) and
+DEPO2(K = 4). The full methodological details are provided in Appendix A.1.
+
+Task Brevo: Mental reasoning breadth. This evaluates a model's ability to process multiple
+dependencies simultaneously, as required in tasks involving tree-like traversal or dependency graphs.
+For example, solving queries like "Who are Alice's nephews?" or GSM-like examples requires
+parallel reasoning across branches of a graph to process relationships bottom-up [69]. Task BREVO
+isolates this capability using recursive traversal of directed acyclic graphs (DAGs), abstracting away
+natural language or arithmetic complexities. Each task instance is formatted as:
+
+<bos> x1 y1 x2 y2
+xm ym <query> q <ans> a1 a2
+ap <eos>
+
+Here, 2m tokens define m edges xi → Yi, representing dependencies where yi depends on xi. Upon
+receiving a query vertex q, the model outputs all vertices recursively reachable from q, sorted in
+topological order starting from the leaves (e.g., u → v → q yields output u followed by v).
+
+The dataset is parameterized by N, the maximum graph size, with DAGs created using n ≤ N
+nodes, each of degree at most 4. Pretraining data is sampled by varying graph sizes, while testing
+focuses on the hardest graphs (n = N). We employ two variants of BREVO:
+• BREVO1: Each vertex name spans a single token, with N = 70/90/110, fit within 1024 tokens.
+• BREVO2: Name spans 2–4 tokens of vocab size 4, with N = 30/40/50, fit within 1536 tokens.
+
+A key discovery from [69] revealed that, due to the non-uniqueness of valid outputs, language
+models preprocess the entire topological order of the DAG mentally before generating the first
+token a1. This insight confirms that our synthetic data rigorously evaluates reasoning breadth by
+requiring models to globally process the underlying graph structure before producing outputs.
+
+Task Capo: Knowledge capacity. Task CAPO evaluates a model's efficiency in encoding
+factual knowledge directly within its parameters, quantified as bits per parameter, which measures
+reliable storage capacity. Following the framework in [7], synthetic datasets of (fake) biographies are
+constructed to test knowledge retention. Each biography includes several attributes (e.g., birthdate,
+university, employer, etc.) and is presented in diverse paraphrased formats to reduce surface-level
+memorization [5, 6]. Capacity is measured using the next-token prediction distribution, accounting
+for both exact correctness and partial accuracy.
+
+To highlight architectural differences, we adopt an undertrained regime where each biography
+is exposed only 100 times during pretraining. The dataset includes N = 50K to 2M biographies,
+encoding 2 × 106 to 108 total bits of information. Models of varying sizes are tested, and results
+are visualized via “bit vs. model size” plots. Additional details are provided in Appendix A.3.
+
+Task Mano: Knowledge manipulation. Task MANO evaluates a distinct form of reasoning: the
+ability to manipulate stored knowledge internally, contrasting with in-context reasoning tasks like
+DEPO or BREVO. While those tasks focus on reasoning over external tokens, MANO requires models
+³Exposing each biography 1000 times during pretraining diminishes architectural differences, as even transformers
+without MLP layers can achieve similar storage efficiency [7]. Uniform exposure ensures clean systematic comparisons
+while avoiding confounding effects tied to rare outliers and junk data [7].
+
+6
+
+to retrieve factual knowledge embedded in their parameters and perform hierarchical computation
+entirely mentally. This combination of retrieval and reasoning makes knowledge manipulation
+uniquely challenging and a skill that must be learned during pretraining.4
+To test this capability, MANO employs synthetic modular arithmetic expressions inspired by
+human mental computation, particularly small-number arithmetic like the 9×9 multiplication table.
+Models solve multi-step arithmetic problems without intermediate steps like Chain-of-Thought. For
+example, given: <bos> + * a b – c d <ans> the task requires evaluating ((axb)+(c-d)) mod 23
+for l = 3, where operands a, b, c, d are sampled uniformly from [0, 22]. Modular arithmetic provides
+the foundational factual knowledge (23 × 23 operation tables), while the task challenges hierarchical
+reasoning by recursively composing operations. Additional details are provided in Appendix A.4.
+The dataset is parameterized by a maximum expression length L, with l sampled uniformly
+from [1, L]. We prepare three MANO datasets across difficulty levels: L = 10, 13, and 16.
+
+Task Lano: Hierarchical language structure. Task LANO evaluates structural reasoning over
+hierarchical relationships and long-range dependencies. Unlike DEPO, BREVO, and MANO, which
+rely on explicit key-value pairs (in-context or knowledge), LANO challenges models to infer implicit
+recursive structures across sequences and resolve global ambiguities within them.
+
+Το test this, LANO leverages synthetic datasets built from context-free grammars (CFGs). Train-
+ing sequences consist of CFG-valid sentences separated by <bos> tokens. For example:
+<bos> 3 3221. 331 2 <bos> 1 2 3 3 1 1221 <bos>
+CFGs are designed with token-level ambiguity, where local tokens (e.g., 1, 2, 3) provide insufficient
+information to directly infer their mapping to CFG rules. Resolving this requires dynamic pro-
+gramming to globally map the entire sequence to a valid recursive application of CFG rules, which
+must also be learned during training. This reasoning grows in worst-case complexity (O(n³)) as
+sequence lengths increase. Details are in Appendix A.5.
+
+Building upon cfg3f [3], which includes sequences of lengths 100–500, we introduce extended
+datasets cfg3j and cfg3k, with sequences ranging up to 200-1000 tokens to increase recursive depth
+and test models on more nested rules and longer dependencies. Training uses context lengths of
+1536 for cfg3j and cfg3k, compared to 512 for cfg3f. Evaluation prompts models with <bos> to
+generate CFG-valid sentences, validated via a dynamic programming parser. KL divergence is also
+used to compare token distributions against ground truth.
+
+In summary, this set of five synthetic tasks covers non-overlapping skills and distinct aspects
+of accuracy-token-level (DEPO, MANO), generative (BREVO, LANO), and distributional (CAPO,
+LANO). While this pool can be further enriched, it serves as a strong starting point for deriving
+meaningful architectural insights, as demonstrated in the following sections.
+
+3 Initial Comparison on Well-Known Architectures
+Language model architectures have evolved significantly since Transformers [62], resulting in three
+major families distinguished by computational mechanisms.
+
+Quadratic-time attention models, pioneered by the original Transformer, include prominent
+architectures such as BERT [34] and GPT2 [45]. Recent refinements include Rotary Position
+Embeddings (RoPE) [12, 57] and gated MLP layers [53]. We use the Huggingface implementation
+⁴For instance, questions like "Was [name] born in an even or odd month?" or derived 2-hop queries such as "What
+is [name]'s sister's birthdate?" demand reasoning layers over stored knowledge. These skills cannot reliably emerge
+through supervised fine-tuning alone [6] and require development during pretraining or continued pretraining.
+
+7
+
+Task Depo1(K=4, k=4/2)
+Llama (ROPE) - original
+N=225-97/100% 99/100% 96/100% 93/100%
+N=300-98/100% 84/99% 43/99% 95/100%
+N=375
+79/98% 99/100% 1/24% 3/27%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+Llama (ROPE) - original
+N=7599/100% 100/100% 99/100% 100/100%
+N=100-99/100% 100/100% 100/100% 100/100%
+N=225
+Task Depo1(K=4, k=4/2)
+Mamba2 original (conv1d)
+20/70% 47/90% 9/76% 20/57%
+5/41% 3/50% 3/33%
+2/16% 12/41% 3/28% 2/33%
+8L512D 8L768D 12L512D 12L768D
+N=300-9/42%
+N=375
+Task Depo2(K=4, k=4/2)
+Mamba2 original (conv1d)
+N=125-97/100% 100/100% 100/100% 100/100% N=125-46/83%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Llama (ROPE) - original
+N=70-45.6% 76.9% 79.8% 88.5%
+N=90-32.6% 64.5% 44.5% 63.1%
+8L512D
+N=75-75/95% 91/98% 74/95% 90/98%
+N=100 55/85% 86/97% 57/90% 86/97%
+69/91% 41/81% 67/91%
+8L768D 12L512D 12L768D
+Task Brevol
+Mamba2 - original (conv1d)
+N=70-17.0% 40.1% 71.4% 56.5%
+N=90 11.5% 87.2% 48.1% 24.2%
+N=110 8.0% 31.2% 17.7% 27.5% N=110
+N=30
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Llama (ROPE) - original
+69.3% 89.8% 83.7% 96.0%
+N=40-40.3% 79.5% 60.5% 88.0%
+N=50
+22.4% 68.2% 40.2% 81.4% N=50
+8L512D 8L768D 12L512D 12L768D
+Task Mano
+Llama (ROPE) - original
+L=10-59.4% 75.5% 84.5% 85.2%
+L=13-55.6% 53.8% 52.5% 46.5%
+L=16-26.3% 19.7% 20.9% 41.6%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Llama (ROPE) - original
+cfg3f91.1% 96.3% 93.4% 97.6%
+cfg3j74.1% 91.4% 82.3% 90.3%
+cfg3k 64.0% 75.1% 60.0% 79.1%
+8L512D 8L768D 12L512D 12L768D
+learned knowledge (bits)
+100
+Task Capo - Llama (ROPE) - original
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+107
+model size (#params)
+Task Mano
+N=2000000
+N=1000000
+N=500000
+N-200000
+N=100000
+N=50000
+108
+Mamba2 - original (conv1d)
+learned knowledge (bits)
+Task Capo - Mamba2 - original(conv1d)
+2 bit / param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+107
+model size (#params)
+Task Mano
+N=2000000
+N=1000000
+N=500000
+N-200000
+N=100000
+N=50000
+108
+Mamba2 - original (conv1d)
+L=1091.4% 97.1% 96.3% 98.8%
+L=1381.5% 95.3% 87.9% 88.0%
+L=16-52.8% 64.5% 69.9% 94.0%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Mamba2 - original (conv1d)
+cfg3f88.2% 93.5% 91.1% 94.1%
+cfg3j69.1% 82.2% 78.2% 84.2%
+cfg3k 43.3% 65.3% 50.9% 70.3%
+8L512D 8L768D 12L512D 12L768D
+Task Depo1(K=4, k=4/2)
+GLA - original
+N=225
+1/16% 0/18%
+N=300 0/5% 0/5%
+N=375 0/0% 0/3%
+0/10% 2/30%
+0/7% 0/15%
+0/2% 0/8%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+GLA - original
+2/14%
+1/1% 1/3% 3/13%
+2/10% 1/1% 2/19% 1/18%
+1/10% 1/2% 1/2% 1/13%
+8L512D 8L768D 12L512D 12L768D
+N=75
+N=100
+N=125
+Task Brevol
+GLA - original
+N=70-4.7% 4.7% 4.1% 24.9%
+N=90-0.9% 0.8% 1.7% 1.0%
+2.9% 8.5% 10.8% 26.2% N=1100.2% 0.6% 0.9% 1.3%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Mamba2 - original (conv1d)
+N=30 13.4% 38.6% 19.8% 54.9%
+66.6% 80.9% 46.4% 4.8% N=40 2.1% 22.2% 2.1% 7.3%
+17.8% 0.6% 22.3% 2.7% N=50 0.8% 1.4% 3.4% 1.4%
+8L512D 8L768D 12L512D 12L768D
+Task Mano
+GLA - original
+51.6% 74.5% 61.7%
+L=10-56.6%
+L=13-26.5% 58.0% 34.5% 41.5%
+L=16-23.5% 50.3% 46.2% 17.5%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+GLA - original
+cfg3f- 23.9% 40.1% 46.7% 74.6%
+cfg3j - 3.3% 6.6% 2.5% 13.8%
+cfg3k 9.9% 17.1% 9.5% 16.9%
+8L512D 8L768D 12L512D 12L768D
+learned knowledge (bits)
+Task Capo - GLA - original
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+N=2000000
+N=1000000
+N=500000
+N-200000
+N=100000
+N=50000
+107
+108
+model size (#params)
+Figure 4: Initial comparison of ROPE, Mamba2, and GLA on five synthetic tasks. GLA performs poorly everywhere
+except knowledge capacity (CAPO); Mamba2 excels at knowledge (CAPO, MANO); Llama (RoPE) is best at
+reasoning (DEPO, BREVO, LANO). This confirms our synthetic playground as effective for architectural
+comparisons. However, the landscape will shift dramatically once Canon layers are introduced, enabling
+deeper reasoning (e.g., DEPO1 with K = 8, DEPO2 with K = 16). See rest of the paper.
+
+of Llama, denoted as Llama(RoPE), incorporating RoPE and gated MLP, and a variant without
+positional embeddings, Llama(NoPE). We refer to these as RoPE and NoPE respectively when
+clear from the context. We exclude relative positional embeddings due to limited empirical benefits
+but additional computational costs [3].
+ROPE models often generalize poorly beyond training context lengths. In contrast, NOPE
+generalizes better but suffers from lower overall performance. Recent attention-score modifications
+(e.g., ALiBi [43] and Hard-Alibi [29]) partially address this trade-off; we discuss in later sections.
+Linear-time attention reduces computation by compressing sequences into fixed-length repre-
+sentations. Examples include Linformer [63], Performer [14], Linear Transformer [33]. We focus on
+more recent Gated Linear Attention (GLA) [66], known for computational efficiency and scalability.
+Recurrent and state-space models process long sequences using evolving hidden states instead
+
+8
+
+of attending over all tokens. Mamba [18, 25] exemplifies this category; we analyze its second
+generation (Mamba2). Other prominent models include S4 [55], S5 [55], RetNet [58], RWKV [41],
+HGRN [44], GSA [74], DeltaNet [68], and GatedDeltaNet [67].
+
+Avoidance of hybrid architectures. We exclude models integrating attention with linear or
+state-space methods—e.g., Griffin [19], Samba [47], GatedDeltaNet-H1/H2 [67] or sliding-window
+attention to maintain clarity. Such hybrid approaches excel in extremely long contexts (e.g., 1
+million tokens), but our analysis focuses explicitly on precision within standard context windows
+(4096 tokens). In practice, long contexts are often compressed to shorter segments (e.g., via CoTs)
+for final detailed processing, making precise local reasoning essential.
+Hybrid models can obscure architectural trade-offs; aggregated results may not reflect individual
+component contributions clearly. For instance, Mamba2 is strong in memory tasks yet weaker in
+structured reasoning. Hybrids blending linear/state-space modules with attention can mask these
+distinctions. Thus, for transparency, this study focuses entirely on isolated architectures to clearly
+analyze their inherent strengths and weaknesses.
+
+Architecture Size Standardization. To ensure fair comparisons, we standardize model sizes
+and evaluate Llama, GLA, and Mamba2 as representative architectures from each family.
+For all tasks except CAPO, we experiment with four architecture sizes. Llama models have 12
+or 8 layers, with hidden dimensions of 768 or 512 (and 12 or 8 heads), denoted as 12L768D, 8L512D,
+etc. (12L768D matches GPT2-small). We translate these configurations into GLA, Mamba2, and
+Mamba2(mlp) to ensure comparable parameter counts.5
+
+For CAPO (bit-per-parameter knowledge capacity), we vary model and data sizes more widely.
+Following [7], we denote model scale by l-h: for Llama, this means l layers, hidden size 64h, and h
+heads. We extend this notation consistently to GLA and Mamba2.
+
+Training. We use identical training settings (batch size, training steps, and learning rate choices)
+across architectures to ensure fair comparisons. Complete details are provided in Appendix A. We
+also fix random seeds so that all architectures pre-train on precisely identical data sequences.
+
+3.1 Initial Comparison Results
+From Figure 4, linear-attention GLA performs weakest overall, Mamba2 excels in knowledge tasks
+(CAPO, MANO), and Llama(RoPE) performs best on reasoning tasks (DEPO, BREVO, LANO).
+These results validate the effectiveness of our synthetic playground; however, we avoid deeper
+interpretation at this point. As shown later, Llama and GLA lack a critical architectural component,
+making this initial comparison incomplete, unfair, and less informative.
+For now, we highlight several key remarks.
+
+3×4 mini scaling laws. Randomness may affect outcomes. For example, in Task MANO, despite
+two seeds and four learning rates per configuration, smaller models sometimes outperform larger
+ones. Thus, robust statistical comparisons are crucial. We address this by testing our synthetic
+tasks systematically at three data scales and four architecture sizes (even more for Task CAPO).
+These "3×4" mini scaling laws enable clearer visual comparisons, reducing variability.
+
+Benefits of synthetic tasks. Synthetic tasks clarify architectural differences starkly (e.g., 90% vs
+5%), clearly exposing strengths and weaknesses. By contrast, real-world experiments often produce
+⁵The original Mamba2 has no MLP layers: each Mamba layer has 6d² parameters (for hidden size d), compared
+with 12d² in Llama. Thus, we configure Mamba2 with 24 or 16 layers to match Llama's size. Mamba2(mlp) alternates
+Mamba and gated MLP blocks, thus keeping 12 or 8 total layers. See details in Appendix C.
+
+9
+
+A
+A B
+store A to B
+.... A?
+(B is not there)
+use key=A to retrieve value=B
+(first attention)
+How to predict ?=B
+(second attention)
+ROPE(1L-2H-16D)
+ROPE(1L-4H-32D)
+a folklore: associative recall "needs" two layers of attention
+attending to A is useless
+X
+ROPE(2L-16H-128D)
+ROPE(2L-8H-64D)
+ROPE(2L-4H-32D)
+ROPE(2L-2H-16D)
+-62% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100%
+0% 91% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100%
+0% 91% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100%
+0% 14% 99% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100%
+0% 0% 0% 0% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100%
+0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0%
+0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0%
+0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0%
+ROPE(1L-8H-64D)
+ROPE(1L-16H-128D)
+1500
+2500
+Canon(cst) - ROPE (1L-2H-16D) -0% 13% 96% 99% 100% 100% 100% 100% 100% 100% 100% 100% 100% 100%
+Canon RoPE(1L-2H-16D)
+0% 59% 100% 100% 100% 100% 100% 100% 100% 1
+5000
+10000
+15000
+20000
+training steps
+25000
+30000
+35000
+40000
+100% 100% 100%
+45000
+50000
+500
+1000
+Figure 5: A trivial token-copying experiment for 500 tokens, added for completeness. 1-layer ROPE requires d ≥ 128,
+while 2-layer RoPE or 1-layer ROPE + Canon achieves 100% with d 16.
+
+=
+modest differences (e.g., 2%) buried in noise. Thus, synthetic pretraining environments allow clean
+evaluations of architectures' scalability and true capabilities.
+
+Interpreting task failures. If a specific architecture (of a given size) fails at a certain difficulty
+level (e.g., large N or k), it does not imply the model cannot learn the skill given infinite training
+steps. Our comparison uses a fixed, limited training budget: all architectures train for the same
+number of steps with identical data and shuffling, reporting best accuracy across multiple learning
+rates. Thus, results should be seen as differences in the speed of skill acquisition, not absolute
+capability.6
+
+Predicting future pipelines. Synthetic tasks simulate idealized, high-quality pretraining condi-
+tions targeting core skills like multi-hop reasoning (DEPO). Unlike datasets such as FineWeb-edu or
+SlimPajama, which contain sparse reasoning examples obscured by simpler content, synthetic tasks
+highlight core capabilities. Currently, 100B-token pretraining fails even simplest 2-hop reasoning
+(Result 12). As training pipelines evolve—via improved data curation or RL-based post-training-
+synthetic tasks like DEPO may better predict models' potential and guide architectural choices.
+
+4 Canon Layers: Enhancing Horizontal Information Flow
+Attention-based Transformers are widely recognized for their ability to perform associative recall.
+A canonical example is the sequence [A] [B] ...[A] [?], where the model predicts ? = B.
+While one might expect the model could simply attend to an earlier [A] to retrieve [B], the actual
+mechanism is more subtle. In a decoder model with causal masking (see Figure 5), tokens can
+attend only to earlier tokens. When processing the first occurrence of [A], information about the
+subsequent token [B] is not yet available. Correct associative recall thus requires two attention
+layers: the first copies information from token [A] to token [B], enriching its representation; the
+second uses this enriched representation, querying by [A] to retrieve value = [B] (via key = [A]).
+
+The importance of local context. Even the simplest tasks, such as single-token associative
+recall, require careful mixing of local context let alone harder tasks or cases when words are
+decomposed into multiple tokens. Since Transformer MLP layers do not inherently mix information
+across tokens, all local context mixing must be performed by attention layers.
+
+Remark 4.1. When stating tasks like associative recall “require two layers," we do not mean an
+exact lower bound. Indeed, 1-layer Transformer is Turing-complete: it can perform associative
+recall (or copying) by blindly aggregating most (or all) context into the current position, allowing
+⁶Faster learning is practically important for example, a model ideally learns reasoning skills quicker than pure
+memorization. Similar observations arise in knowledge capacity tasks [7], where architectural differences vanish with
+ample training but become pronounced when training budgets are limited.
+
+10
+
+the single MLP layer to perform local query/key/value computations. Empirically, however, this
+is highly inefficient: Figure 5 shows that a 1-layer Transformer requires hidden dimension 128 to
+fully recall sequences of length 500, whereas two layers achieve this with dimension 16.
+
+Positional embeddings such as absolute, rotary, and relative variants address modeling local
+token interactions by biasing attention toward neighboring tokens rather than distant ones. Rotary
+and relative embeddings are particularly effective, but their reliance on computationally heavy
+attention raises the question: are we shooting a bird with a cannon?
+Similar challenges arise in linear attention models like GLA [66], which compress past tokens
+using gating-controlled decaying weights. Capturing recent tokens (e.g., positions t-1 or t-2)
+forces the gating function to reduce emphasis on distant contexts. State-space models like Mamba2
+similarly compress long-token sequences but often lose critical detail from neighboring tokens.
+
+Canon layers: general form. Inspired by (vertical) residual connections, we introduce Canon
+layers to explicitly enhance horizontal information flow across neighboring tokens. Canon layers
+aggregate hidden representations from adjacent positions into the current token, functioning like
+“horizontal residuals." Unlike traditional attention-based global aggregation or recurrent compres-
+sion, Canon layers focus on explicitly propagating information within a local window (e.g., of size
+4).
+Formally, given any hidden states ht ∈ Rm at token position t, a Canon layer computes:
+h₁ = wo © ht + W1 © ht−1 + W2 © ht−2 + w3 © ht−3,
+where denotes element-wise multiplication, wi ∈ Rm (i = 0,1,2,3) are weights, and padding
+zeros are used for boundary conditions. We call this Canon, borrowing from the musical term, as
+it resembles melodies played sequentially at fixed temporal delays.7
+
+Flexible Integration. Canon layers integrate at multiple points within each Transformer block:
+• Canon-A: Before the attention block (m = d if hidden size is d).
+• Canon-B: Inside the attention block, applied to Q/K/V projections (m = 3d).
+• Canon-C: Before the MLP block (m = d).
+3
+• Canon-D: Within the MLP block (m = 4d for standard MLP, m = d for gated MLP).
+Combining all four points gives Canon-ABCD (full-score Canon); partial combinations (Canon-
+A/B/ABC) can also be explored.
+Canon layers integrate flexibly across diverse architectures, including Transformers, linear-
+attention, and state-space models. For Mamba2 (without standard MLP layers), Canon layers
+appear at Canon-A and Canon-B positions (yielding Canon-AB); for Mamba2(mlp), the complete
+Canon-ABCD configuration applies. Canon-B in Mamba2 scales as m = 4d + o(d).8
+
+Canon layers: Implementation variants. Canon layers can be implemented in various ways.
+Even a simple variant that uses fixed, randomly generated weights acting as horizontal resid-
+ual links-aggregating the past three tokens—already notably enhances performance (Figure 20,
+Appendix).9 More complex variants, such as dynamic convolution with hidden-state-dependent
+weighting (effectively gating), are promising directions not studied in detail here.
+⁷In Pachelbel's Canon in D, violins sequentially play the same melody with delays, creating overlapping horizontal
+repetition patterns analogous to Canon layers.
+⁸For example, Mamba2 settings with ssm_state_size=64, num_heads=16 result in m 4d+144 dimensions.
+⁹Unlike vertical residual links (h' = h + σ(Wh)), Canon layers aggregate multiple token vectors from different
+relative positions (t1, t2,t-3). Assigning fixed orthogonal directions effectively provides each position a unique
+"ID" for aggregation. Simple scalar weighting (e.g., h₁ = ht +0.4ht−1+0.2ht−2+0.1ht−3) can degrade performance.
+
+11
+
+Canon Layers
+Explicitly add "horizontal residual" connections:
+h = woht + W₁ht-1 + W2 ht-2 + W3ht-3 E IRM
+random fixed Wo, W1, W2, W3 ∈ Rm already highly effective
+trainable wo, W1, W2, W3:
+h' = h + causal_conv1dw (h) – used in this paper
+residual link "h +" accelerates training
+4 minimal overhead + ☑ flexible integration
+delayed repetition,
+like in music
+shift=1, shift=2,...
+can be: attention,
+linear-attn, SSM, MLP...
+point A
+point B
+point C
+point D
+W1
+W
+more complex forms (e.g., dynamic conv with w depends on h),
+possible but less efficient, not explored in this paper for clarity.
+can add Canon anywhere (e.g., A/B/C/D sub-layers)
+Figure 6: Illustration of Canon layers.
+
+In this paper, for simplicity and efficiency, we implement Canon layers as 1-d causal convolution
+with kernel size 4, available through efficient CUDA kernels implemented by the open-source H3
+library (pip package causal_conv1d) [22]. We also incorporate explicit residual connections:
+h₁ = ht + conv1d([ht, ht−1, ht-2, ht-3])
+(4.1)
+denoted as Canon(res). Without residual connections, we denote it Canon(no-res). Minimal code
+changes (just a few lines) are needed for integration. Even fully enabled (Canon-ABCD), Canon
+layers increase the parameter count minimally. 10 Our emphasis is on clearly demonstrating Canon
+layers' substantial performance benefits; detailed runtime optimizations remain future work.
+
+Prior work. Convolutional mechanisms were previously integrated into Transformers, notably
+Conformer [26] for speech and CvT [65] for vision; thus convolution alone is not novel. However,
+our primary contribution is systematically evaluating its impact-isolating it clearly via synthetic
+pretraining. Unlike prior convolutional approaches, Canon layers offer flexible insertion points
+(A/B/C/D), explicit residual connections, and remain deliberately lightweight (compared to Con-
+former or CvT). Thus Canon serves a distinct purpose: enhancing horizontal information flow,
+rather than learning detailed convolutional filters. (Indeed, even simple random-weight averaging
+yields significant gains.)
+Causal convld was introduced in H3 [22], later adopted in Mamba [18, 25] as shift-SSM within
+its SSM block, employing SiLU activation but no residual connections. While these SSM models
+use convld to narrow their expressivity gap towards full attention, our work provides the first
+systematic evaluation of convld's impact across linear, SSM, and full-attention architectures. By
+benchmarking Canon-enhanced models (such as Transformer, Mamba2, GLA) in controlled condi-
+tions against their original versions, we clearly distinguish Canon layers' contributions from other
+architectural components (e.g., state-space or linear attention).
+
+The concurrent work on multi-token attention (MTA) [24] addresses associative recall in Trans-
+formers using 2D convolutional operators within the attention layer. MTA is computationally
+heavier than our Canon layers and was tested at academic-scale pretraining. As we emphasized,
+Canon layers are not tied to attention layers; it could be interesting to explore how much additional
+benefit MTA offers when combined with Canon layers.
+10 Fewer than 0.45% parameters for GPT2-small. For a 1.3B-parameter Llama with Canon-ABCD enabled, pa-
+rameters increase by 0.0063%, runtime overhead on an H100 GPU with naive implementation (PyTorch bf16, flash
+attention, causal convld kernels) is 12.4%, 14.1%, and 20.8% for forward, backward, and generation respectively. For
+Canon-AC, overheads reduce to 5.8%, 5.8%, and 7.0%. Further runtime efficiencies are possible (e.g., consolidating
+multiple Canon operations across layers), though these optimizations remain beyond this paper's scope.
+
+12
+
+Task Depo1(K=8, k=8/4)
+Llama (ROPE) - original
+N=2250/34%
+1/50%
+1/4%
+N=3000/27%
+N-375-0/2%
+0/1%
+0/0% 0/12% 0/0%
+0/56% 0/0% 0/0%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=16, k=16/8)
+Llama (ROPE) - original
+N-75-2/1%
+N-100-1/1%
+N=125-1/2%
+2/1% 1/1% 30/99%
+1/90% 1/3% 21/96%
+1/92% 1/3% 1/50%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Llama (ROPE) - original
+N=70-45.6% 76.9% 79.8% 88.5%
+N=90-32.6% 64.5% 44.5% 63.1%
+Task Depo1(K=8, k=8/4)
+Llama (ROPE) - Canon-ABCD(res)
+N=225-97/100% 92/100% 73/89% 94/100%
+N=30057/97% 54/93% 92/99% 99/99%
+N-375-76/99% 53/99% 16/66% 97/100%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=16, k=16/8)
+Llama(ROPE) - Canon-ABCD(res)
+N=75 91/99% 97/100% 98/100% 99/100%
+N=100-98/100% 98/100% 99/100% 98/100%
+N=125 71/98% 90/100% 94/99% 96/100%
+8L512D 8L768D 12L512D 12L768D
+Task Depo1(K=8, k=8/4)
+Llama (ROPE) Canon-ABCD(res)
+N=225-99/100% 97/100% 99/100% 100/100% N=225
+N=300-98/100% 92/99% 95/100% 95/100% N=300
+N-375-75/99% 97/100% 85/100% 90/100% N-375
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=16, k=16/8)
+Llama (ROPE) - Canon-ABCD(res)
+N=75-92/100% 100/100% 97/100% 99/100%
+N=100-97/100% 99/100% 96/100% 97/100% N=100
+N=125-85/100% 99/100% 98/100% 98/100% N=125
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Task Brevol
+Llama (ROPE) - Canon-ABCD(res)
+N=70-84.6% 88.7% 88.3% 91.3%
+N=90-51.3% 72.4% 69.9% 75.7%
+Llama (ROPE) - Canon-ABCD(res)
+N=7083.7% 93.8% 91.3% 96.5%
+N=90-62.9% 84.5% 81.2% 90.7%
+N=110-8.0% 31.2% 17.7% 27.5% N=110-24.8% 49.1% 41.2% 58.8% N=110-47.9% 82.2% 69.7% 84.5%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Llama (ROPE) - original
+Task Brevo2
+8L512D 8L768D 12L512D 12L768D
+Task Depo1(K=8, k=8/4)
+Llama (NoPE) - original
+0/0% 0/0% 0/0% 0/0%
+0/0% 0/0% 0/0% 0/0%
+0/0% 0/0%
+0/0%
+0/0%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=16, k=16/8)
+Llama (NoPE) - original
+0/0% 0/0% 0/0% 0/0%
+0/0%
+0/0% 0/0% 0/0%
+0/0% 0/0% 0/0% 0/0%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Llama (NoPE) - original
+N=70-0.2% 0.0% 0.0% 0.4%
+N=90-0.1% 0.0% 0.0% 0.0%
+N=110-0.0% 0.0% 0.0% 0.1%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Llama (NoPE) - original
+8L512D 8L768D 12L512D 12L768D
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Llama (ROPE) - Canon-ABCD(res)
+N=3087.1% 95.6% 92.2% 97.1%
+N=40 75.4% 87.7% 80.1% 93.5%
+N=50-55.1% 82.5% 69.3% 88.1%
+N=30-0.0% 0.0% 0.0% 0.0%
+N=40-0.0% 0.0% 0.0% 0.0%
+N=50-0.0% 0.0% 0.0% 0.0%
+Llama (RoPE) - Canon-ABCD(res)
+N=30-69.3% 89.8% 83.7% 96.0% N=3087.5% 94.5% 92.3% 95.4%
+N=40-40.3% 79.5% 60.5% 88.0% N=40-66.0% 85.3% 79.3% 90.5%
+N=50-22.4% 68.2% 40.2% 81.4% N=50-44.6% 75.5% 68.5% 87.8%
+8L512D 8L768D 12L512D 12L768D
+Task Capo - Llama (ROPE) - original
+8L512D 8L768D 12L512D 12L768D
+Task Capo Llama (ROPE) - Canon-ABCD(res)
+8L512D 8L768D 12L512D 12L768D
+Task Capo - Llama (ROPE) Canon-ABCD(res)
+8L512D 8L768D 12L512D 12L768D
+Task Capo - Llama (NoPE) - original
+Task Depo1(K=8, k=8/4)
+Llama (NoPE) - Canon-ABCD(res)
+N=225-99/100% 99/100% 99/100% 100/100%
+N=30096/99% 99/100% 99/100% 99/100%
+N-375-99/100% 99/100% 98/100% 99/100%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=16, k=16/8)
+Llama (NoPE) - Canon-ABCD(res)
+N=75-96/100% 85/99% 86/100% 99/100%
+N=100-94/100% 86/99% 99/100% 99/100%
+N=125-90/100% 98/100% 93/100% 96/100%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Llama (NoPE) - Canon-ABCD(res)
+N=7084.8% 94.4% 91.1% 96.2%
+N=90-63.9% 85.8% 75.5% 92.2%
+N-110-42.0% 75.3% 58.2% 84.9%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Llama (NoPE) - Canon-ABCD(res)
+N=30 87.4% 93.2% 89.0% 96.1%
+84.0% 75.2% 91.7%
+N=40-61.2%
+N-50-40.4%
+8L512D
+56.0% 56.3% 79.9%
+8L768D 12L512D 12L768D
+Task Capo - Llama (NoPE) - Canon-ABCD(res)
+learned knowledge (bits)
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+N-2000000
+N=1000000
+N-500000
+N-200000
+N=100000
+N=50000
+10
+model size (#params)
+Task Mano
+Llama (ROPE) - original
+L=10-59.4%
+75.5% 84.5% 85.2%
+L=13-55.6% 53.8% 52.5% 46.5%
+L=16-26.3% 19.7% 20.9% 41.6%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Llama (RoPE) - original
+cfg3f91.1% 96.3% 93.4% 97.6%
+cfg3j74.1% 91.4% 82.3% 90.3%
+cfg3k 64.0% 75.1% 60.0% 79.1%
+8L512D 8L768D 12L512D 12L768D
+learned
+vledge (bits)
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+N-2000000
+N=1000000
+N-500000
+N-200000
+N=100000
+N=50000
+10
+model size (#params)
+Task Mano
+Llama (ROPE) - Canon-ABCD(res)
+L=10 95.1% 99.3% 99.3% 99.5%
+94.6% 97.1% 98.8%
+82.8% 91.4% 83.0%
+L-13-66.0%
+L=16-63.7%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Llama (ROPE) - Canon-ABCD(res)
+cfg3f96.6% 98.0% 97.2% 98.3%
+cfg3j88.2% 92.0% 88.6% 94.3%
+cfg3k 75.2% 87.1% 83.0% 86.7%
+8L512D 8L768D 12L512D 12L768D
+learned
+vledge (bits)
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+model size (#params)
+Task Mano
+N-2000000
+N=1000000
+N-500000
+N-200000
+N=100000
+N=50000
+Llama (ROPE) - Canon-ABCD(res)
+L=10 94.2% 98.0% 99.2% 99.6%
+L=1389.8% 88.5% 98.2% 99.2%
+L=1683.7% 83.6% 88.8% 85.3%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Llama (ROPE) - Canon-ABCD(res)
+cfq3f95.2% 97.5% 96.0% 98.1%
+cfg3j81.4% 90.1% 85.9% 92.6%
+cfg3k 66.0% 77.9% 76.1% 78.9%
+8L512D 8L768D 12L512D 12L768D
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+model size (#params)
+Task Mano
+N-2000000
+N=1000000
+N-500000
+N-200000
+N=100000
+N=50000
+Llama (NoPE) - original
+L=10-7.1% 7.1% 7.1% 6.9%
+L-13-7.1% 7.1% 7.2% 7.1%
+L=16-7.3% 7.3%
+7.4%
+7.3%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Llama (NoPE) - original
+cfg3f- 0.0% 0.0% 0.0% 38.8%
+cfg3j- 0.0% 0.0% 0.0% 0.0%
+cfg3k - 0.0% 0.0% 0.0% 0.0%
+8L512D 8L768D 12L512D 12L768D
+knowledge (bits)
+2 bit / param
+1 bit/param
+0.5 bit / param
+0.25 bit/param
+model size (#params)
+Task Mano
+N-2000000
+N=1000000
+-500000
+N-200000
+N=100000
+N=50000
+Llama (NoPE) - Canon-ABCD(res)
+L=1097.7% 98.9% 99.3% 99.3%
+L=1383.1% 90.1% 95.9% 98.1%
+L=16-53.7% 55.5% 89.4% 94.3%
+8L512D 8L768D 12L512D 12L768D
+1215120 1217680
+Task Lano
+Llama (NoPE) - Canon-ABCD (res)
+cfg3f87.9% 91.9% 88.5% 92.5%
+cfg3j55.1% 70.3% 58.6% 78.3%
+cfg3k 33.5% 51.0% 37.2% 53.1%
+8L512D 8L768D 12L512D 12L768D
+Figure 7: Column 1 vs. 2: Canon layers dramatically enhance ROPE, improving reasoning depth by 2-4x.
+Column 4 vs. 5: Canon transforms NoPE into a strong performer on par with RoPE-based models.
+Column 3 vs. 2+5: ROPE usage can be reduced-ROPE + Canon (RoPE enabled for 1/4 dimensions)
+outperforms both ROPE/NOPE + Canon, unlocking improved length generalization.
+
+Remark. This figure uses DEPO1 (K=8) and DEPO2(K=16). Earlier results in Figure 4 were based on
+DEPO1(K=4) and DEPO2(K=4), because model performances were weaker.
+
+5 When Transformer Meets Canon
+
+Figure 4+7 show that a 12-layer, 768-dimension Llama(RoPE) model trained on our ideal data can
+only handle 4-hop retrieval in contexts of length 2048. Can this be any better?
+
+5.1 ROPE with Canon Layers
+Result 2 (Figure 7 – 1st vs. 2nd column). In our controlled playground, Canon layers (ABCD)
+introduce substantial improvements: with a 0.5% increase in trainable parameters, reasoning depth
+of RoPE increases by 2-4×, reasoning breadth by 30%, knowledge capacity by 10-15%, knowledge
+manipulation length by 30%, measurable gains in hierarchical language structure learning.
+
+Task Depo. In reasoning depth, RoPE pretrained on DEPO1(K = 8)—covering sufficiently many
+(k≤ 8)-hop reasoning instances—achieves near-zero accuracy even when evaluated on k = 4, but
+ROPE + Canon-ABCD can get 50+% even on the hardest k = 8. On DEPO2(K = 16) a more
+
+13
+
+Accuracy on k
+100
+Accuracy on k
+0
+Task Depo2(K=16) | N=125 | Llama (RoPE)
+100
+k=16
+k=1
+50
+50
+k=2
+k=4
+k=8
+20000 40000 60000 80000 100000 120000 140000
+Train steps
+Task Depo2(K=16) | N=125 | Llama (ROPE) + Canon-ABCD(res)
+k=16
+k=1
+50
+k=2
+k=4
+k=8
+0
+0 20000 40000 60000 80000 100000 120000 140000
+Train steps
+Accuracy on
+on k
+Accuracy on k
+Task Depo2(K=16) | N=100 | Llama (RoPE)
+100
+k=16
+k=1
+50
+k=2
+k=4
+k=8
+0
+0
+20000
+40000 60000 80000 100000 120000
+Train steps
+Task Depo2(K=16) | N=100 | Llama (ROPE) + Canon-ABCD(res)
+100
+k=16
+k=1
+50
+k=2
+k=4
+k=8
+0
+0
+20000 40000 60000 80000 100000 120000
+Train steps
+Accuracy on k
+Accuracy on k
+Task Depo2(K=16) | N=75 | Llama (RoPE)
+100
+k=16
+k=1
+50
+k=2
+k=4
+k=8
+0
+20000
+40000
+60000
+Train steps
+80000
+100000
+100
+Task Depo2(K=16) | N=75 | Llama (RoPE) + Canon-ABCD(res)
+k-16
+k=1
+50-
+k=2
+k=4
+k=8
+0
+20000
+40000
+60000
+80000
+100000
+Train steps
+Figure 8: Training curves for the 8L512D ROPE model, with and without Canon layers, on Task DEPO2(K = 16),
+evaluated at depths k = 1, 2, 4, 8, 16 and graph size n = N, across three learning rates.
+
+Task Brevo1 - Llama (ROPE) - original
+N=70 79% 87% 79% 76% 76% 68% 91% 91% 94% 89% 92% 89% 46% 51% 47% 44% 43% 43% 77% 85% 79% 75% 74% 78%
+N=90 26% 29% 26% 26% 27% 20% 63% 71% 66% 64% 56% 53% 29% 37% 36% 25% 25% 22% 64% 74% 69% 61% 57% 55%
+N=110 18% 32% 21% 13% 11% 12% 28% 44% 32% 22% 19% 19% 8% 20% 10% 5% 4% 6% 29% 46% 33% 24% 22% 18%
+all acc depth 1 depth 2 depth 3 depth 4 depth 5 all acc depth 1 depth 2 depth 3 depth 4 depth 5 all acc depth 1 depth 2 depth 3 depth 4 depth 5 all acc depth 1 depth 2 depth 3 depth 4 depth 5
+8L512D 8L512D 8L512D 8L512D 8L512D 8L512D 8L768D 8L768D 8L768D 8L768D 8L768D 8L768D 12L512D 12L512D 12L512D 12L512D 12L512D 12L512D 12L768D 12L768D 12L768D 12L768D 12L768D 12L768D
+Task Brevo1 - Llama (ROPE) - Canon-ABCD(res)
+N=70 88% 92% 89% 87% 86%
+N=90 70% 79% 73% 68% 64% 62%
+N=110 41% 61% 46% 37% 33% 27%
+89% 91% 95%
+76% 83%
+59% 73%
+all acc depth 1
+8L512D 8L768D 8L768D
+all acc depth 1 depth 2 depth 3 depth 4 depth 5
+8L512D 8L512D 8L512D 8L512D 8L512D
+92% 90% 90% 100% 85% 87% 86% 84% 82% 81% 89% 91% 90% 87% 87% 84%
+78% 74% 71% 70% 51% 64% 56% 48% 44% 38% 72% 79% 75% 71% 68% 63%
+63% 55% 50% 50% 25% 43% 29% 19% 19% 14% 49% 66% 53% 45% 42% 36%
+depth 2 depth 3 depth 4 depth 5 all acc depth 1 depth 2 depth 3 depth 4 depth 5 all acc depth 1 depth 2 depth 3 depth 4 depth 5
+8L768D 8L768D 8L768D 8L768D 12L512D 12L512D 12L512D 12L512D 12L512D 12L512D 12L768D 12L768D 12L768D 12L768D 12L768D 12L768D
+Task Brevo1 - Llama (ROPE)
+Canon-ABCD (res)
+N=70 91% 94% 92% 91% 91% 89% 96% 97% 97% 96% 97% 95% 84% 86% 85% 82% 82% 83% 94% 95% 93% 94% 95% 94%
+N=90 81% 86% 82% 80% 79% 80% 91% 93% 91% 90% 89% 93% 63% 72% 65% 62% 56% 56% 84% 89% 85% 84% 83% 80%
+N=110 70% 78% 72% 67% 65% 65% 84% 90% 86% 85% 82% 83% 48% 66% 51% 45% 41% 35% 82% 88% 84% 82% 79% 75%
+all acc depth 1 depth 2 depth 3 depth 4 depth 5 all acc depth 1 depth 2 depth 3 depth 4 depth 5 all acc depth 1 depth 2 depth 3 depth 4 depth 5 all acc depth 1 depth 2 depth 3 depth 4 depth 5
+8L512D 8L512D 8L512D 8L512D 8L512D 8L512D 8L768D 8L768D 8L768D 8L768D 8L768D 8L768D 12L512D 12L512D 12L512D 12L512D 12L512D 12L512D 12L768D 12L768D 12L768D 12L768D 12L768D 12L768D
+Figure 9: Detailed accuracies for Task BREVO1, shown overall and stratified by dependency graph depths 1, 2, 3, 4, 5.
+
+challenging setup where each word spans 3-5 tokens11
+Canon-ABCD achieves near-perfect accuracy for k = 16.
+ROPE completely fails, whereas ROPE +
+These improvements may seem surprising at first. For associative recall (analogous to DEPO
+with k = 1), theory suggests a single Canon + attention layer suffices (recall Figure 5). By this
+reasoning, Canon layers might reduce the required number of attention layers by at most one. So,
+why do Canon layers yield a 2-4× improvement in reasoning depth?
+The explanation lies in learning dynamics. Deep reasoning tasks like DEPO unfold through a
+hierarchical learning process, where models first master simple 1-hop instances and then gradually
+progress to 2-hop, 3-hop, and beyond. This process relies heavily on two factors: (1) training data
+spanning a range of difficulty levels and (2) architectural support like residual connections. Without
+either e.g., training only with k = 8 data or removing residuals—the model can fails entirely.12
+Thus, architectures that enable faster mastery of 1- and 2-hop reasoning climb the hierarchy
+faster, as illustrated in Figure 8. ROPE + Canon-ABCD achieves deeper reasoning progression
+much faster than vanilla ROPE, leveraging the inherent easy-to-hard structure of multi-hop tasks.
+We emphasize again that this is not about performance under infinite training data-RoPE could
+eventually achieve similar accuracy on DEPO2(K = 16). However, RoPE + Canon achieves com-
+parable results with significantly fewer training steps, making it far more efficient.
+
+Task Brev. On reasoning breadth, we observe 30% improvement by introducing Canon-ABCD.
+Specifically, the accuracies of ROPE to solve BREVO1(N = 70) or BREVO2(N = 30) resemble the
+performance of RoPE+Canon to solve BREVO1(N = 90) or BREVO2(N = 40). Since input length
+11 DEPO2 is intentionally designed to make 4-token windows insufficient for resolving individual words or identifying
+key-value pairs, which spans 10-14 tokens, posing a substantial challenge for all architectures, including Canon layers.
+12 The first theory foundation for why deep learning can perform deep (hierarchical) learning was established by
+Allen-Zhu and Li [2] (in the 3-layer case) and Allen-Zhu and Li [4] (for w(1)-layer). They show that deep learning
+relies on easy-to-hard curricula and residual structures for progressively building complexity.
+
+14
+
+scales with N, this reflects roughly 30% increase in reasoning breath.
+To understand the source of this improvement, we analyze the accuracy across tasks stratified
+by depth of the dependency depth. Recall each query in BREVO requires the model to identify all
+vertices it recursively depends on, forming a sub-DAG of varying (minimum) depth. In Figure 9,
+we plot model accuracy not only overall but also separately for problem instaces spanning DAG
+depths of 1, 2, 3, 4, 5. The results show that vanilla RoPE struggles with instances involving greater
+DAG depth, whereas RoPE+Canon improves reasoning performance on deeper structures. This
+suggests that Canon-ABCD enhances localized reasoning paths within Transformer blocks, allowing
+for better handling of recursive dependency, which can be challenging for standard attention alone.
+
+Task Capo. On knowledge capacity, prior work [7] found that gated MLP layers in Llama(RoPE)
+reduce model capacity due to slower and less stable training dynamics. One remedy proposed
+in that work is to revert gated MLP back to standard MLP; however, this sacrifices reasoning
+capability (see Section 5.4). Here, we present an alternative solution: adding Canon layers. Canon
+layers improve training speed and increase the effective capacity by 10-15% in the controlled 100-
+exposure pretraining regime for CAPO. On a separate note, GPT2(RoPE) models that originally
+employ standard MLP exhibit no capacity loss after Canon layers are introduced (Figure 11).
+
+Task Mano. On knowledge manipulation, Canon layers increase manipulable length. RoPE+Canon
+matches the performance of vanilla RoPE on Mano(L = 10) when tested on Mano(L = 13), a 30%
+improvement in length. This again stems from Canon layers accelerating hierarchical learning,
+enabling the model to scale from simpler tasks (L = 1) to more complex ones (L = 2, L = 3, and
+beyond) faster. For simplicity, we omit the hierarchical learning speed visualization.
+
+Task Lano. Canon layers improve RoPE's performance on hierarchical language structure learn-
+ing, though interpreting the gains requires some algorithmic background. For context, dataset
+cfg3k adds one level of structural complexity above cfg3f, using the same CFG rule distribution
+(see Appendix A.5). RoPE+Canon outperforms standard RoPE on cfg3k, but still struggles to
+fully handle this increased complexity. This is expected, as deeper CFG structures increase se-
+quence length n by 2-3×, and parsing these CFGs with dynamic programming involves worst-case
+time complexity O(n³). Consequently, cfg3k poses arguably more than 8× greater computational
+challenge compared to cfg3f. Our intermediate dataset cfg3j has difficulty around 4×, suggesting
+ROPE+Canon can handle roughly twice as challenging structure-learning tasks comparing to ROPE.
+
+Summary. Canon layers consistently improve performance across reasoning, knowledge and lan-
+guage tasks, all without introducing instability or accuracy trade-offs.
+
+5.2 NoPE with Canon Layers
+Result 3 (Figure 7+10°). Canon layers transform NoPE. Key findings include:
+• NoPE+Canon matches RoPE+Canon and even surpasses it on DEPO; a remarkable result
+given that without Canon, NoPE achieves essentially zero performance on all measures.
+• NoPE+Canon significantly outperforms existing fixes for NoPE, such as ALiBi and H-Alibi.
+• With Canon layers, RoPE usage can be greatly reduced: RoPE on only 1/4 dims (denoted
+RoPE+Canon) outperforms both RoPE/NoPE+Canon, great news for length generalization.
+"(Sub-results correspond to Figure 7 (4th vs 5th column), Figure 10, and Figure 7 (3rd column), respectively.)
+
+Canon layers skyrocket NoPE performance. Canon layers dramatically improve NOPE (No
+Positional Embedding) transformers, lifting them from near-zero accuracy to competitive levels,
+
+15
+
+even slightly surpassing RoPE+Canon on reasoning depth. NoPE-Canon is only weaker on Task
+LANO, which involves hierarchical structural learning over long sequences, thus relying more heavily
+on relative distance between input tokens; yet even there NoPE-Canon remains competitive with
+alternatives such as Mamba2.
+
+Dominance over existing fixes on NoPE. While NoPE excels at length generalization, its
+performance on complex reasoning tasks has historically been weak. Fixes like ALiBi [43] and
+Hard-Alibi [29] partially address this: ALiBi applies a distance-based penalty to attention logits13,
+while Hard-Alibi disables attention beyond distance h for the h-th head. Although these methods
+improve NOPE performance (partly mimicking RoPE), Canon layers clearly dominate. As shown
+in Figure 10 (top), NoPE+Canon significantly outperforms both alternatives.
+
+Minimal RoPE usage with Canon layers. Canon layers eliminate the need for heavy ROPE
+usage, and excessive RoPE can even hurt performance. With Canons, minimal RoPE usage is
+sufficient often preferable for optimal results. For example, enabling RoPE on half of the heads
+at half of their dimensions (denoted Canon) consistently outperforms full RoPE usage or NoPE, as
+shown in Figure 7 (3rd column). This is great news for long-context researchers: ROPE is a
+known bottleneck for Transformers with longer inputs. As Canon layers allow significantly reduced
+ROPE without performance loss, they become indispensable for length generalization tasks.14
+
+Remark 5.1. Despite their versatility, Canon layers alone cannot fully resolve extremely challenging
+tasks that require deep hierarchical reasoning over long sequences (e.g., cfg3k in Task LANO). Such
+tasks, requiring O(n³) dynamic programming over 1000 tokens, remain computationally demanding.
+Nevertheless, Canon layers consistently offer huge improvements outside these specialized scenarios.
+
+All findings translate to real-life experiments. To be shown in Section 9, NOPE+Canon con-
+sistently matches or surpasses RoPE+Canon in real-world pretraining; the RoPE+Canon variants
+outperform RoPE+Canon on several reasoning tasks, particularly involving long-context inputs.
+
+Remark 5.2. This paper focuses on architectural differences within computational stages after
+relevant information is retrieved into manageable contexts (e.g., 4096 tokens). Techniques like
+DeepSeek's NSA architecture [72], designed for retrieval and compression from extremely long
+inputs (e.g., 1M tokens), are complementary to Canon layers. Such techniques and Canon layers
+can thus jointly handle distinct processing phases in long-context models.
+
+5.3
+Ablation Studies With Canon Layers
+This section systematically investigates the design choices in Canon layers via ablation studies.
+
+Component-level contributions. Each Canon component (A/B/C/D) contributes meaningfully
+to performance, with cumulative benefits from combinations. Adding even a single Canon layer
+yields notable gains, and stacking multiple Canon layers across sub-layers further amplifies these
+improvements, especially on weaker architectures like NoPE. Summaries appear in Figure 10 (for
+model size 12L768D) and additional size experiments in Appendix E.
+
+Independence of Attention/MLP. Prior works (e.g., the GLA codebase) focused solely on
+convolution-like operations within attention projections (Canon-B). However, we find that Canon-
+ACD alone already achieves substantial performance improvements, without modifying attention
+13 Specifically, adding -|ji|2-8h/H to the logits of head h of H total heads.
+14 Alternative reduced-RoPE configurations explored in the appendix include: 1/4) لـ of heads at full dimensions(
+and (all heads at 1/4 dimensions, as in GPT-NeoX [12]). Among these, yields slightly better performance
+according to Figure 21.
+
+16
+
+N-300
+N-300
+N-375
+83/99%
+N-225-NoRes 66/99%
+Task Depo1(K-8, k=8/4) Ablation study - Llama (NoPE)
+5/53%
+29/84% 85/100%
+100/100%
+N-225-Res-99/100% 99/100% 100/100% 98/100% 99/100% 62/97% 99/99% 76/98% 60/96%
+77/99% 53/97%
+99/100% 76/99% 98/100% 93/99% 85/90% 38/43% 71/96% 0/0%
+N-300
+N-375
+N-375
+68/99%
+100/100%
+94/100% 99/100% 99/100% 93/99% 86/91% 49/93% 88/99% 90/99% 60/93%
+0/0%
+5/49% 1/90%
+99/100% 82/99% 96/100% 66/98% 0/68% 23/85% 47/89% 0/0%
+99/100%
+96/100% 78/97% 97/100% 49/97% 43/75% 0/28% 53/94% 0/0%
+0/10%
+7/78%
+54/98% 93/99% 99/100% 89/99% 83/99% 52/94% 95/97% 55/93%
+Task Depo2(K=16, k=16/8) Ablation study Llama (NoPE)
+37/88%
+51/99% 1/825%
+Res-85/99%
+N-75-NoRes-34/95%
+100/100% 99/1
+73/99%
+25/
+94/100% 99/1
+10/91%
+N-100
+N-100
+N-125
+1/1% 80/97% 30/98% 25/97% 43/93% 78/98% 46/98% 0/0%
+90/100% 99/100% 71/98% 97/100% 36/99% 75/99%
+8/82%
+72/98% 41/99%
+1/1% 1/83% 2/78% 47/93% 5/95% 39/89% 29/87% 10%
+96/100% 99/100% 17/91% 98/100% 45/93% 17/93%
+30/97% 2/81%
+1/52%
+1/1%
+2/78% 68/97% 23/94% 68/90% 23/91% 0/0%
+99/100% 96/100% 90/99% 95/100% 2/92% 63/96% 12/93% 81/99%
+85/100%
+97/100%
+40/92%
+93/100% 59/81% 94/100%
+0/30%
+34/91%
+28/92%
+48/96%
+100/100% 97/100% 99/100%
+95/100% 70/97% 100/100%
+90/100% 6/99/16 98/100%
+Task Depol(K-8, k=8/4) Ablation study Llama (ROPE)
+96/100% 98/100% 97/100% 78/99% 19/94% 0/1%
+95/100% 25/43% 92/100% 0/98% 100/100%
+0/10%
+0/77% 98/
+4/97% 79/99%
+48/94%
+0/0% 0/23%
+68/95% 48/98% 81/99% 6/99% 0/99%
+0/13% 3/86%97/100% 89/99% 68/100% 0/13% 51/100% 3/61% 60/99%
+66/99%
+54/99% 98/100% 95/100%
+51/98% 89/99% 99/99% 51/95% 98/100% 0/40% 75/94%
+0/98%
+68/100%
+17/96%
+Canon-A
+Task Depo2(K=16, k=16/8) - Ablation study - Llama (ROPE)
+12/96%
+7/99%
+1/18% 9/97% 10/98% 75/99% 1/94% 30/99%
+82/98% 98/100% 99/100% 83/99%
+62/96%
+1/37% 58/98%
+35/93% 65/97% 19/94% 1/77% 2/99% 21/96%
+97/11 9/100% 98/100% 99/100% 99/100% 96/100% 96/100% 93/100%
+24/97%
+ABCD
+anon-ABCD
+ABCD
+97/100% 97/100% 99/100%
+1/81
+1/1%
+87/99% 98/100%
+1/1%
+1/58% 1/82% 1/9% 60/98% 1/97% 1/50%
+93/99% 96/100% 89/99% 93/99% 90/100% 66/99%
+98/100% 96/100% 99/100%
+54/%
+1/17%
+99/100%
+100% 99/100%
+N-100
+1/1%
+Task Brevol- Ablation study Llama (NoPE)
+92.5% 92.7%
+1.2%
+N-70-Act-Res-6.9%
+N=70-NoRes-84.5%
+82.0%
+N-70-Res-88.5% 95.3% 96.2% 94.6% 95.6% 61.6% 92.8% 90.5% 91.8%
+2.9%
+55.3% 84.7%
+N-90
+21.4%
+N=90-NoRes 45.6%
+88.6% 69.3% 90.9% 92.2% 93.4% 83.6% 84.4% 0.4%
+49.6%
+N-90 22.2% 89.0% 92.2% 85.6% 90.9% 51.0% 81.7% 79.4% 74.8%
+2.1%
+1.6%
+34.1% 49.1%
+70.0% 24.6% 72.9% 75.0% 76.8% 49.3% 58.1% 0.0%
+N-110
+N-110
+N=110-NoRes-58.3
+N-40-
+20.4%
+38.2% 14.2% 20.0% 40.6% 57.7% 31.3% 31.8% 0.1%
+50.7% 77.1% 84.9% 63.6% 83.0% 2.9% 67.3% 41.1% 40.5%
+nen-ABC
+son-ABCE
+anon-
+Task Brevo2 - Ablation study - Llama (NoPE)
+91.0%
+94.0% 93.7%
+N-30-Act-Res - 93.6%
+N=30-NoRes-89.3%
+90.0%
+N-30-Res-94.0% 95.4% 96.1% 95.4% 96.0% 93.2% 94.1% 93.7% 94.7%
+-Res-84.1%
+79.8%
+85.7% 84.8%
+N-40-NoRes-80.4%
+82.9%
+N-40-Res-87.0% 88.8% 91.7% 88.7% 91.6% 81.2% 86.3% 86.7% 84.3%
+64.2%
+N=50-Act-Res-75.0%
+73.0% 75.6%
+N-50-NoRes-66.3%
+N-50-Res-75.9% 76.0% 79.9% 75.7% 85.2% 50.4% 68.0% 74.0% 76.9%
+93.6% 87.7% 92.0% 92.5% 93.8% 93.4% 88.4% 0.0%
+Canon-A
+55.7%
+ABCD
+Canon-
+81.9% 70.0% 88.4% 84.7% 85.5% 84.8% 80.4% 0.0%
+68.7% 19.4% 72.4% 71.8% 75.0% 72.9% 63.5% 0.0%
+Alith
+Task Brevol - Ablation study - Llama (ROPE)
+N-70-Act-Res-87.1%
+88.9%
+90.8% 87.9%
+N-70-NoRes-92.7%
+85.0%
+84.9% 90.1% 92.7% 93.0% 92.4% 88.5%
+N=70-Res-89.8% 92.3% 91.3% 91.3% 92.4% 85.9% 93.7% 91.7% 91.4%
+69.2%
+72.2% 71.2%
+65.8% 70.4% 77.7% 80.5% 79.6% 63.1%
+N-90
+N-110
+68.0%
+54.7%
+N-90-NoRes - 81.4%
+N-90
+67.1% 67.6% 75.7% 76.8% 87.8% 57.2% 72.5% 71.2% 63.8%
+41.0%
+49.6% 54.7%
+43.5% 51.0% 66.5% 57.5% 65.9% 27.5%
+49.9% 36.2%
+N=110-NoRes 63.3%
+N-110-
+N-30
+99/100% 93/100% 100/1
+N=30
+39.8%
+n-ABCD
+Canon
+L-10
+Task Mano - Ablation study - Llama (NOPE)
+39.4% 52.1%
+93.3%
+-Res-55.9%
+L=10-NoRes-95.8%
+97.5%
+L-10-Res-90.3% 98.6% 99.3% 98.3% 99.3% 95.6% 99.2% 78.2% 61.2%
+29.5%
+7.6% 25.5%
+13
+24.0%
+L=13-NoRes-56.2%
+94.4% 97.1% 99.2% 28.3% 11.6% 98.8% 99.2% 6.9%
+87.7%
+L-13 66.3% 93.1% 98.1% 97.1% 98.7% 70.8% 98.1% 30.1% 15.8%
+30.3%
+29.7%
+7.6% 7.9%
+84.9% 73.0% 96.7% 33.7% 7.5% 98.4% 98.4% 7.1%
+L-16
+L=16-NoRes
+L-16
+81.2%
+27.5% 48.3% 93.8% 7.6% 7.5% 72.8% 97.6% 7.3%
+29.0% 93.3% 94.3% 90.9% 96.8% 80.5% 72.1% 19.5% 7.8%
+Canont Canon D
+Task Lano Ablation study Llama (NoPE)
+92.2% 89.1%
+77.3%
+cfg3f
+-Res-77.5%
+cfg3f-NoRes -73.9%
+68.9%
+cfg3f-Res-82.9% 91.1% 92.5% 90.6% 93.1% 82.7% 89.7% 90.9% 91.2%
+59.0%
+71.6% 76.6%
+cfg3j-Act
+50.7%
+cfg3j- Nol 29.8%
+cfg3j
+cfg3k-Act-Res
+cfg3k - NoRes -18.3%
+cfg3k
+12.0%
+67.9% 85.1% 86.2% 79.3% 81.3% 78.3% 8.0% 38.8%
+17.3% 54.1% 56.3% 55.3% 69.3% 54.1% 6.8% 0.0%
+64.2% 78.7% 78.3% 76.7% 82.3% 65.2% 72.7% 76.4% 70.5%
+57.6% 50.6%
+18.1%
+9.4% 28.7% 26.3% 36.0% 37.6% 23.6% 5.2% 0.0%
+41.8% 54.1% 53.1% 54.0% 51.2% 41. 42.3% 52.7% 57.8%
+-ABC
+L-10-Act-Res-99.0%
+ABCD
+Canon
+Task Mano - Ablation study Llama (ROPE)
+91.8%
+77.7% 83.8%
+L-10-NoRes-92.1%
+97.9%
+L=10-Res-96.7% 97.7% 99.5% 95.8% 97.6% 97.5% 98.6% 83.3% 90.3%
+69.5%
+80.7% 66.4%
+53.7% 79.4% 95.7% 32.9% 45.6% 46.5%
+94.5% 85.9% 98.6% 88.9% 50.3% 85.2%
+96.5% 96.3% 96.1%
+L-13-Act-Res -85.3%
+NoRes-69.7%
+90.7% 91.1% 91.5%
+L-16-Act
+84.5% 84.7% 79.7%
+original
+Canon-ABCD
+Canon-ABCD
+WCanon ABCD
+47.7%
+95.8%
+L-13-Res-83.8% 97.5% 98.8% 88.6% 98.0% 90.3% 87.7% 75.9% 77.6%
+35.2%
+47.9% 58.3%
+40.1% 27.4% 78.0% 18.2% 26.9% 41.6%
+83.2%
+79.8%
+53.5%
+L=16-NoRes-57.8%
+L-16-
+88
+Canon-ABC
+Canon-ABCD
+99.6% 99.7% 99.6%
+99.2% 99.1% 96.3%
+85.3% 97.9% 88.0%
+original
+Canon-ABCD
+Canon-ABCD
+Canon ABCD
+N-50
+96.3%
+N-30-NoRes-93.0%
+Task Brevo2 - Ablation study - Llama (ROPE)
+95.3%
+96.6% 95.1%
+84.7%
+96.3 95.7% 95.4% 96.5% 97.0% 94.6% 95.9% 96.5% 95.9%
+91.1%
+88.0%
+91.4% 91.9%
+77.0% 81.8% 83.7% 91.9% 88.0% 88.0%
+89.6% 91.0% 92.6% 95.0% 94.4% 96.0%
+N-40-NoRes-89.1%
+73.7%
+N=40-Res-91 89.8% 90.5% 91.8% 92.6% 87.0% 92.2% 90.6% 92.9%
+77.3%
+86.0% 84.8%
+62.5% 65.6% 78.3% 84.0% 80.4% 81.4%
+-Res-88.7%
+N-50-NoRes - 81.7%
+67.9%
+N=50-Res 82.3% 82.5% 87.8% 87.2% 88.7% 77.8% 84.5% 83.1% 85.7%
+Canon-ABCD
+Canon-AC
+Canos-ACD
+Canon-B
+Canon-BD
+Canen-C
+Canon-D
+original
+97.1% 96.3% 97.3%
+93.5% 89.2% 95.5%
+88.1% 85.9% 91.7%
+Canen-ABCD
+Canon-ABCD
+Canon ABCD
+Task Lano - Ablation study - Llama (ROPE)
+97.6%
+98.1% 97.8%
+cfg3f-Act-Res-97.7%
+cfg3f-NoRes-93.6%
+cfg3f-Res-97.5% 97.7% 98.3% 98.2% 98.5% 97.5% 97.9% 97.8% 97.5%
+cfg3j-Act-Res-92.9%
+92.4%
+93.8% 91.1%
+cfg3j-NoRes-64.0%
+55.0%
+cfg3j-Res-92.4% 94.9% 94.3% 95.1% 93.4% 94.2% 93.3% 93.4% 92.5%
+cfg3k- Res-87.0%
+84.8%
+87.4% 83.3%
+23.9%
+43.4% 53.0% 53.1% 72.5% 73.2% 79.1%
+cfg3k - NoRes 42.4%
+83.1% 84.7% 95.7% 94.8% 95.1% 95.9% 97.6%
+63.6% 80.3% 82.7% 88.4% 87.7% 90.3%
+cfg3k-Res -87.5% 89.8% 86.7% 86.3% 84.7% 89.8% 85.2% 85.1% 85.8%
+Canon-
+Canon-ABC
+Canon-ABCD
+Canon-AC
+98.1% 97.6% 97.5%
+92.6% 91.5% 93.3%
+Figure 10: Ablation study on 12-layer, 768-dim Transformers (NoPE top, ROPE bottom) with Canon variants (A-D),
+Canon-B
+Canon-D
+original
+78.9% 81.1% 84.5%
+Canon-ABCD
+Canon ABCD
+Canon-ABCD
+residual links, activation functions, ALiBi, and Hard-ALiBi. Blank entries indicate untested configurations
+due to resource constraints; results for additional model sizes appear in Figure 24-25 of Appendix E.
+
+mechanisms. Similarly, Canon-ABC or even Canon-AC perform strongly without adjusting MLP
+layers. This highlights Canon layers' general role in enhancing horizontal information flow across
+architecture sub-layers, independently complementing attention or MLP mechanisms.
+
+Role of residual connections. Residual links around Canon layers — i.e., the “ht+” part of (4.1)
+are critical for training stability and effective learning, preserving vertical computational path-
+ways and allowing global representations to selectively incorporate local context. Without residual
+connections, training becomes slower and less stable (see rows marked "NoRes" in Figure 10).
+
+Nonlinear activations and computational simplicity. Contrary to prior works (e.g., H3/Mamba),
+adding activation functions such as SiLU after the Canon layers does not yield noticeable benefits.
+Canon layers effectively inject local context directly into token positions, and nonlinear operations
+are sufficiently handled by the attention and MLP blocks (see rows marked "Act" in Figure 10).
+
+Result 4 (Figure 10). Canon layers are lightweight, versatile, and effective enhancements that
+integrate seamlessly into Transformers. Key findings:
+• Canon-A/B/C/D yield meaningful, cumulative improvements when stacked, and can be flex-
+ibly applied anywhere independent of attention or MLP modifications.
+• Residual connections in Canon design are essential for stable, efficient training.
+• Adding nonlinear activations (e.g., SiLU) provide no measurable benefit, simplifying design.
+
+5.4 MLP and Mixture-of-Experts
+Our synthetic playground provides a valuable framework to evaluate broader architectural choices.
+
+Gated vs. standard MLPs. Gated MLPs [53], which replace standard MLP operations Vo(Wx)
+by V(σ(W₁x)· (W2x)), improve expressiveness and parameter efficiency. Widely adopted by large-
+scale models (e.g., PaLM [15], Llama [59, 60], Mistral [31]), gated MLPs have become standard
+
+17
+
+learned knowledge (bits)
+107
+learned knowledge (bits)
+107
+200
+106
+108.
+Task Capo - Llama (ROPE) - original
+2 bit / param
+1 bit / param
+0.5 bit/param
+0.25 bit / param
+107
+N=2000000
+N=1000000
+N=500000
+N=200000
+N=100000
+N=50000
+108
+model size (#params)
+Task Capo - Llama (ROPE) - Canon-ABCD(res)
+108
+2 bit / param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+N=2000000
+N=1000000
+N=500000
+100/
+N=200000
+N=100000
+N=50000
+106
+107
+108
+model size (#params)
+learned knowledge (bits)
+107
+learned knowledge (bits)
+106
+106
+108
+Task Capo - GPT2(ROPE) - original
+2 bit / param
+1 bit / param
+0.5 bit/param
+0.25 bit/param
+107
+N=2000000
+N=1000000
+N=500000
+N=200000
+N=100000
+N=50000
+108
+model size (#params)
+Task Capo - GPT2(ROPE) - Canon-ABCD(res)
+2 bit/param
+1 bit/param
+108
+0.5 bit / param
+0.25 bit / param
+106
+107
+N=2000000
+N=1000000
+N=500000
+N=200000
+N=100000
+N=50000
+108
+learned knowledge (bits)
+108
+107
+106
+106
+Task Capo - 32-MoE - Llama (ROPE)
+2 bit / param
+1 bit / param
+0.5 bit/param
+0.25 bit/param
+N=2000000
+N=1000000
+N=500000
+N=200000
+N=100000
+N=50000
+107
+108
+model size (#params)
+Task Capo - 32-MoE - Llama (RoPE) + Canon-ABC(r)
+learned knowledge (bits)
+108
+2 bit / param
+1 bit / param
+0.5 bit/param
+0.25 bit/param
+N=2000000
+N=1000000
+N=500000
+N=200000
+N=100000
+106
+N=50000
+100
+107
+108
+model size (#params)
+model size (#params)
+Figure 11: Evaluation of knowledge capacity (CAPO) across architectures, measured as bits per parameter. The first
+row represents baseline models, while the second row shows improvements with Canon layers added.
+Conclusion: Canon layers enhance knowledge storage for architectures that are slower to train, such as
+gated MLP and MoE, partially mitigating the gap between gated and standard MLP as identified in [7].
+
+design choices. However, [7] found that gated MLP reduces knowledge capacity by about 30% in
+limited-exposure scenarios (e.g., 100-exposure Task CAPO) due to slower convergence.
+Thus, what is the best tradeoff? Our experiments (Figure 20) confirm gated MLP's advantages
+over standard MLP (“GPT2-style”) on reasoning-heavy benchmarks, showing substantial improve-
+ments on knowledge manipulation (MANO) and smaller yet consistent gains on reasoning breadth
+(BREVO). Thus, replacing gated MLP with standard MLP may not be the best choice. However,
+keep in mind that adding Canon layers already partially mitigates gated MLP's capacity loss (recall
+Result 2), due to improving training dynamics and speed, recovering about half of its lost capacity.
+
+Mixture-of-Experts. Mixture-of-Experts (MOE) [21, 54] enhances parameter efficiency by re-
+placing dense MLPs with multiple parallel "experts," selectively routing tokens to fewer active
+experts. While MoE achieves good scalability (particularly on knowledge capacity) and compet-
+itive inference-time performance, it suffers from significantly slower knowledge acquisition speed
+during training. For example, a 32-expert transformer may acquire 10× less knowledge in the same
+100-exposure regime (mimicking rare knowledge) compared to dense models (Figure 11). Could
+Canon layers mitigate this due to their improved training dynamics?
+Integrating Canon layers with MoE, however, poses a challenge. Canon-D relies on neighboring
+tokens' hidden states, conflicting with MoE's independent token-wise expert dispatching. Adapting
+Canon-D to MoE would require complex engineering. To avoid such complexity, we test Canon-
+ABC layers alone, which already significantly accelerate MoE knowledge acquisition and improve
+bit-per-parameter efficiency (Figure 11), recovering at least half of the MoE-induced capacity loss.
+
+Result 5 (Figure 11+20). Key insights for MLP and MoE architectures:
+• Gated MLP demonstrates modest gains over standard MLP in in-context reasoning (BREVO)
+and substantial improvement in knowledge manipulation (MANO).
+• Gated MLP reduces knowledge capacity (CAPO); Canon layers partially mitigate this loss.
+• Canon-ABC significantly improves MoE knowledge acquisition and bit-per-param capacity.
+
+18
+
+Task Depo1(K=4, k=4/2)
+GLA - original
+N=225
+1/16% 0/18% 0/10% 2/30%
+N=300 0/5% 0/5% 0/7% 0/15%
+N=375 0/0% 0/3% 0/2% 0/8%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+GLA original
+2/14%
+1/1% 2/19% 1/18%
+1/2%
+1/2% 1/13%
+8L768D 12L512D 12L768D
+N=75 1/1% 1/3% 3/13%
+N=100-2/10%
+N=125-1/10%
+8L512D
+Task Brevol
+GLA - original
+N=70-4.7%
+4.7% 4.1% 24.9%
+N=90-0.9% 0.8% 1.7% 1.0%
+N=110-0.2% 0.6% 0.9% 1.3%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+GLA - original
+Task Depo1(K=4, k=4/2)
+GLA - Canon-ABCD(res)
+N-225-16/72% 25/74% 62/93% 58/93%
+N-300-6/32% 10/49% 12/51% 41/83%
+N=375-8/38% 3/26% 11/52% 12/55%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+GLA - Canon-ABCD(res)
+N=75-47/79%
+N=10023/53%
+54/81% 82/95% 73/92%
+36/85% 53/89% 39/82%
+N=125 14/46% 9/29% 57/85% 46/77%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Task Depo1(K=4, k=4/2)
+GLA - convid
+0/0% 0/1% 0/1% 0/15%
+0/0% 0/0% 0/0% 0/2%
+N=375-0/2% 0/1% 0/0% 0/0%
+N=225
+N=300
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+GLA conv1d
+N=75 1/7% 1/1% 2/19% 1/3%
+N=1001/5% 1/1% 1/2% 1/10%
+N=125 1/1% 1/1% 2/14% 1/3%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+GLA conv1d
+GLA - Canon-ABCD (res)
+N=7093.8% 93.6% 95.7% 97.2% N=70-0.5% 0.8% 2.7% 2.6%
+N=90-63.5% 83.5% 91.1% 88.4% N=90-0.0% 0.0% 0.4% 2.8%
+N=110-49.6% 55.9% 59.5% 72.1% N=110 -0.1% 0.0% 0.4% 0.9%
+8L512D 8L768D 12L512D 12L768D
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+GLA - Canon-ABCD(res)
+Task Brevo2
+GLA conv1d
+N=30-13.4% 38.6% 19.8% 54.9% N=30-80.5% 86.8% 90.8% 91.8% N=30
+N=40
+N=40 2.1% 22.2% 2.1% 7.3%
+N=50-0.8% 1.4% 3.4% 1.4%
+8L512D 8L768D 12L512D 12L768D
+Task Mano
+GLA - original
+Task Mano
+GLA - Canon-ABCD(res)
+3.1% 0.4% 31.2% 45.6%
+0.3% 0.1% 1.3% 40.9%
+N=40-59.3% 70.7% 28.3% 85.9%
+N=50-20.0% 0.9% 32.6% 41.0% N=50-0.3% 0.2% 1.1% 1.9%
+8L512D 8L768D 12L512D 12L768D
+Task Mano
+GLA - conv1d
+8L512D 8L768D 12L512D 12L768D
+learned knowledge (bits)
+8L512D 8L768D 12L512D 12L768D
+Task Capo - GLA - original
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+8L512D
+8L768D 12L512D 12L768D
+Task Capo GLA-Canon-ABCD(res)
+8L512D 8L768D 12L512D 12L768D
+Task Capo Mamba2 noconvld
+8L512D 8L768D 12L512D 12L768D
+Task Depo1(K=4, k=4/2)
+Mamba2 noconv1d
+N-225-2/26% 5/33% 1/43% 8/45%
+N-3000/9% 1/14% 1/14% 1/18%
+N=375 0/10% 1/9% 0/10% 1/16%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+Mamba2 noconv1d
+N=75-12/65% 14/60% 16/72% 17/83%
+N=100-3/27% 1/7% 1/21% 4/27%
+N=125-7/35% 20/50% 3/20% 4/40%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Mamba2 noconvld
+N=70 0.3% 1.0% 0.6% 0.5%
+N=90-0.1% 0.5% 0.6% 0.5%
+N=110 0.3% 0.3% 0.1% 0.4%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Mamba2 noconv1d
+N=30-8.1% 57.8% 28.5% 44.9%
+N=40-1.9% 10.6% 1.6% 44.2%
+N=50 0.2% 3.3% 0.7% 3.2%
+8L512D 8L768D 12L512D 12L768D
+Task Mano
+Mamba2 noconv1d
+L=10-56.6% 51.6% 74.5% 61.7% L=10 9.2% 7.4% 7.7% 13.2%
+L=13-26.5% 58.0% 34.5% 41.5% L=13 7.4% 8.5% 7.4% 7.2%
+L=16-23.5% 50.3% 46.2% 17.5% L=16 7.4% 7.3% 7.3% 7.5%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+GLA original
+cfg3f- 23.9% 40.1% 46.7% 74.6%
+10
+model size (#params)
+Task Lano
+GLA - Canon-ABCD (res)
+cfg3f 88.0% 90.6% 89.5% 93.3%
+cfg3j- 3.3% 6.6% 2.5% 13.8% cfg3j 70.3% 82.1% 72.9% 81.9%
+cfg3k 9.9% 17.1% 9.5% 16.9% cfg3k 44.9% 63.1% 52.8% 71.0%
+8L512D 8L768D 12L512D 12L768D
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+GLA conv1d
+10
+model size (#params)
+Task Lano
+Mamba2 noconvld
+44.8%
+33.1% 56.6% 41.7%
+cfg3f 81.8% 90.2% 83.8% 92.0% cfg3f
+cfg3j-45.6% 75.8% 58.7% 81.0% cfg3j- 2.1% 5.2% 2.5% 8.1%
+cfg3k 34.8% 53.2% 39.6% 63.7% cfg3k 11.0% 12.8% 12.5% 12.5%
+8L512D 8L768D 12L512D 12L768D
+10
+model size (#params)
+Task Capo Mamba2 original(conv1d)
+(sala)
+N-2000000
+N=1000000
+N-500000
+N=200000
+N-1000
+N-50000
+learned knowledge (bit
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+N-2000000
+N=1000000
+N-500000
+N=200000
+N=100000
+N-50000
+learned knowledge (bits)
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+N-2000000
+N=1000000
+N-500000
+N=200000
+N-100000
+N-50000
+learned know
+10
+model size (#params)
+Task Depo1(K=4, k=4/2)
+Mamba2 original (conv1d)
+N-225-20/70% 47/90% 9/76% 20/57%
+N-300-9/42% 5/41% 3/50% 3/33%
+N=375-2/16% 12/41% 3/28% 2/33%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+Mamba2 original (conv1d)
+N=75 75/95%
+N=100-55/85%
+N=125-46/83%
+91/98% 74/95% 90/98%
+86/97% 57/90% 86/97%
+69/91% 41/81% 67/91%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Mamba2 original (conv1d)
+N=70-17.0% 40.1% 71.4% 56.5%
+N=90-11.5% 87.2% 48.1% 24.2%
+N=110- 2.9% 8.5% 10.8% 26.2%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Mamba2 - original (conv1d)
+N=3093.5% 92.8% 86.3% 50.4%
+N=40-66.6% 80.9% 46.4% 4.8%
+N=50-17.8% 0.6% 22.3% 2.7%
+8L512D 8L768D 12L512D 12L768D
+Task Mano
+Mamba2 original (conv1d)
+L=1091.4% 97.1% 96.3% 98.8%
+L=1381.5% 95.3% 87.9% 88.0%
+L=16-52.8% 64.5% 69.9% 94.0%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Mamba2 original (conv1d)
+cfg3f88.2% 93.5% 91.1% 94.1%
+cfg3j69.1% 82.2% 78.2% 84.2%
+cfg3k 43.3% 65.3% 50.9% 70.3%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Mamba2 - original (conv1d)
+cfg3f88.2% 93.5% 91.1% 94.1%
+cfg3j69.1% 82.2% 78.2% 84.2%
+cfg3k 43.3% 65.3% 50.9% 70.3%
+8L512D 8L768D 12L512D 12L768D
+Figure 12: Columns 1, 2, 3, 5: Canon drastically improves GLA, making it comparable to Mamba2 (Result 6+7).
+Columns 1, 4, 5: Removing convid reduces Mamba2's performance back to match GLA (Result 8).
+Remark. Synthetic results here predict similar trends in real-life experiments (Result 12 and Figure 17).
+
+6 When Linear Attention Meets Canon
+
+Linear attention models have gained attention for their scalability and efficient handling of long
+contexts. Here, we examine Canon layers integrated into Gated Linear Attention (GLA).
+GLA, like most linear attention models, compresses past tokens via a (gated) averaging mecha-
+nism. While highly efficient, gated averaging often diminishes the influence of nearby tokens crucial
+for nearly all tasks. Canon layers explicitly introduce horizontal localized context flow, addressing
+this limitation and significantly enhancing reasoning.
+
+As shown in Figure 12, integrating Canon-ABCD layers substantially improves GLA perfor-
+mance across all benchmarks, transforming it from a weak baseline into a strong competitor.
+Despite its simpler design, GLA+Canon matches and sometimes exceeds Mamba2. Specifi-
+cally, GLA+Canon significantly surpasses Mamba2 on reasoning breadth (BREVO1) and trails only
+slightly on knowledge manipulation. Our later Section 9 further confirms this upward trajectory in
+real-world academic-scale pretraining, across essentially all standard evaluation metrics.
+
+Result 6 (Figure 12). Adding Canon layers:
+• Skyrockets performance: GLA dramatically improves, increasing reasoning depth from 1-hop
+to 4-hop, doubling reasoning breadth, and gaining over 2× in knowledge manipulation length.
+• GLA matches or surpasses Mamba2: Despite GLA's simpler design, these enhancements bring
+it on par or better compared to Mamba2, significantly surpassing it on task BREVO1.
+
+19
+
+Task Depo1(K=4, k=4/2)
+Mamba2(mlp) - noconv1d
+Task Depo1(K=4, k=4/2)
+Mamba2 original (conv1d)
+Task Depo1(K=4, k=4/2)
+Mamba2 - Canon-AB (no-res)
+N=300
+N-225-20/70% 47/90% 9/76%
+9/42% 5/41% 3/50%
+N=375 2/16% 12/41% 3/28% 2/33%
+20/57%
+3/33%
+N-225-5/49%
+N-300-1/34%
+N=375-1/14%
+6/53% 29/77% 6/60%
+N-2250/18%
+1/22% 3/33% 2/29%
+N-300-1/12%
+0/12% 1/30% 1/17%
+N=375-0/5%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+Mamba2 - original (conv1d)
+N=75 75/95% 91/98% 74/95% 90/98%
+N=10055/85% 86/97% 57/90% 86/97%
+N=125-46/83% 69/91% 41/81% 67/91%
+8L768D 12L512D 12L768D
+8L512D
+Task Brevol
+Mamba2 - original (conv1d)
+N=70-17.0% 40.1% 71.4% 56.5%
+N=90-11.5% 87.2% 48.1% 24.2%
+N=110 -2.9% 8.5% 10.8% 26.2%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Mamba2 - original (conv1d)
+N=3093.5% 92.8% 86.3% 50.4%
+N=40-66.6% 80.9% 46.4% 4.8%
+N=50-17.8% 0.6% 22.3% 2.7%
+8L512D 8L768D 12L512D 12L768D
+Task Mano
+Mamba2 original (conv1d)
+L=1091.4% 97.1% 96.3% 98.8%
+L=1381.5% 95.3% 87.9% 88.0%
+L=16-52.8% 64.5% 69.9% 94.0%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Mamba2 original (conv1d)
+cfg3f88.2% 93.5% 91.1% 94.1%
+cfg3j- 69.1% 82.2% 78.2% 84.2%
+cfg3k 43.3% 65.3% 50.9% 70.3%
+8L512D 8L768D 12L512D 12L768D
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+Mamba2 - Canon-AB (no-res)
+N=75-67/96% 90/99% 79/96% 85/97%
+N=100-42/85% 53/91% 56/90% 50/85%
+N=125- 30/76% 68/93% 23/77% 32/80%
+8L768D 12L512D 12L768D
+8L512D
+Task Brevol
+Mamba2 - Canon-AB (no-res)
+N=70-76.5% 81.2% 79.4% 90.5%
+N=90-66.7% 59.2% 64.1% 83.1%
+N=110- 23.8% 23.7% 46.0% 68.4%
+8L512D 8L768D 12L512D 12L768D
+N=75
+1/17% 1/19% 1/27%
+1/17% 0/13% 1/13%
+0/7% 0/8% 0/9%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+Mamba2(mlp) - noconv1d
+2/9% 3/23% 2/25% 8/46%
+N=100-1/4% 15/54% 1/3% 1/9%
+N=125 1/8% 2/27% 1/3% 1/10%
+8L512D
+8L768D 12L512D 12L768D
+Task Brevol
+Mamba2(mlp) - noconv1d
+N=70-0.3% 0.3% 0.4% 0.5%
+N=90 -0.3% 0.1% 0.5% 0.2%
+N=110 -0.2% 0.0% 0.2% 0.3%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Mamba2(mlp) - noconv1d
+Task Brevo2
+Mamba2 Canon-AB (no-res)
+N=30-94.1% 96.1% 95.0% 97.2% N=30 8.2% 39.1% 3.7% 31.0%
+N=4080.2% 88.3% 68.3% 79.1% N=40 0.6% 12.6% 1.2% 10.8%
+N=50-63.9% 70.2% 55.9% 35.1% N=50-0.4% 1.3% 0.9% 1.8%
+8L512D 8L768D 12L512D 12L768D
+Task Mano
+Mamba2 - Canon-AB(no-res)
+L=1098.9% 99.3% 99.6% 99.5%
+L=1398.9% 99.3% 99.3% 99.2%
+L=1698.6% 99.2% 99.0% 98.8%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Mamba2 - Canon-AB(no-res)
+cfg3f83.9% 90.6% 85.9% 86.4%
+cfg3j- 63.9% 77.8% 73.1% 68.9%
+cfg3k 46.4% 57.4% 46.1% 51.9%
+8L512D 8L768D 12L512D 12L768D
+8L512D 8L768D 12L512D 12L768D
+Task Mano
+Mamba2(mlp) - noconv1d
+L=10-73.7% 78.8% 68.2% 66.9%
+L=13-71.1% 62.3% 51.1% 47.5%
+L=16-31.2% 28.4% 28.6% 37.2%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Mamba2(mlp) - noconv1d
+cfg3f-42.0% 47.7% 28.5% 40.3%
+cfg3j- 2.6% 9.9% 5.0% 5.9%
+cfg3k 9.6% 17.8% 12.3% 9.2%
+Task Depo1(K=4, k=4/2)
+Mamba2(mlp) original (conv1d)
+N-225-12/65% 29/67% 24/74% 43/84%
+N-300-4/35% 12/46% 13/62% 13/61%
+N=375-1/22% 13/56% 7/33% 10/42%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+Mamba2(mlp) original (conv1d)
+N=75-18/61% 80/95% 30/86% 69/89%
+N=100-17/63% 47/83% 17/55% 42/82%
+N=125- 5/39% 46/85% 10/41% 24/75%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Mamba2(mlp) original (conv1d)
+N=70-3.7% 80.1% 50.1% 72.4%
+N=90-0.3% 0.5% 3.8% 4.8%
+N=110 0.1% 0.0% 1.1% 1.2%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Mamba2(mlp) - original (conv1d)
+N=30-50.8% 95.6% 68.1% 3.4%
+N=40-12.5% 67.0% 14.5% 0.5%
+N=50 3.3% 12.4% 4.0% 0.5%
+8L512D 8L768D 12L512D 12L768D
+Task Mano
+Mamba2(mlp) original (conv1d)
+L=10 96.5% 95.1% 95.2% 95.7%
+L=13-79.9% 84.8% 88.0% 91.8%
+L=16-74.4% 90.1% 72.3% 87.4%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+8L512D 8L768D 12L512D 12L768D
+Mamba2(mlp) - original (conv1d)
+cfg3f83.8% 92.2% 86.8% 92.2%
+cfg3j45.5% 72.0% 54.2% 74.3%
+cfg3k- 32.7% 50.0% 35.3% 46.1%
+8L512D 8L768D 12L512D 12L768D
+Task Depo1(K=4, k=4/2)
+Mamba2(mlp) - Canon-ABCD (no-res)
+N-225-40/79% 6/76% 18/67% 36/74%
+N-300-10/49% 5/52% 2/28% 2/79%
+N=375-1/23% 1/28% 1/18% 1/42%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+Mamba2(mlp) - Canon-ABCD(no-res)
+N=7586/96% 91/99% 92/98% 74/95%
+N=10062/95% 67/97% 44/91% 74/97%
+N=125-37/73% 66/88% 53/90% 53/90%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Mamba2(mlp) - Canon-ABCD(no-res)
+N=70-70.6% 64.7% 65.0% 87.8%
+N=90-5.7% 21.2% 13.0% 55.1%
+N=110 - 2.1% 0.4% 8.7% 41.1%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Mamba2(mlp) - Canon-ABCD(no-res)
+N=3083.7% 85.2% 65.6% 94.1%
+N=40-52.6% 34.1% 15.6% 84.2%
+N=50-13.2% 10.2% 14.0% 53.1%
+8L512D 8L768D 12L512D 12L768D
+Task Mano
+Mamba2(mlp) - Canon-ABCD(no-res)
+L=1099.2% 99.2% 98.4% 99.4%
+L=1398.1% 98.9% 98.2% 98.4%
+L=1693.1% 97.2% 95.4% 98.0%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Mamba2(mlp) - Canon-ABCD(no-res)
+cfg3f73.8% 85.7% 77.9% 81.5%
+cfg3j 38.2% 60.2% 41.8% 64.3%
+cfg3k- 32.9% 41.4% 33.5% 41.3%
+8L512D 8L768D 12L512D 12L768D
+Figure 13: Mamba and Mamba(mlp) architectures without conv1d, with conv1d (original), and with full-score Canon.
+Note: Mamba - noconvld and Mamba(mlp) - noconvld perform similarly poorly (Figure 12).
+
+Following GLA's original publication, its authors introduced a conv1d-based enhancement
+corresponding roughly to a partial Canon-B implementation with activation but without residual
+connections. Our ablation study (Figure 12+22) reveals minimal benefit of this variant: it yields
+no improvement on reasoning tasks (DEPO, BREVO), slightly worsens knowledge manipulation
+(MANO), and only moderately improves structural reasoning (LANO). By contrast, the full Canon-
+ABCD configuration consistently and significantly enhances performance on all these tasks. For
+clarity, when Canon layers are enabled in GLA, its built-in conv1d is disabled.
+
+This highlights that merely altering attention projections (i.e. Canon-B alone) is insufficient.
+Instead, fully integrating localized composition across all sub-layers (Canon-ABCD) is essential for
+unlocking GLA's potential. To further confirm robustness, we evaluated a variant of GLA with a
+1+elu(x) feature map instead of the identity map. Canon layers produced similarly strong improve-
+ments here, illustrating their broad, architecture-agnostic applicability across different feature-map
+choices in linear attention models.
+
+Result 7 (Figure 12+22). Residual links are essential for Canon layers in GLA. Partial Canon-B
+implementations (e.g., conv1d without residuals) provide limited gains. Full Canon-ABCD with
+residuals can unlock GLA's performance across all tasks, even with non-linear feature maps.
+
+7 When Mamba Meets Canon
+While Mamba2 is widely recognized as a state-space model (SSM), it quietly incorporates an auxil-
+iary non-linear conv1d operation in each SSM block.15 This conv1d mechanism, first introduced in
+the H3 model [22] as shift-SSM, effectively acts as a partial Canon-B layer: it performs horizontal
+mixing on selected coordinates, includes non-linear activation, and omits residual connections.
+15 Mambal includes this as well, but since Mamba2 consistently outperforms it, we only report Mamba2 results.
+
+20
+
+Surprisingly, this built-in conv1d plays a central role in Mamba2's performance, often surpass-
+ing the impact of its SSM design. Disabling it sharply degrades performance, reducing Mamba2
+to levels comparable to GLA on both synthetic tasks (see Figure 12 for Mamba2, Figure 13 for
+Mamba2(mlp)) and real-world datasets (see Section 9). This raises a question: is Mamba2's
+strength primarily due to the Canon-like conv1d rather than its state-space formulation?
+
+To isolate the contributions clearly, we replaced Mamba2's conv1d layer with Canon layers:
+• For Mamba2, we use Canon-AB as the full-score configuration: Canon-A is placed before the
+SSM block with dimension m = d, and Canon-B placed within the SSM block with dimension
+m = 4d + 144.16 In contrast, Mamba2's original conv1d applies only to a subset of 2d + o(d)
+dimensions with non-linear activation.
+• For Mamba2(mlp), which alternates SSM blocks and gated MLP layers, we introduce Canon-C
+and Canon-D before and within the MLP sub-layers, respectively, together forming the full
+Canon-ABCD configuration.
+
+As demonstrated in Figure 13, fully replacing the original conv1d with Canon layers consis-
+tently improves Mamba2, particularly on knowledge manipulation (MANO) and reasoning breadth
+(BREVO), surpassing even its original implementation.
+Comparing Figure 12 with Figure 13, we conclude that the majority of Mamba2's performance
+boost comes from Canon-style horizontal information flow (either via original convld or our full
+Canon layers), not from its state-space formulation itself. Introducing Canon layers provides addi-
+tional incremental gains, enabling Mamba2 to slightly exceed GLA-but the intrinsic state-space
+mechanism contributes comparatively limited improvement.
+
+Result 8 (Figure 12+13). Key observations on Mamba2:
+• Mamba2 contains an internal non-linear conv1d mechanism (a partial Canon-B) within its
+SSM blocks, which contributes more substantially to performance than its state-space design.
+Removing it greatly reduces performance, limiting Mamba2 to GLA-level capabilities.
+• Replacing the internal conv1d with full Canon layers further improves performance, partic-
+ularly in knowledge manipulation (MANO) and reasoning breadth (BREVO).
+(Also holds for Mambal [25]; in our playground Mambal is consistently outperformed by Mamba2.)
+
+7.1
+Ablation Studies with Canon Layers
+To better understand how Canon layers interact with Mamba, we performed ablation studies varying
+the number of sub-layers, residual connections, and initialization schemes.
+
+Residuals on Canon. Residual links on Canon layers exhibited mixed effects. As shown in
+Figure 14, enabling residual connections improved hierarchical structural learning (LANO) and
+in-context reasoning depth (DEPO), while disabling residuals benefited knowledge manipulation
+(MANO) and reasoning breadth (BREVO). While selective application of residual links across sub-
+layer configurations could optimize performance further, this is beyond the scope of this paper due
+to our primary focus on Transformer architectures.
+Given Mamba's significantly weaker recursive reasoning (DEPO, LANO) compared to Transform-
+ers, but stronger shallow, knowledge-driven reasoning (MANO, BREVO), we recommend disabling
+residual links for Canon layers with Mamba. This configuration better aligns with Mamba's core
+strengths. For hybrid architectures combining Mamba with Transformer layers (e.g., Samba [47]),
+we recommend optimizing Mamba for these shallow reasoning tasks, while delegating deeper, re-
+cursive reasoning (DEPO, LANO) to Transformers.
+16 The additive 144 arises from the Mamba2 specifications: ssm_state_size = 64 and num_heads = 16.
+
+21
+
+Task Depo1(K=4, k=4/2) - Ablation study - Mamba2
+N-225 - NoRes
+20/57%
+N-225 - Res
+6/60% 39/89% 13/60% 8/45%
+34/83% 38/91%
+N-300- NoRes
+2/29% 23/63% 6/36% 1/18% 3/33%
+N=300-Res 7/50% 12/58%
+N=375-NoRes 1/17% 3/33% 5/28% 1/16%
+N=375-Res 2/25% 6/33%
+Canon-AB
+Canon-B
+mimetic
+noconvid
+2/33%
+original (conv1d)
+Task Brevo1 - Ablation study - Mamba2
+N=70-NoRes -90.5% 90.5% 65.3% 0.5% 56.5%
+N=70-Res-83.3% 0.1%
+Task Mano - Ablation study - Mamba2
+L=10-NoRes - 99.5% 99.9% 53.0% 66.2% 98.8%
+L=10-Res-91.4% 95.4%
+N=90-NoRes 83.1% 70.2% 0.3% 0.5% 24.2% L=13-NoRes - 99.2% 99.7% 34.6% 48.9% 88.0%
+N-90-Res-29.6% 0.5%
+L-13-Res - 68.8% 79.5%
+N=110 - NoRes 68.4% 27.3% 0.0% 0.4% 26.2% L=16-NoRes-98.8% 99.6% 10.1% 34.1% 94.0%
+N=110-Res 3.7% 3.8%
+L-16-Res-69.7% 88.2%
+Canon-AB
+Canon-B
+mimetic
+noconvld
+original (conv1d)
+N=75 - NoRes
+N=75 - Res
+N=100-NoRes
+50/85%
+N=100 - Res
+86/95% 52/92%
+N=125 - NoRes 32/80% 51/88% 5/42%
+N=125 - Res
+67/90% 66/90%
+Canon-AB
+Canon-B
+mimetic
+noconvid
+original (conv1d)
+85/97% 86/97% 25/55%
+94/99% 76/95%
+Task Depo2(K=4, k=4/2) - Ablation study - Mamba2
+90/98%
+17/83%
+63/88% 33/75% 4/27% 86/97%
+4/40% 67/91%
+N=50-Res-0.8% 1.0%
+Canon-AB
+Canon-B
+mimetic
+noconvld
+original (conv1d)
+N=50-NoRes 35.1% 1.1% 0.9% 3.2% 2.7%
+N=40-NoRes - 79.1% 56.1% 1.2% 44.2% 4.8%
+N=40-Res-0.5% 1.5%
+N=30 - NoRes - 97.2% 75.9% 2.2% 44.9% 50.4%
+N=30-Res-13.3% 39.1%
+Task Brevo2 - Ablation study - Mamba2
+cfg3k - Res-73.1% 60.5%
+Canon-AB
+Canon-B
+mimetic
+noconvld
+original (convld)
+cfg3k - NoRes -51.9% 50.8% 38.7% 12.5% 70.3%
+cfg3j - NoRes - 68.9% 80.4% 37.7% 8.1% 84.2%
+cfg3j-Res83.8% 84.6%
+cfg3f - NoRes - 86.4% 88.2% 91.8% 41.7% 94.1%
+cfg3f-Res 94.2% 93.1%
+Canon-AB
+Canon-B
+mimetic
+noconvld
+Task Lano - Ablation study - Mamba2
+original (conv1d)
+Task Depo1(K=4, k=4/2) - Ablation study - Mamba2(mlp)
+N-225-NoRes 36/74% 63/92% 26/85% 53/85% 1/27% 43/84%
+N-225-Res 49/84% 42/78% 21/61% 40/90%
+N-300-NoRes 2/79% 36/79% 30/76% 25/86% 1/13% 13/61%
+N-300-Res 19/79% 13/69% 11/47% 29/75%
+N=375-NoRes
+1/42%
+21/84% 1/27% 16/73% 0/9%
+N=375-Res 18/54% 8/47% 11/66% 43/73%
+N-125-Res
+Canon-ABCD
+Canon-ACD
+Canon-B
+Canon-BD
+Task Brevo1 - Ablation study - Mamba2(mlp)
+N=70-NoRes -87.8% 79.8% 84.6% 18.7% 0.5% 72.4%
+N=70-Res-92.4% 79.6% 72.7% 2.1%
+10/42%
+N=90-NoRes 55.1% 4.7% 18.1% 62.6% 0.2% 4.8%
+N-90-Res - 7.8% 1.3% 1.9% 8.1%
+N=110- NoRes 41.1% 5.2% 4.5% 31.1% 0.3% 1.2%
+noconvid
+original (conv1d)
+N=110 - Res 3.7% 8.6% 0.4% 6.2%
+Canon-ABCD
+Canon-ACD
+Canon-B
+Canon-BD
+noconvid
+original (conv1d)
+Task Mano - Ablation study - Mamba2(mlp)
+L=10 - NoRes - 99.4% 99.7% 99.6% 99.8% 66.9% 95.7%
+L=10-Res-94.4% 80.2% 91.4% 97.2%
+L=13-NoRes 98.4% 99.2% 99.2% 99.4% 47.5% 91.8%
+L=13-Res 98.6% 66.7% 87.1% 76.0%
+L=16-NoRes 98.0% 97.5% 99.2% 98.8% 37.2% 87.4%
+L-16-Res-80.8% 82.4% 74.9% 40.6%
+N=75-NoRes
+N=75 - Res
+Task Depo2(K=4, k=4/2) - Ablation study - Mamba2(mlp)
+74/95% 86/97% 91/98% 83/99% 8/46%
+94/99% 94/99% 77/94% 88/96%
+69/89%
+Task Brevo2 - Ablation study Mamba2(mlp)
+N=30-NoRes - 94.1% 40.6% 15.6% 30.6% 31.0% 3.4%
+N=30-Res-65.9% 80.7% 19.9% 20.6%
+cfg3f - NoRes - 81.5% 87.3% 91.4% 85.3% 40.3% 92.2%
+cfg3f-Res 94.6% 93.6% 90.4% 90.9%
+N=100-NoRes
+N=100 - Res
+N=125 - NoRes
+74/97% 86/96% 64/93% 52/93%
+76/97% 85/98% 61/91% 82/96%
+53/90% 66/93% 52/90% 42/86% 1/10%
+1/9% 42/82%
+cfg3j - NoRes - 64.3% 70.1% 68.9% 65.1% 5.9% 74.3%
+cfg3j-Res - 84.3% 84.1% 71.9% 73.7%
+24/75%
+Canon-ABCD
+53/88% 77/95% 41/75% 73/89%
+Canon-ACD
+Canon-B
+Canon-BD
+noconvld
+original (conv1d)
+Canon-ABCD
+Canon-ACD
+Canon-B
+Canon-BD
+noconvid
+Task Lano - Ablation study - Mamba2(mlp)
+original (conv1d)
+N=40-NoRes-84.2% 4.9% 3.1% 2.4% 10.8% 0.5%
+N=40-Res-13.5% 2.5% 1.0% 0.9%
+N=50-Res 4.1% 3.4% 0.6% 0.7%
+N-50-NoRes -53.1% 0.4% 1.8% 0.4% 1.8% 0.5% cfg3k-NoRes 41.3% 44.9% 48.9% 44.1% 9.2% 46.1%
+Canon-ABCD
+Canon-ACD
+Canon-B
+Canon-BD
+noconvld
+original (conv1d)
+cfg3k - Res-66.4% 58.5% 45.0% 53.3%
+Canon-ABCD
+Canon-ACD
+Canon-B
+Canon-BD
+noconvld
+original (conv1d)
+Figure 14: Ablation study of Mamba2 models of 12L768D size with Canon layers, Canon residuals, original non-linear
+conv1d, mimetic initialization. Additional size experiments are in Figure 26-27 of Appendix E.
+
+Canon sub-layers. Adding more Canon sub-layers in Mamba2 provided improvements, though
+less pronounced than in Transformers. Notably, Mamba2(mlp) with Canon-ACD consistently out-
+performed both original Mamba2(mlp) and the Canon-B-only version. This confirms that Canon
+layers need not be tied to integration within the SSM block (as in original Mamba) and can also
+deliver benefits externally, similar to Transformer setups.
+
+Mimetic initialization. We tested the mimetic initialization scheme proposed for Mamba [61],
+previously shown to enhance associative recall and selective copying, thereby improving length
+generalization. However, our ablation studies (Figure 14; see further details in Figure 26) found
+it offered no measurable benefit—and sometimes even degraded performance on other tasks. This
+suggests mimetic initialization may overfit length generalization objectives at the expense of per-
+formance on everything else. These results highlight the importance of evaluating architectural
+choices on a diverse task playground.
+
+Result 9 (Figure 14). Canon layers are lightweight, versatile improvements for Mamba2, consis-
+tently enhancing reasoning and knowledge manipulation. Key findings include:
+• Disabling Canon residuals improves MANO and BREVO, aligning with Mamba2's strengths;
+enabling residuals benefits recursive reasoning (LANO, DEPO), though often unnecessary.
+• Canon layers remain effective when placed outside the SSM block, highlighting their generality
+as horizontal information-flow components independent of architectures.
+• Mamba's mimetic init [61], designed for length generalization, harms shorter-context perfor-
+mance, highlighting the importance of architectural design using a diverse playground.
+
+22
+
+Task Depo1(K=8, k=8/4)
+Llama (ROPE) - Canon-ABCD(res)
+N=225-99/100% 97/100% 99/100% 100/100%
+N=300-98/100% 92/99% 95/100% 95/100%
+N=375
+75/99% 97/100% 85/100% 90/100%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=16, k=16/8)
+Llama (ROPE) - Canon-ABCD(res)
+N=75-92/100% 100/100% 97/100% 99/100%
+N=100-97/100% 99/100% 96/100% 97/100%
+N=125-85/100% 99/100% 98/100% 98/100%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Llama (ROPE) - Canon-ABCD(res)
+N=7083.7% 93.8% 91.3% 96.5%
+N=90 62.9% 84.5% 81.2% 90.7%
+N=110-47.9% 82.2% 69.7% 84.5%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Llama (ROPE) - Canon-ABCD(res)
+N=30 87.1% 95.6% 92.2% 97.1%
+N=40 75.4% 87.7% 80.1% 93.5%
+N=50 55.1% 82.5% 69.3% 88.1%
+learned knowledge (bits)
+8L512D 8L768D
+12L512D 12L768D
+Canon-ABCD(res)
+Task Capo - Llama (ROPE)
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+N=2000000
+N=1000000
+N=500000
+N=200000
+N=100000
+N-50000
+108
+8L512D 8L768D 12L512D 12L768D
+Task Depo1(K=4, k=4/2)
+Mamba2 - Canon-AB (no-res)
+5/49% 6/53% 29/77% 6/60%
+Task Depo1(K=8, k=8/4)
+Llama (NoPE) - Canon-ABCD(res)
+N=225-99/100% 99/100% 99/100% 100/100% N=225
+N=300 96/99% 99/100% 99/100% 99/100% N=300-1/34%
+N=375-99/100% 99/100% 98/100% 99/100% N=375
+1/22% 3/33% 2/29%
+1/14% 0/12% 1/30% 1/17%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+Mamba2 - Canon-AB(no-res)
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=16, k=16/8)
+Llama (NoPE) - Canon-ABCD(res)
+N=75-96/100% 85/99% 86/100% 99/100% N=7567/96%
+N=100-94/100% 86/99% 99/100% 99/100% N=100-42/85%
+N=125-90/100% 98/100% 93/100% 96/100% N=125-30/76%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+Llama (NoPE) - Canon-ABCD(res)
+N=70
+84.8% 94.4% 91.1% 96.2%
+N=90-63.9% 85.8% 75.5% 92.2%
+8L512D
+90/99% 79/96% 85/97%
+53/91% 56/90% 50/85%
+68/93% 23/77% 32/80%
+8L768D 12L512D 12L768D
+Task Brevol
+Mamba2 - Canon-AB(no-res)
+N=7076.5% 81.2% 79.4% 90.5%
+N=90-66.7% 59.2% 64.1% 83.1%
+N=110-42.0% 75.3% 58.2% 84.9% N=110-23.8% 23.7% 46.0% 68.4%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Llama (RoPE) - Canon-ABCD(res)
+N=3087.5% 94.5% 92.3% 95.4%
+N=40-66.0% 85.3% 79.3% 90.5%
+N=50-44.6% 75.5% 68.5% 87.8%
+learned knowledge (bits)
+10
+200
+10
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Llama (NoPE) - Canon-ABCD(res)
+N=3087.4% 93.2% 89.0% 96.1% N=30
+N=40-61.2% 84.0% 75.2% 91.7% N=40
+N=50 40.4% 56.0% 56.3% 79.9% N=50
+learned knowledge (bits)
+10
+200
+8L512D 8L768D 12L512D 12L768D
+Task Capo - Llama (NoPE) - Canon-ABCD(res)
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+N=2000000
+N=1000000
+N=500000
+N=200000
+N=100000
+N-50000
+108
+learned knowledge (bits)
+20
+8L512D 8L768D 12L512D 12L768D
+Task Capo - Mamba2 Canon-AB(no-res)
+2 bit/param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+N=2000000
+N=1000000
+N=500000
+N=200000
+N=100000
+N-50000
+108
+learned knowledge (bits)
+20
+8L512D 8L768D 12L512D 12L768D
+Task Depo1(K=4, k=4/2)
+GLA - Canon-ABCD(res)
+N-225-16/72% 25/74% 62/93% 58/93%
+N=300-6/32% 10/49% 12/51% 41/83%
+N=375 8/38% 3/26% 11/52% 12/55%
+8L512D 8L768D 12L512D 12L768D
+Task Depo2(K=4, k=4/2)
+GLA - Canon-ABCD(res)
+N=75-47/79% 54/81% 82/95% 73/92%
+N=100- 23/53% 36/85% 53/89% 39/82%
+N=125-14/46% 9/29% 57/85% 46/77%
+8L512D 8L768D 12L512D 12L768D
+Task Brevol
+GLA - Canon-ABCD (res)
+N=7093.8% 93.6% 95.7% 97.2%
+N=90-63.5% 83.5% 91.1% 88.4%
+N=11049.6% 55.9% 59.5% 72.1%
+8L512D 8L768D 12L512D 12L768D
+Task Brevo2
+Mamba2 - Canon-AB(no-res)
+GLA - Canon-ABCD(res)
+94.1% 96.1% 95.0% 97.2% N=30 80.5% 86.8% 90.8% 91.8%
+80.2% 88.3% 68.3% 79.1% N=40 59.3% 70.7% 28.3% 85.9%
+63.9% 70.2% 55.9% 35.1% N=50 20.0% 0.9% 32.6% 41.0%
+8L512D
+8L768D 12L512D 12L768D
+Task Capo - GLA - Canon-ABCD(res)
+2 bit / param
+1 bit/param
+0.5 bit/param
+0.25 bit/param
+N=2000000
+N=1000000
+N=500000
+N=200000
+N=100000
+N-50000
+107
+108
+model size (#params)
+Task Mano
+107
+model size (#params)
+Task Mano
+Llama (ROPE) - Canon-ABCD(res)
+L=1094.2% 98.0% 99.2% 99.6%
+L=13-89.8% 88.5% 98.2% 99.2%
+L=1683.7% 83.6% 88.8% 85.3%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Llama (ROPE) - Canon-ABCD(res)
+cfg3f95.2% 97.5% 96.0% 98.1%
+cfg3j 81.4% 90.1% 85.9% 92.6%
+cfg3k 66.0% 77.9% 76.1% 78.9%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Llama (ROPE) - Canon-ABCD(res)
+cfg3f-0.00048 0.00034 0.00042 0.00028
+cfg3j -0.00071 0.00052 0.00065 0.00040
+cfg3k -0.00155 0.00090 0.00113 0.00091
+107
+model size (#params)
+Task Mano
+107
+model size (#params)
+Task Mano
+Mamba2 - Canon-AB(no-res)
+L=1098.9%
+Llama (NoPE) - Canon-ABCD(res)
+L=1097.7% 98.9% 99.3% 99.3%
+L=13 83.1% 90.1% 95.9% 98.1%
+L-16-53.7% 55.5% 89.4% 94.3% L=16
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+GLA - Canon-ABCD(res)
+99.3% 99.6% 99.5% L=10 98.4%
+L=13 98.9% 99.3% 99.3% 99.2% L=13
+98.6% 99.2% 99.0% 98.8% L=16
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+Llama (NoPE) - Canon-ABCD(res)
+Mamba2 - Canon-AB (no-res)
+cfg3f87.9% 91.9% 88.5% 92.5% cfg3f83.9% 90.6% 85.9% 86.4%
+cfg3j55.1% 70.3% 58.6% 78.3% cfg3j63.9% 77.8% 73.1% 68.9%
+cfg3k 33.5% 51.0% 37.2% 53.1% cfg3k - 46.4% 57.4% 46.1% 51.9%
+8L512D 8L768D 12L512D 12L768D
+8L512D 8L768D 12L512D 12L768D
+99.5% 99.5% 97.8%
+70.9% 97.0% 87.7% 97.9%
+54.1% 83.3% 43.8% 65.6%
+8L512D 8L768D 12L512D 12L768D
+Task Lano
+GLA - Canon-ABCD(res)
+cfg3f88.0% 90.6% 89.5% 93.3%
+cfg3j
+70.3% 82.1% 72.9% 81.9%
+cfg3k 44.9% 63.1% 52.8% 71.0%
+8L512D 8L768D 12L512D 12L768D
+Figure 15: Final comparison of base architectures equipped with full-score Canon layers: RoPE(), NOPE, Mamba2,
+and GLA. While Canon layers significantly enhance reasoning across all architectures (c.f. Figure 4), they
+are not a panacea. With Canon layers added, Mamba2 and GLA still underperform Transformers by 200%
+in reasoning depth, with results shown only for DEPO(K=4) due to zeros at K=8/16 (see Figure 26).
+
+8 Final Comparison Across Base Models
+Applying full-score Canon uniformly to all architectures creates a controlled environment analogous
+to a vacuum chamber—eliminating extraneous variables and exposing architectural trade-offs.
+
+Result 10 (Figure 15). With full-score Canon layers added, we find:
+• reasoning depth: RoPE(1) ≈ NoPE ≫ Mamba2 ≈ GLA (e.g., 2× deeper reasoning);
+• reasoning breadth: RoPE(1) > NoPE ≈ Mamba2 ≈ GLA;
+• knowledge capacity: Mamba2 ≈ GLA > RoPE(1) ≈ NoPE;
+• knowledge manipulation: Mamba2 > RoPE(1) > NoPE > GLA;
+• hierarchical structure: RoPE(1) > NoPE ≈ Mamba2 ≈ GLA.
+
+Remark 8.1. The initial comparison (Figure 4) does not represent a controlled comparison. In the
+
+23
+
+Accuracy on k
+Accuracy on k
+Accuracy on k
+100
+90 55
+80
+100
+95
+35 90 55
+Task Depo1(K=4) | N=375 | Mamba2 original(conv1d)
+20000
+40000
+60000
+Train steps
+80000
+100000
+Task Depo1(K=4) | N=375 | Mamba2 Canon-AB(no-res)
+80
+0
+20000
+100
+40000
+60000
+Train steps
+80000
+k=1
+k=2
+k=4
+k=1
+k=2
+k=4
+100000
+Task Depo1(K=4) | N=375 | GLA- Canon-ABCD(res)
+55 90 35
+k=1
+k=2
+k=4
+80
+0
+20000 40000
+60000
+80000 100000
+Train steps
+Accuracy on k
+Accuracy on k
+100
+Task Depo1(K=4) | N=300 | Mamba2 original(conv1d)
+100
+95
+90
+85
+80
+k=1
+k=2
+k=4
+Accuracy on k
+95
+90
+55
+80
+20000
+40000
+60000
+80000
+100000
+Train steps
+Task Depo1(K=4) | N=300 | Mamba2 Canon-AB(no-res)
+100
+100
+95-
+90
+85
+80
+20000
+k=1
+k=2
+k=4
+80
+40000
+60000
+80000
+100000
+Train steps
+Accuracy on k
+55 90 55
+Accuracy on k
+Task Depo1(K=4) | N=225 | Mamba2 original(conv1d)
+10000 20000 30000 40000 50000 60000 70000 80000
+Train steps
+Task Depo1(K=4) | N=225 | Mamba2 Canon-AB(no-res)
+10000 20000 30000 40000 50000 60000 70000 80000
+Train steps
+k=1
+k=2
+k=4
+Task Depo1(K=4) | N=300 | GLA - Canon-ABCD(res)
+100
+95-
+90 55
+k=1
+k=2
+k=4
+Accuracy on k
+35 90 55
+Task Depo1(K=4) | N=225 | GLA - Canon-ABCD(res)
+100
+95
+k=1
+k=2
+k=4
+80
+80
+20000
+40000
+60000
+80000
+100000
+Train steps
+10000 20000 30000 40000 50000 60000 70000 80000
+Train steps
+Figure 16: Training curves for 12L768D architectures on Task DEPO1 (K=4), evaluated at k = 1,2,4 and n = N,
+with results shown across three learning rates for each k.
+
+original setup, Mamba2 includes non-linear convld layers (a subcase of Canon-B) while GLA and
+Transformers do not. By adding full-score Canon, the comparison becomes scientifically meaningful.
+
+Challenges in Deep Reasoning for Linear-Time Models. Among all comparisons, reasoning
+depth remains the weakest point of Mamba and GLA, and potentially most linear-time models on
+the market. Due to their compression of in-context knowledge, these models struggle to reliably
+achieve 99% accuracy on even 1- or 2-hop information retrieval tasks (as demonstrated in Figure 16),
+despite prolonged training. When reasoning depth increases beyond 2 hops, errors from earlier steps
+accumulate significantly, leading to an overall inability to perform deeper reasoning tasks.
+
+We emphasize: the inability to achieve high accuracy on 1- or 2-hop tasks is not caused by
+insufficient recurrent memory. Consider Mamba2: each layer passes 128d parameters (= expansion
+× ssm_state_size × hidden size d), sufficient to store the entire input sequence.17 Additionally,
+Mamba2 performs well on simpler 1-hop tasks (K = 1) with even a single-layer network. Thus, the
+bottleneck is not information-theoretic. (Later real-life experiments shall also confirm this.)
+
+The core limitation instead lies in the memory dynamics: how efficiently in-context informa-
+tion is encoded during compression and how reliably it is retrieved for reasoning. Inaccuracies in
+encoding or retrieval accumulate over hops, affecting performance in deeper reasoning tasks.
+
+Thus, our findings pinpoint the Achilles' Heel of linear models for focused future research to-
+ward more intelligent linear designs. Until linear architectures overcome these limitations, hybrid
+approaches combining sliding-window attention (for deep reasoning) and linear or state-space com-
+ponents (for compressing longer contexts) remain the best practical solutions. Integrating Canon
+layers in both components can further maximize the overall performance.
+
+Result 11 (Figure 16). Linear models like Mamba and GLA struggle with deep reasoning due to
+error accumulated from inefficient compression and retrieval, despite sufficient memory. Com-
+bining Transformers with linear models, both augmented with Canon layers, offers a compromise.
+17 For example, in Task DEPO, representing N key-value pairs with a vocabulary size V requires at most 2N log2(V)
+bits. In DEPO2, we use N = 75 and V < 2500. This knowledge can easily fit within the memory state of Mamba2.
+
+24
+
+k=1
+k=2
+k=4
+
+Result 12: Real-life pretraining at academic scale
+GLA + Mamba2 (no conv1d)
++ NOPE perform the worst
+with Canons, Mamba2
++ GLA perform closely
+Physics says: Beyond this is noise.
+☑ "noise" from random seeds
+NOPE or ROPE(J) helps
+length generalization
+الحمد احمد محمد محمد محمد العصر السياحي✗ simplest 2-hop reasoning
+We stop here to avoid over-interpretation A Linear models struggle (even short-context) retrieval tasks
+how to interpret this table
+SlimPajama | 100B token pretrain | 1.3B models
+fails at academic scale
+Mamba2(mlp) - original(conv1d) - seed 20
+48.3% 72.1% 56.6% 57.8% 59.2% 30.0% 40.4% 62.1% 15.8 11.8
+Mamba2(mlp) - Canon-ABCD(res)-seed 20-50.5% 73.3% 56.5% 57.6% 59.1% 30.5% 40.1% 62.3% 15.7 11.0
+Mamba2 - original(conv1d) - seed 20
+Mamba2 - noconvldseed 20
+Mamba2 - Canon-AB(res) seed 20
+Mamba2 - Canon-AB(no-res) - seed 20
+GatedDeltaNet - original(conv1d) - seed 20
+GLA-original(noconv1d) - seed 20
+GLA-convld- seed 20
+Llama (ROPE) - original - seed 22
+Llama (ROPE) - original - seed 21
+Llama(ROPE) - original - seed 20
+Llama (ROPE) - Canon-ABCD (res) - seed 20
+Llama(ROPE) - original - seed 27
+Llama(ROPE)-original-seed 26
+Llama(ROPE) - original - seed 25
+Llama (ROPE) - original - seed 24
+Llama(ROPE) original seed 23
+53.3% 71.4% 56.2% 58.5% 59.1% 29.9% 40.9% 61.2% 15.7 10.1
+52.3% 71.2% 56.1% 58.7% 59.3% 29.0% 40.9% 60.8% 15.8 10.4
+50.7% 72.1% 56.0% 57.9% 59.5% 29.6% 40.8% 61.1% 15.7 11.3
+53.1% 71.9% 56.5% 59.2% 60.8% 29.2% 41.3% 61.8% 15.7 9.9
+52.8% 72.1% 56.0% 58.8% 58.5% 29.0% 41.0% 60.7% 15.7 10.2
+52.3% 71.6% 56.7% 58.2% 59.4% 31.0% 42.1% 62.9% 15.8 10.3
+-55.0% 72.0% 56.0% 57.7% 58.9% 29.1% 41.1% 62.3% 15.7 9.8
+50.8% 72.3% 55.8% 57.2% 59.1% 29.6% 41.1% 63.5% 15.7 11.2
+52.0% 72.4% 56.5% 60.4% 58.4% 29.0% 40.9% 62.8% 15.4 11.0
+79.0% 86.6% 52.8% 62.3% 33.5% 35.3% 43.9% 55.4% 61.4% 60.6% 25.0% 40.39
+79.4% 84.6% 54.5% 61.9% 35.3% 36.0% 45.6% 56.4% 64.2% 59.1% 27.4% 39.3%
+78.7% 85.4% 53.8% 63.5% 33.3% 34.4% 45.6% 57.3% 62.9% 60.3% 24.9% 38.6%
+81.5% 87.2% 52.6% 62.2% 34.3% 36.6% 45.5% 55.4% 62.3% 59.8% 22.3% 42.8%
+76.2% 85.5% 50.9% 59.7% 34.1% 37.5% 48.9% 57.3% 63.2% 61.4% 25.6% 39.1%
+81.3% 87.4% 54.8% 59.4% 32.7% 36.2% 46.3% 54.4% 63.7% 61.4% 25.1% 41.1%
+80.3% 85.2% 52.1% 60.8% 35.1% 36.7% 45.3% 59.7% 63.4% 59.7% 23.8% 39.4%
+79.6% 85.6% 50.7% 59.4% 32.5% 36.0% 44.4% 55.2% 62.5% 60.0% 25.2% 40.8%
+78.6% 86.9% 54.8% 58.4% 34.1% 35.0% 44.6% 56.2% 63.8% 60.6% 24.2% 39.6%
+Llama (ROPE) - Canon-ABCD (res) - seed 20-51.7% 71.7% 57.2% 57.8% 60.9% 29.4% 41.0% 63.1% 15.2 11.1
+Llama (ROPE) Canon-ABCD (res) seed 20-51.4% 71.7% 56.5% 58.9% 60.1% 29.9% 40.8% 63.2% 15.4 10.4
+Llama(NOPE) - original - seed 20
+Llama (NoPE) Canon-ABCD(res)- seed 20
+43.8% 70.3% 49.2% 54.5% 55.1% 27.3% 39.0% 60.4% 18.1 21.3
+-48.8% 72.1% 55.7% 58.6% 58.1% 29.3% 41.6% 62.8% 15.6 12.9
+80.1% 87.4% 56.5% 62.6% 35.2% 39.4% 46.3% 57.1% 63.9% 61.4% 26.8% 42.3%
+78.6% 87.2% 57.3% 61.5% 35.4% 40.0% 46.2% 59.0% 65.5% 61.7% 25.8% 41.9%
+78.6% 84.8% 55.7% 63.4% 32.9% 35.9% 45.1% 53.6% 59.1% 55.7% 23.7% 38.3%
+77.7% 86.5% 56.5% 59.9% 36.1% 40.2% 49.1% 58.3% 63.7% 59.8% 26.8% 40.9%
+99.3% 98.0% 95.6% 89.4% 80.8% 6.2% 0.2%
+97.8% 98.7% 98.6% 95.7% 87.0% 7.3% 1.2%
+99.2% 96.6% 96.2% 91.1% 80.5% 9.4% 0.7%
+97.4% 95.5% 93.0% 84.4% 80.3% 8.5% 0.3%
+99.3% 98.8% 96.2% 92.6% 79.1% 9.7% 0.4%
+98.9% 98.0% 93.5% 89.3% 78.0% 4.4% 0.4%
+99.2% 98.8% 94.6% 94.2% 80.5% 5.1% 0.3%
+98.8% 96.6% 90.7% 84.0% 73.1% 14.8% 0.4%
+98.9% 99.1% 98.0% 95.6% 91.3% 7.0% 1.2%
+99.2% 99.6% 99.7% 99.3% 99.6% 80.6% 35.8%
+99.7% 99.8% 99.1% 98.6% 95.3% 60.8% 18.6%
+98.8% 98.8% 99.0% 98.5% 98.6% 66.8% 1.7%
+99.3% 99.4% 98.9% 98.8% 99.4% 88.9% 10.1%
+31.6% 31.4% 28.3% 26.9% 27.8% 6.1% 0.0%
+31.0% 29.5% 27.8% 23.6% 23.8% 12.1% 1.3%
+30.4% 30.1% 28.4% 25.4% 26.9% 13.5% 0.4%
+31.2% 30.1% 30.5% 26.5% 26.4% 10.1% 0.2%
+31.8% 31.9% 30.8% 30.1% 27.2% 7.6% 0.2%
+29.2% 29.9% 28.4% 28.5% 27.7% 8.9% 0.2%
+31.1% 30.1% 29.7% 24.6% 26.1% 6.7% 0.0%
+30.5% 31.0% 30.5% 28.5% 29.3% 14.9% 0.2%
+34.4% 34.2% 33.3% 31.4% 30.8% 6.2% 1.2%
+34.2% 33.0% 32.5% 29.5% 31.5% 27.9% 25.1%
+35.0% 32.3% 33.0% 30.6% 34.5% 29.1% 10.4%
+28.9% 28.5% 25.5% 29.1% 28.4% 18.8% 1.6%
+36.1% 34.8% 35.0% 33.4% 34.3% 30.5% 2.6%
+75.7% 65.2% 42.8% 30.7% 23.7% 15.5% 12.8%
+76.2% 61.5% 42.9% 29.6% 22.0% 13.7% 8.5%
+75.4% 64.8% 40.4% 27.8% 16.6% 10.7% 8.6%
+49.2% 34.6% 21.3% 15.4% 12.6% 9.8% 8.3%
+95.0% 88.1% 68.0% 50.2% 32.9% 17.8% 10.2%
+75.9% 65.8% 46.2% 36.4% 26.0% 17.4% 12.5%
+74.4% 62.7% 46.2% 35.1% 27.4% 20.9% 14.3%
+77.6% 63.7% 37.4% 26.9% 17.8% 14.6% 11.9%
+63.0% 50.9% 35.0% 22.7% 16.0% 10.6% 9.4%
+32.2% 30.0% 27.8% 27.4% 21.7% 15.8% 11.6%
+35.0% 30.8% 29.1% 30.2% 24.6% 20.3% 13.9%
+34.0% 33.9% 29.5% 28.4% 20.3% 15.9% 11.3%
+33.0% 29.1% 28.6% 25.2% 21.0% 14.4% 10.1%
+34.8% 30.5% 28.0% 25.9% 23.0% 17.6% 11.0%
+33.2% 32.1% 28.5% 26.7% 24.3% 21.1% 14.5%
+33.1% 33.0% 28.7% 29.4% 21.7% 23.3% 17.6%
+31.8% 29.8% 22.0% 23.0% 19.8% 17.5% 14.3%
+34.2% 35.1% 27.8% 27.9% 25.9% 21.8% 15.7%
+GLA-Canon-ABCD(res) - seed 20
+-49.5% 72.1% 56.9% 57.0% 60.0% 29.1% 40.7% 60.2% 15.7 11.9
+42.4% 70.5% 49.2% 54.8% 54.7% 27.2% 40.7% 60.3% 18.6 16.8
+-49.9% 72.3% 57.3% 58.6% 60.1% 30.5% 41.5% 61.2% 15.7 10.7
+47.9% 72.3% 55.6% 57.3% 59.6% 31.3% 41.4% 62.4% 16.1 12.0
+49.3% 72.4% 55.1% 58.7% 59.6% 28.8% 40.8% 62.1% 16.1 11.2
+43.7% 70.3% 48.8% 54.0% 55.3% 26.3% 40.3% 61.7% 18.6 16.0
+48.2% 71.0% 53.3% 56.7% 56.9% 28.2% 40.5% 60.6% 16.7 12.5
+48.2% 72.6% 54.1% 57.9% 58.3% 28.5% 41.5% 62.0% 16.7 12.8
+LMB PIQA Hella wino
+Wiki ppl
+LMB ppl
+55.9% 72.1% 45.0% 51.0% 30.9% 35.2% 37.7% 57.8% 59.1% 60.2% 21.4% 37.8%
+63.9% 77.5% 47.8% 56.7% 30.3% 37.6% 36.5% 56.8% 60.5% 59.9% 21.0% 37.1%
+56.4% 67.2% 48.2% 55.7% 30.5% 37.2% 38.3% 58.6% 60.0% 59.8% 24.3% 38.5%
+48.2% 64.4% 44.0% 49.1% 27.1% 33.0% 33.6% 56.5% 55.4% 57.3% 20.9% 34.1%
+60.8% 75.8% 48.2% 57.2% 30.5% 37.4% 37.8% 58.0% 61.6% 61.7% 22.3% 38.7%
+63.3% 74.0% 44.5% 53.0% 30.2% 35.8% 37.1% 58.2% 60.7% 60.1% 21.3% 35.2%
+62.3% 76.0% 51.1% 52.8% 30.8% 36.5% 39.1% 61.3% 60.0% 61.7% 23.6% 38.0%
+57.8% 69.2% 39.2% 52.8% 27.5% 34.0% 35.1% 57.2% 55.0% 57.8% 20.0% 37.7%
+57.2% 74.2% 47.1% 52.4% 28.6% 35.9% 37.9% 59.6% 58.1% 59.4% 22.9% 35.3%
+65.8% 76.0% 51.8% 56.3% 30.9% 36.4% 36.7% 58.1% 59.7% 59.7% 20.9% 36.3%
+EDA DAZND WOEZ NO NOZ ad
+Squar
+Squad2
+TriviaQA
+Drop Drop2
+FineWeb-Edu | 100B token pretrain | 1.3B models
+1-hop-Ok
+73.7% 63.8% 47.9% 36.4% 24.3% 17.0% 12.6%
+1-hop-1k
+1-hop-2k
+1-hop-3k
+1-hop-4k
+1-hop-5k
+1-hop-6k
+2-hop-ok
+31.8% 32.2% 28.1% 29.3% 25.3% 19.6% 15.2%
+2-hop-1k
+2-hop-2k
+2-hop-3k
+2-hop-4k
+2-hop-5k
+2-hop-6k
+28.9% 29.5% 29.3% 26.3% 26.2% 3.3% 0.4%
+Llama(ROPE) - Canon-ABCD(res) - seed 20
+48.1% 73.0% 59.3% 59.4% 72.6% 41.1% 42.1% 63.5% 16.7 13.1
+48.5% 72.7% 58.8% 60.7% 71.7% 39.8% 42.4% 63.4% 16.7 12.3
+50.1% 72.7% 58.9% 60.5% 72.2% 41.0% 42.3% 63.5% 16.8 12.0
+48.9% 72.5% 59.1% 59.0% 71.4% 41.1% 42.9% 62.3% 16.9 12.6
+47.4% 73.4% 58.6% 59.6% 71.7% 40.4% 42.9% 63.2% 16.6 13.3
+50.0% 73.8% 59.0% 59.7% 71.8% 38.7% 42.3% 62.5% 16.8 11.6
+-48.7% 72.9% 58.8% 59.0% 71.4% 37.9% 42.8% 63.6% 16.6 12.7
+-49.2% 73.2% 59.0% 58.8% 72.3% 39.1% 43.4% 64.6% 16.8 11.8
+50.7% 73.0% 59.6% 60.2% 74.0% 41.5% 42.5% 65.1% 16.2 11.2
+71.7% 78.3% 49.7% 60.5% 29.2% 34.3% 44.0% 55.3% 64.3% 61.0% 24.3% 36.6%
+71.3% 82.7% 46.2% 56.5% 29.0% 33.0% 44.8% 55.1% 63.1% 62.5% 24.5% 34.9%
+74.2% 76.8% 53.6% 52.6% 31.0% 34.1% 43.6% 57.4% 64.5% 63.6% 23.1% 37.3%
+74.7% 79.7% 49.2% 54.7% 30.3% 33.7% 47.9% 58.2% 65.0% 61.8% 24.2% 37.4%
+73.1% 73.4% 48.9% 54.7% 28.1% 31.5% 44.8% 55.3% 63.4% 61.3% 23.3% 38.2%
+70.8% 77.8% 45.3% 52.3% 28.5% 33.9% 44.1% 56.3% 62.1% 61.9% 20.9% 34.5%
+75.4% 82.1% 50.4% 56.9% 29.2% 34.0% 41.9% 56.1% 65.6% 62.8% 25.0% 37.6%
+68.8% 81.5% 52.0% 56.8% 29.4% 31.2% 43.4% 57.2% 64.0% 61.8% 22.1% 36.3%
+79.2% 82.7% 52.5% 59.2% 30.7% 36.3% 43.0% 54.8% 65.9% 63.5% 23.3% 38.8%
+77.1% 84.7% 54.1% 57.1% 31.9% 37.3% 45.3% 56.4% 66.4% 63.9% 24.4% 38.7%
+76.6% 83.0% 57.7% 60.6% 31.2% 37.5% 45.1% 61.4% 64.2% 63.9% 23.3% 39.4%
+76.3% 84.5% 53.8% 55.2% 28.4% 32.6% 43.7% 55.5% 62.5% 57.9% 23.3% 37.8%
+76.4% 83.7% 52.5% 57.4% 33.1% 37.5% 45.4% 58.4% 65.6% 60.6% 24.5% 38.0%
+98.9% 97.6% 90.5% 86.3% 65.4% 3.3% 0.7%
+98.0% 96.2% 91.2% 83.2% 59.8% 7.0% 0.8%
+97.3% 96.9% 92.8% 88.7% 56.1% 2.7% 0.6%
+99.0% 97.4% 92.3% 84.7% 58.4% 5.4% 0.9%
+97.8% 93.4% 87.6% 80.9% 46.4% 7.5% 0.3%
+98.0% 93.4% 87.0% 81.6% 49.0% 3.3% 0.4%
+98.4% 97.8% 96.4% 91.3% 64.7% 1.6% 0.7%
+99.4% 98.6% 96.5% 90.9% 51.1% 5.6% 0.2%
+99.7% 99.1% 95.7% 89.2% 68.4% 4.9% 0.7%
+FDA DAZ INDE
+31.2% 42.4% 32.7% 37.7% 25.5% 31.6% 36.4% 58.9% 62.3% 63.8% 21.0% 38.8%
+34.4% 45.8% 36.2% 44.3% 25.6% 32.4% 35.0% 59.9% 63.0% 62.6% 22.0% 39.1%
+37.8% 43.0% 33.8% 39.6% 25.8% 31.3% 36.7% 57.0% 61.2% 62.7% 22.6% 38.7%
+23.6% 30.7% 27.8% 33.5% 22.7% 28.1% 31.8% 56.2% 58.5% 61.7% 19.8% 33.0%
+41.7% 51.6% 34.8% 47.3% 24.9% 30.9% 35.4% 57.9% 2.8% 64.0% 22.3% 35.8%
+39.9% 50.5% 30.7% 40.3% 24.8% 30.9% 35.0% 56.4% 61.0% 61.3% 21.3% 37.2%
+44.4% 56.8% 38.0% 45.5% 27.0% 32.9% 36.9% 61.7% 62.1% 62.9% 21.8% 39.7%
+35.2% 45.1% 31.1% 41.2% 23.2% 28.1% 32.3% 57.3% 57.0% 61.7% 21.7% 35.4%
+38.2% 52.8% 38.5% 48.7% 23.3% 28.4% 35.6% 58.5% 61.0% 62.1% 21.9% 34.4%
+47.3% 61.9% 38.7% 50.0% 24.0% 30.9% 36.5% 59.9% 61.1% 61.3% 23.5% 39.8%
+99.1% 99.1% 97.9% 97.0% 94.5% 69.8% 29.4%
+98.8% 98.0% 97.6% 96.6% 93.4% 81.1% 17.8%
+99.2% 99.0% 98.4% 97.6% 96.8% 75.6% 6.4%
+99.6% 99.1% 99.1% 98.6% 96.9% 85.5% 2.1%
+32.5% 31.1% 28.7% 22.4% 24.7% 6.1% 0.3%
+30.8% 31.1% 28.9% 27.0% 25.9% 4.0% 0.2%
+31.2% 31.2% 30.5% 30.4% 27.7% 8.1% 0.5%
+30.2% 30.6% 30.7% 25.5% 27.4% 11.8% 0.0%
+31.2% 31.2% 33.0% 27.2% 29.3% 3.9% 0.4%
+30.8% 30.5% 28.6% 26.0% 25.5% 3.2% 0.3%
+32.0% 31.1% 28.5% 26.0% 26.0% 5.4% 0.2%
+31.1% 32.2% 31.7% 26.7% 28.3% 6.8% 0.7%
+33.1% 34.3% 32.1% 28.9% 29.5% 28.7% 21.7%
+34.4% 33.0% 33.0% 28.7% 32.0% 28.7% 9.8%
+33.8% 33.6% 31.4% 31.3% 33.9% 23.1% 1.2%
+34.4% 34.7% 34.2% 29.8% 35.7% 31.4% 12.8%
+55.6% 37.0% 17.9% 10.3% 7.0% 6.2% 3.7%
+63.8% 46.5% 20.1% 11.1% 7.7% 4.7% 3.4%
+41.7% 29.5% 13.8% 9.7% 6.1% 3.6% 2.7%
+50.0% 32.6% 18.0% 9.1% 6.3% 4.6% 3.2%
+49.6% 33.3% 18.3% 11.4% 7.9% 5.3% 3.3%
+58.2% 44.9% 27.0% 16.6% 9.6% 6.8% 5.1%
+39.8% 29.4% 18.5% 9.8% 6.9% 6.0% 3.9%
+55.1% 34.0% 18.1% 10.3% 6.6% 4.3% 3.8%
+59.1% 39.6% 23.9% 12.9% 6.1% 6.5% 4.0%
+NO NOZ uad2
+31.9% 30.4% 24.4% 25.6% 17.9% 14.1% 10.5%
+31.6% 30.5% 26.2% 24.5% 19.7% 15.5% 9.8%
+32.3% 32.3% 24.8% 24.3% 15.7% 15.1% 9.8%
+30.3% 27.5% 22.9% 20.5% 14.2% 11.6% 9.9%
+32.8% 30.1% 24.3% 23.8% 18.2% 14.0% 9.5%
+32.3% 29.9% 24.7% 25.1% 17.3% 14.4% 10.5%
+31.6% 32.7% 25.2% 23.7% 19.5% 16.4% 11.0%
+31.4% 26.6% 20.4% 17.9% 13.7% 11.1% 7.7%
+33.6% 29.8% 23.6% 22.1% 15.2% 14.1% 10.5%
+32.613 30.3% 24.6% 22.6% 18.4% 14.7% 9.9%
+2-hon-4k
+
+Figure 17: Performance of 1.3B-parameter models pretrained on 100B tokens across discriminative (left), generative
+1-hop-Ok
+1-hop-1k
+evaluation (middle), and 1/2-hop reasoning (right) tasks. Best over 2 learning rates.
+1-bop-2k
+1-hop-3k
+1-hop-4k
+1-hop-5k
+1-hop-6k
+2-hop-Ok
+2-hop-1k
+2-hop-2k
+2-hop-3k
+2-hop-5k
+2-hop-6k
+
+9 Real-Life Experiments
+
+We present real-life experiments at the academic scale, pretraining 1.3B-parameter language models
+on 100B tokens using the FineWeb-Edu [40] and SlimPajama [56] datasets, with a context length of
+4096 (details in Appendix B). This setup mirrors configurations widely adopted in recent academic
+studies, including Titans [9], GatedDeltaNet (with conv1d) [67], and MTA [24], and reflects one of
+the most popular pretraining paradigms at this scale.
+Model evaluation is conducted using at least two benchmark suites. The first suite is based
+on lm-evaluation-harness [23], as employed in prior studies [9, 67]. We focus on commonsense
+reasoning tasks, including PIQA [11], HellaSwag [73], WinoGrande [48], ARC-easy (ARC-e) and
+ARC-challenge (ARC-c) [17], SIQA [49], BoolQ [16], WikiText, and LAMBADA (LMB) [39]. These
+tasks evaluate sequence-to-sequence performance, where models solve multi-choice questions by
+scoring each option using log-likelihood. This set is referred to as discriminative evaluation tasks,
+and we adopt the original evaluation pipeline for consistency. 18
+The second suite follows the Just Read Twice (JRT) protocol [8], designed specifically to im-
+18 Following tradition [9, 66, 67], we use (acc_n) for HellaSwag and ARC-c, but acc_n for other tasks.
+
+25
+
+prove the reliability of generative evaluations for smaller-scale pretrained models.19 The six tasks
+in this suite include SWDE and FDA (originally described in [8]), as well as SQuAD(v2) [46],
+TriviaQA [32], Natural Questions (NQ) [36], and DROP [20]. JRT-enhanced variants are denoted
+as FDA2, SWDE2, SQUAD2, etc., to indicate prompt augmentation. This suite is referred to as
+generative evaluation tasks, and we again adopt the original evaluation codebase for comparison.
+Key Observations. Despite identical training setups, model performance varies significantly due
+to random seeds, which affect initialization and data sampling order. For example, Llama(RoPE)-
+1.3B exhibits fluctuations exceeding 4% on LAMBADA, 3% on BoolQ, and 1-3% on
+other discriminative tasks. Variability is greater for generative tasks: FDA fluctuates by 9%,
+SWDE by 8%, and other generative tasks by 3-5% even with JRT prompts enabled. Hence,
+only differences exceeding these thresholds are considered statistically meaningful. From Figure 17:
+• Generative evaluation tasks: Linear models (Mamba2, GLA, and GatedDeltaNet) substan-
+tially underperform full Transformers, even on contexts shorter than their training length. 20
+Retrieval-heavy tasks like FDA/SWDE amplify this gap, aligning with our findings in Result 11.
+• Both GLA and NoPE show poor performance in their base configurations, but significant
+improve with full-score Canon layers. GLA+Canon often matches or surpasses Mamba2, while
+NoPE+Canon performs comparably to ROPE across most tasks. These confirm Result 3+6.
+Conversely, removing conv1d makes Mamba2 perform as bad as GLA, confirming Result 8.
+• While ROPE, ROPE+Canon, and NoPE+Canon excel across tasks without notable differ-
+ences, linear models like GLA+Canon, Mamba2+Canon (or conv1d), and GatedDeltaNet
+(with conv1d) perform similarly. This suggests that at the academic scale (1.3B parameters
+and 100B tokens), pretraining does not reliably highlight finer architectural differences.
+
+Babilong and Multi-Hop Reasoning. The Babilong dataset [35] embeds the original bAbi
+dataset [64] into passages with varied lengths of “junk” information to test multi-hop reasoning in
+long contexts. At the academic pretraining scale, Babilong is overly challenging.21 Our Figure 23 in
+the appendix show that it is difficult to use Babilong to evaluate reasoning or length generalization.
+The only statistical significant findings (in our standard) are:
+• Linear models underperform Transformers even in short contexts, confirming their weakness
+stems not from memory but from inefficiencies in compression and retrieval (c.f. Result 11).
+• Transformers show significant long-context gains when RoPE is reduced (RoPEJ) or removed
+(NOPE), particularly in junk contexts extending to 4k tokens in length.
+To address Babilong's limitations, we introduce simpler evaluation tasks for multi-hop reasoning.
+Task 1-hop-L embeds five birth-year statements within Wikipedia passages of length L, prompting
+models to recall birth years. Task 2-hop-L uses three birth-year statements followed by three
+equivalence links (e.g., “X was born the same year as Y"), prompting models to infer the birth
+years of linked names. Details are in Appendix B. These tasks are designed to be the most natural,
+leveraging common English (e.g., birth years). Results from Figure 17 show:
+19 Generative testing can be noisy at this scale, as such models often struggle with prompt comprehension. JRT
+addresses this by repeating the context and question twice, allowing models to more accurately reveal their intrinsic
+generative capabilities.
+20 Generative task prompts are capped at 1024 tokens (or 2048 tokens for JRT prompts) based on the original
+codebase, while models were trained with 4096-token sequences.
+21 For example, in babilong.qa2, the passage "Charlie went to the kitchen. Charlie got a bottle. Charlie moved
+to the balcony." is followed by the 2-hop question: "Where is the bottle?" Models fail even without junk context,
+achieving below 37% accuracy essentially random guessing
+
+26
+
+• All models struggle with 2-hop-L, only 30-36% accuracy (i.e., random guess) even with L = 0.
+• 1-hop-L distinguishes architectures: full Transformers outperform linear models at L = 0,
+while NoPE-based Transformers and RoPE(J) length-generalizes better as L increases.
+
+Result 12 (Figure 17+23). Academic-scale pretraining—1.3B-parameter models trained on 100B
+tokens with a context length of 4096-exhibits high noise and limited resolution, with most archi-
+tectural differences statistically insignificant. Yet, some consistent findings emerge:
+• Linear models (Mamba2, GLA, GatedDeltaNet) underperform full Transformers even on
+short-context retrieval tasks (1-hop-L, FDA, SWDE), even with Canon layers (c.f. Result 11).
+• Canon layers strongly elevate GLA to Mamba2-level, NoPE to RoPE-level (c.f. Result 3+6);
+conversely, removing conv1d sharply downgrades Mamba2 to GLA (c.f. Result 8).
+• All models struggle with 2-hop tasks, even in 100-token contexts, highlighting the limits of
+academic-scale pretraining.
+• Reducing or removing RoPE (i.e., NoPE or RoPE.) improves long-context generalization.
+
+10 Conclusion and Future Direction
+We introduce Canon layers, lightweight constructs enhancing horizontal information flow, notably
+advancing reasoning depth/breadth, knowledge capacity/manipulation, and hierarchical structure
+learning across diverse architectures. Our synthetic tasks rigorously isolate architectural capabil-
+ities, overcoming the noise and randomness of real-world academic-scale (1.3B parameters, 100B
+tokens) pretraining experiments.
+
+Canon layers transform historically weak architectures
+such as NoPE transformers to RoPE-
+level, and linear attention (GLA) to Mamba-level and significantly reduce reliance on RoPЕ,
+improving length generalization. Additionally, our findings clarify that linear models' poor rea-
+soning depth originates from inefficient token compression and retrieval processes, not recurrent
+memory limitations.
+
+Moreover, our synthetic tasks underscore the value of controlled, predictive benchmarks for ar-
+chitecture evaluation. Compared to typical academic-scale real-life setups, our synthetic playground
+reveals clearer insights into true model capabilities and scaling behavior.
+
+Future Directions. Several interesting directions arise from this work:
+• ALTERNATIVE CANON IMPLEMENTATIONS. We focused on simple linear convolutional (ker-
+nel size-3) Canon layers, owing to their conceptual simplicity and efficient CUDA kernels.
+Future work should explore dynamic, adaptive convolution methods-weights conditioned on
+hidden states enabling gating-investigating whether performance benefits offset additional
+computational overhead.
+• FINE-GRAINED CANON DESIGN CHOICES. We briefly explored simplifying Canon usage, such
+as applying it selectively (e.g., mainly in early layers) or using cross-layer Canon connections
+like he+1 = he+1 + Canon(he). Such cross-layer connections naturally improve computational
+efficiency- e
