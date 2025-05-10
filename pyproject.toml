@@ -14,8 +14,7 @@ db-dtypes = "^1.2.0"
 docker = "^7.1.0"
 fastapi = "^0.111.0"
 gunicorn = "^22.0.0"
-google-cloud-aiplatform = ">=1.71.0,<2.0.0"
-google-genai = "^1.10.0"
+google-genai = "^1.13.0"
 googlemaps = "^4.10.0"
 instructor = ">=1.4.3,<2.0.0"
 ipykernel = ">=6.29,<7.0"
@@ -33,7 +32,6 @@ requests = "^2.27.1"
 scikit-learn = ">=1.5.0"
 seaborn = ">=0.13.0"
 uvicorn = "*"
-vertexai = "*"
 weasyprint = "*"
 ruff = "*"
 black = "*"
@@ -103,6 +101,12 @@ convention = "google"
     # The below are debateable
     "PLR2004", # Magic value used in comparison, ...
     "S311", # Standard pseudo-random generators are not suitable for cryptographic purposes
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "manual: Run tests that interact with live external APIs (select with '-m manual')"
 ]
 
 [tool.poetry.scripts]

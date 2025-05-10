@@ -14,3 +14,9 @@ recordings
 .memory_db
 examples/outputs
 examples/output
+.DS_Store
+**/.DS_Store
+PROJECT_PLANS_PRDS
+PERSONAL_NOTES
+*TODO*.md
+processed_papers
