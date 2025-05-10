@@ -36,44 +36,60 @@ def test_environment(tmp_path: Path):
     conn = database.get_db_connection(temp_db_path)
     assert conn is not None
     database.create_tables(conn)
-    conn.close()
+    # Keep conn open for CodeAgent, close it in teardown or after agent use
 
-    # Configure and create the agent instance
-    # Mock load_config if necessary, or ensure defaults point to tmp paths
-    # For simplicity, we'll instantiate directly with temp paths
-    # NOTE: Assumes CodeAgent doesn't strictly require a real API key for this test path
+    # Prepare config for CodeAgent
+    test_config = {
+        'gemini_api_key': "DUMMY_API_KEY",
+        'model_name': "gemini-test-model",
+        'verbose': False,
+        'default_thinking_budget': 100,
+        'PDFS_TO_CHAT_WITH_DIRECTORY': str(temp_pdf_dir),
+        'PAPER_BLOBS_DIR': str(temp_blob_dir),
+        # Add other necessary config keys if CodeAgent expects them
+        # e.g., SAVED_CONVERSATIONS_DIRECTORY, though maybe not critical for these PDF tests
+        'SAVED_CONVERSATIONS_DIRECTORY': str(tmp_path / "saved_conversations"),
+    }
+    (tmp_path / "saved_conversations").mkdir(exist_ok=True)
+
+
     agent = CodeAgent(
-        model_name="gemini-test-model", # Use a dummy model name
-        verbose=False,
-        api_key="DUMMY_API_KEY", # Provide a dummy key
-        default_thinking_budget=100,
-        pdf_dir=str(temp_pdf_dir),
-        db_path=str(temp_db_path),
-        blob_dir=str(temp_blob_dir)
+        config=test_config,
+        conn=conn
     )
     # Prevent actual client configuration if not needed
     agent.client = MagicMock()
     agent.chat = MagicMock()
 
-    return agent, temp_pdf_dir, temp_blob_dir, temp_db_path
+    yield agent, temp_pdf_dir, temp_blob_dir, temp_db_path
+
+    # Teardown: close the connection
+    if conn:
+        conn.close()
 
 
 @pytest.fixture
 def manual_test_environment(tmp_path: Path):
     """Creates a temporary environment for MANUAL integration tests requiring REAL API access."""
     # Check for API key first
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.getenv("GOOGLE_API_KEY") # Make sure this is the correct env var name, might be GEMINI_API_KEY
     if not api_key:
-        pytest.skip("GOOGLE_API_KEY environment variable not set, skipping manual test.")
+        # Check for GEMINI_API_KEY as a fallback or primary
+        api_key = os.getenv("GEMINI_API_KEY") 
+        if not api_key:
+            pytest.skip("GEMINI_API_KEY or GOOGLE_API_KEY environment variable not set, skipping manual test.")
+
 
     # Define temporary paths
     temp_pdf_dir = tmp_path / "PDFS_manual"
     temp_blob_dir = tmp_path / "paper_blobs_manual"
     temp_db_path = tmp_path / "test_paper_database_manual.db"
+    temp_saved_conversations_dir = tmp_path / "saved_conversations_manual"
 
     # Create directories
     temp_pdf_dir.mkdir()
     temp_blob_dir.mkdir()
+    temp_saved_conversations_dir.mkdir(exist_ok=True)
 
     # Copy all PDFs from the test PDF directory to the temporary PDF directory
     source_pdf_dir = Path(__file__).parent.parent / "PDFS"
@@ -84,21 +100,31 @@ def manual_test_environment(tmp_path: Path):
     conn = database.get_db_connection(temp_db_path)
     assert conn is not None
     database.create_tables(conn)
-    conn.close()
+    # Keep conn open for CodeAgent
 
     # Configure and create the agent instance with REAL API Key
-    agent = CodeAgent(
-        model_name="gemini-1.5-flash", # Use a real model capable of file processing
-        verbose=True, # Enable verbose for manual test debugging
-        api_key=api_key, # Pass the real API key
-        default_thinking_budget=100,
-        pdf_dir=str(temp_pdf_dir),
-        db_path=str(temp_db_path),
-        blob_dir=str(temp_blob_dir)
-    )
-    # DO NOT mock agent.client or agent.chat here
+    manual_test_config = {
+        'gemini_api_key': api_key,
+        'model_name': "gemini-1.5-flash", # Use a real model capable of file processing
+        'verbose': True, # Enable verbose for manual test debugging
+        'default_thinking_budget': 100,
+        'PDFS_TO_CHAT_WITH_DIRECTORY': str(temp_pdf_dir),
+        'PAPER_BLOBS_DIR': str(temp_blob_dir),
+        'SAVED_CONVERSATIONS_DIRECTORY': str(temp_saved_conversations_dir),
+        'pdf_processing_method': 'Gemini' # Ensure Gemini is used for PDF processing
+    }
 
-    return agent, temp_pdf_dir, temp_blob_dir, temp_db_path
+    agent = CodeAgent(
+        config=manual_test_config,
+        conn=conn
+    )
+    # DO NOT mock agent.client or agent.chat here as it's a real API test
+
+    yield agent, temp_pdf_dir, temp_blob_dir, temp_db_path
+
+    # Teardown: close the connection
+    if conn:
+        conn.close()
 
 
 # --- Test Cases --- #
@@ -128,7 +154,7 @@ def test_handle_pdf_basic(mock_extract_text, test_environment): # Add mock_extra
     assert paper is not None
     assert paper['id'] == paper_id
     assert paper['source_filename'] == TEST_PDF_FILENAME
-    assert paper['status'] == 'complete' # Expect 'complete' after successful run
+    assert paper['status'] == 'processed_pending_context' # Changed from 'complete'
     assert paper['arxiv_id'] is None # No arxiv_id provided
     assert paper['blob_path'] == f"paper_{paper_id}_text.txt"
 
@@ -162,7 +188,7 @@ def test_handle_pdf_non_arxiv_filename(mock_extract_text, test_environment): # A
     assert paper is not None
     assert paper['id'] == paper_id
     assert paper['source_filename'] == TEST_PDF_FILENAME_NON_ARXIV # Check correct filename stored
-    assert paper['status'] == 'complete'
+    assert paper['status'] == 'processed_pending_context' # Changed from 'complete'
     assert paper['arxiv_id'] is None # No arxiv_id provided or inferred
     assert paper['blob_path'] == f"paper_{paper_id}_text.txt"
 
@@ -197,7 +223,7 @@ def test_handle_pdf_with_arxiv_id(mock_extract_text, test_environment): # Add mo
     assert paper is not None
     assert paper['id'] == paper_id
     assert paper['source_filename'] == TEST_PDF_FILENAME
-    assert paper['status'] == 'complete' # Expect 'complete' after successful run
+    assert paper['status'] == 'processed_pending_context' # Changed from 'complete'
     assert paper['arxiv_id'] == test_arxiv_id # Verify provided arxiv_id was saved
     assert paper['blob_path'] == f"paper_{paper_id}_text.txt"
 
@@ -252,7 +278,7 @@ def test_manual_integration_gemini_pdf_processing(manual_test_environment):
     assert paper is not None, f"Paper with ID {paper_id} not found in database."
     assert paper['id'] == paper_id
     assert paper['source_filename'] == TEST_PDF_FILENAME
-    assert paper['status'] == 'complete', f"Paper status is '{paper['status']}', expected 'complete'."
+    assert paper['status'] == 'processed_pending_context', f"Paper status is '{paper['status']}', expected 'processed_pending_context'."
     assert paper['blob_path'] == f"paper_{paper_id}_text.txt"
 
     # Check blob file

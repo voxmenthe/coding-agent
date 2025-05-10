@@ -760,10 +760,10 @@ class CodeAgent:
             extracted_text = None
             try:
                 # TODO: Implement fallback to pypdf if configured or if gemini fails?
-                if self.pdf_processing_method == 'Gemini':
+                if self.pdf_processing_method.lower() == 'gemini':
                      extracted_text = tools.extract_text_from_pdf_gemini(pdf_path, self.client, self.model_name)
                 # Add other methods like pypdf here if needed
-                # elif self.pdf_processing_method == 'pypdf':
+                # elif self.pdf_processing_method.lower() == 'pypdf':
                 #    extracted_text = tools.extract_text_from_pdf_pypdf(pdf_path) # Assuming this exists
                 else:
                     raise ValueError(f"Unsupported pdf_processing_method: {self.pdf_processing_method}")
