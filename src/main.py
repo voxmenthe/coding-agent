@@ -10,8 +10,8 @@ import traceback
 import argparse
 import functools
 import logging
-import asyncio, threading
-from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
+import asyncio, threading, uuid # Added uuid
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, TextColumn, BarColumn # Added TextColumn, BarColumn
 from prompt_toolkit.completion import WordCompleter, NestedCompleter, PathCompleter, Completer, Completion
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
@@ -20,6 +20,10 @@ import yaml
 import sqlite3
 from typing import Optional
 from dotenv import load_dotenv # Import dotenv
+from datetime import datetime, timezone # Added for processed_timestamp
+import sys # For sys.executable
+import subprocess # For running scripts
+# from google.generativeai import types as genai_types # This was incorrect for the new SDK as the `google.generativeai` SDK is deprecated and we should use `google.genai` SDK instead
 
 
 # Setup basic logging
@@ -128,12 +132,21 @@ class CodeAgent:
         self.pdf_processing_method = config.get('pdf_processing_method', 'Gemini') # Default method
         self.client = None
         self.chat = None
+        self.db_path_str = str(config.get('PAPER_DB_PATH')) if config.get('PAPER_DB_PATH') else None # Store DB path string
         
-        # # Background asyncio loop (daemon so app exits cleanly)
-        # self.loop = asyncio.new_event_loop()
-        # threading.Thread(target=self.loop.run_forever, daemon=True).start()
-        # # Async GenAI client that lives on that loop
-        # self.async_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY")).aio
+        # Background asyncio loop (daemon so app exits cleanly)
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        # Async GenAI client that lives on that loop
+        if self.api_key: # Ensure API key exists before creating async client
+            self.async_client = genai.Client(api_key=self.api_key).aio
+        else:
+            self.async_client = None
+            logger.warning("GEMINI_API_KEY not found. Async GenAI client not initialized.")
+
+        # Collection to keep track of active background tasks (Future objects and metadata)
+        self.active_background_tasks = {}
+        self.pending_script_output: Optional[str] = None # For output from /run_script
         
         self.conversation_history = [] # Manual history for token counting ONLY
         self.current_token_count = 0 # Store token count for the next prompt
@@ -268,13 +281,16 @@ class CodeAgent:
         print("   Use '/save <optional_filename>' to save the current conversation.")
         print("   Use '/load <filename>' to load a saved conversation.")
         print(f"   Use '/thinking_budget <value>' to set tool thinking budget (current: {self.thinking_budget}).") # Updated help
+        print(f"   Use '/cancel <task_id>' to attempt to cancel a background task.")
+        print(f"   Use '/tasks' to list active background tasks.")
+        print(f"   Use '/run_script <python|shell> <script_path> [args...]' to run a script.")
 
         # Set initial thinking budget from default/config
         self.thinking_config = types.ThinkingConfig(thinking_budget=self.thinking_budget)
         print(f"\n🧠 Initial thinking budget set to: {self.thinking_budget} tokens.")
 
         # Define slash commands and setup nested completer
-        slash_commands = ['/reset', '/exit', '/q', '/clear', '/save', '/thinking_budget'] # Added /thinking_budget
+        slash_commands = ['/reset', '/exit', '/q', '/clear', '/save', '/thinking_budget', '/cancel', '/tasks', '/run_script']
         # pdf_files = [] # <-- Remove old pdf_files list creation
         # if self.pdfs_dir_abs_path.is_dir():
         #     try:
@@ -338,40 +354,31 @@ class CodeAgent:
                     self.messages_per_interval.pop()
                     continue
 
-                # count this turn
-                self._messages_this_interval += 1
-                message_to_send = user_input                 # ← default
-                
-                # ─── 3 · prompt injection ─────────────────────────────────────
-                prompt_len = len(self.pending_prompt) if self.pending_prompt else 0
-                if self.pending_prompt:
-                    print("[Including loaded prompt.]\n")
-                    message_to_send = f"{self.pending_prompt}\n\n{message_to_send}"
-                    self.pending_prompt = None
-                
-                # Check for PDF context AFTER prompt (so prompt comes first)
-                pdf_context_len = len(self.pending_pdf_context) if self.pending_pdf_context else 0
-                if self.pending_pdf_context:
-                    print("[Including context from previously processed PDF.]\n")
-                    message_to_send = f"{self.pending_pdf_context}\n\n{message_to_send}"
-                    self.pending_pdf_context = None        # consume exactly once
-                
-                
-                # --- Log message details before sending --- 
-                final_message_len = len(message_to_send)
-                logger.info(f"Preparing to send message.")
-                logger.info(f"  - Original user input length: {len(user_input)}")
-                logger.info(f"  - Pending prompt length (before clear): {prompt_len}")
-                logger.info(f"  - Pending PDF context length (before clear): {pdf_context_len}")
-                logger.info(f"  - Final message_to_send length: {final_message_len}")
-                # Log snippets for verification
-                if final_message_len > 200:
-                    logger.info(f"  - Final message start: {message_to_send[:100]}...")
-                    logger.info(f"  - Final message end: ...{message_to_send[-100:]}")
-                
-                # --- Handle User Commands --- 
-                # --- /save command ---
-                if user_input.lower().startswith("/save"):
+                # --- Handle User Commands FIRST --- 
+                # (This is important so local commands don't accidentally consume contexts
+                # that were meant for an LLM call that happens later)
+                if user_input.lower().startswith("/pdf"): # Already handles its own continue
+                    args = user_input.split()[1:]
+                    self._handle_pdf_command(args)
+                    # self._messages_this_interval is not incremented for this local command
+                    continue  
+
+                elif user_input.lower().startswith("/prompt "):
+                    parts = user_input.split(maxsplit=1)
+                    prompt_name = parts[1] if len(parts) == 2 else ""
+                    prompt_content = self._load_prompt(prompt_name)
+                    if prompt_content:
+                        self.pending_prompt = prompt_content
+                        print(f"\n✅ Prompt '{prompt_name}' loaded. "
+                              "It will be included in your next message to the LLM.")
+                    else:
+                        print(f"\n❌ Prompt '{prompt_name}' not found.")
+                    # self._messages_this_interval is not incremented
+                    continue
+
+                elif user_input.lower().startswith("/save"):
+                    # ... (existing /save logic) ... 
+                    # Ensure it continues and does not increment _messages_this_interval
                     import json
                     import datetime
                     parts = user_input.split()
@@ -384,20 +391,19 @@ class CodeAgent:
                             filename = f'{now}.json'
 
                     save_path = Path(__file__).parent.parent / self.config.get('SAVED_CONVERSATIONS_DIRECTORY', 'SAVED_CONVERSATIONS/') / filename
-                    # Prepare state dict
                     save_state = {
                         'conversation_history': [],
                         'current_token_count': self.current_token_count,
                         'prompt_time_counts': self.prompt_time_counts,
                         'messages_per_interval': self.messages_per_interval,
-                        '_messages_this_interval': self._messages_this_interval,
+                        '_messages_this_interval': self._messages_this_interval, # Save current state before potential LLM call
                         'active_files': [getattr(f, 'name', str(f)) for f in self.active_files],
                         'thinking_budget': self.thinking_budget,
+                        'pending_prompt': self.pending_prompt, # Save pending states
+                        'pending_pdf_context': self.pending_pdf_context
                     }
-                    # Convert Content objects to serializable dictionaries
                     serializable_history = []
                     for content in self.conversation_history:
-                        # Ensure parts is a list of strings
                         parts_text = [part.text for part in content.parts if hasattr(part, 'text') and part.text is not None]
                         serializable_history.append({
                             'role': content.role,
@@ -412,8 +418,9 @@ class CodeAgent:
                         print(f"\n❌ Failed to save conversation: {e}")
                     continue
 
-                # --- /load command ---
-                if user_input.lower().startswith("/load"):
+                elif user_input.lower().startswith("/load"):
+                    # ... (existing /load logic) ...
+                    # Ensure it continues and does not increment _messages_this_interval
                     import json
                     parts = user_input.split()
                     if len(parts) > 1:
@@ -428,14 +435,11 @@ class CodeAgent:
                     try:
                         with open(load_path, 'r') as f:
                             load_state = json.load(f)
-                        # Restore state
                         reconstructed_history = []
                         if 'conversation_history' in load_state and isinstance(load_state['conversation_history'], list):
                             for item in load_state['conversation_history']:
                                 if isinstance(item, dict) and 'role' in item and 'parts' in item and isinstance(item['parts'], list):
-                                    # Recreate Parts from the list of text strings
                                     parts = [types.Part(text=part_text) for part_text in item['parts'] if isinstance(part_text, str)]
-                                    # Recreate Content object
                                     content = types.Content(role=item['role'], parts=parts)
                                     reconstructed_history.append(content)
                                 else:
@@ -447,18 +451,21 @@ class CodeAgent:
                         self.current_token_count = load_state.get('current_token_count', 0)
                         self.prompt_time_counts = load_state.get('prompt_time_counts', [0])
                         self.messages_per_interval = load_state.get('messages_per_interval', [0])
-                        self._messages_this_interval = load_state.get('_messages_this_interval', 0)
+                        self._messages_this_interval = load_state.get('_messages_this_interval', 0) # Restore this carefully
                         self.active_files = []  # Don't restore files by default
                         self.thinking_budget = load_state.get('thinking_budget', DEFAULT_THINKING_BUDGET)
-                        # Re-create chat session with loaded history
+                        self.pending_prompt = load_state.get('pending_prompt') # Restore pending states
+                        self.pending_pdf_context = load_state.get('pending_pdf_context')
                         self.chat = self.client.chats.create(model=self.model_name, history=self.conversation_history)
                         print(f"\n📂 Loaded conversation from: {filename}")
+                        if self.pending_prompt: print("   Loaded pending prompt is active.")
+                        if self.pending_pdf_context: print("   Loaded pending PDF context is active.")
                     except Exception as e:
                         print(f"\n❌ Failed to load conversation: {e}")
                     continue
 
-                # --- /thinking_budget command ---
                 elif user_input.lower().startswith("/thinking_budget"):
+                    # ... (existing /thinking_budget logic) ...
                     parts = user_input.split()
                     if len(parts) == 2:
                         try:
@@ -473,118 +480,191 @@ class CodeAgent:
                             print("\n⚠️ Invalid number format for thinking budget.")
                     else:
                         print("\n⚠️ Usage: /thinking_budget <number_of_tokens>")
-                    continue # Skip sending command to model
-
-                # Check if the user input starts with '/pdf '
-                if user_input.lower().startswith("/pdf"):
-                    args = user_input.split()[1:]
-                    self._handle_pdf_command(args)
-                    continue  
+                    continue
 
                 elif user_input.lower() == "/reset":
+                    # ... (existing /reset logic) ...
                     print("\n🎯 Resetting context and starting a new chat session...")
                     self.chat = self.client.chats.create(model=self.model_name, history=[])
                     self.conversation_history = []
                     self.current_token_count = 0
                     self.active_files = []
-                    # Reset tracking lists
                     self.prompt_time_counts = [0]
                     self.messages_per_interval = [0]
-                    self._messages_this_interval = 0
+                    self._messages_this_interval = 0 
+                    self.pending_prompt = None # Clear pending states on reset
+                    self.pending_pdf_context = None
                     print("\n✅ Chat session and history cleared.")
-                    # Decrement message counter as this command 'message' doesn't persist
-                    self._messages_this_interval = 0 # Should already be 0 but reset for safety
-                    continue # Skip sending this command to the model
+                    continue
 
                 elif user_input.lower().startswith("/clear "):
-                    # Decrement message counter as this command 'message' doesn't persist
-                    self._messages_this_interval -= 1 
+                    # ... (existing /clear logic) ...
                     try:
                         parts = user_input.split()
                         if len(parts) != 2:
                             raise ValueError("Usage: /clear <number_of_tokens>")
-                        tokens_to_clear = int(parts[1])
-                        if tokens_to_clear <= 0:
+                        tokens_to_clear_target = int(parts[1])
+                        if tokens_to_clear_target <= 0:
                             raise ValueError("Number of tokens must be positive.")
 
-                        if not self.chat or not self.chat.history or len(self.prompt_time_counts) <= 1:
-                            print("Chat history is empty or too short to clear.")
+                        if not self.conversation_history:
+                            print("Chat history is already empty.")
                             continue
 
-                        # Find the index corresponding to the interval to clear up to
-                        # We look for the last count <= tokens_to_clear
-                        # `bisect_right` finds the insertion point for tokens_to_clear
-                        # The interval *before* this insertion point is the one we clear up to.
-                        idx = bisect.bisect_right(self.prompt_time_counts, tokens_to_clear)
+                        logger.info(f"Attempting to clear approx. {tokens_to_clear_target} tokens from history.")
                         
-                        # We need at least one interval before the target to clear anything
-                        if idx <= 1:
-                            print(f"Requested tokens ({tokens_to_clear}) is less than the first recorded interval ({self.prompt_time_counts[1]}). No messages cleared.")
-                            continue
+                        new_history = list(self.conversation_history)
+                        tokens_counted_for_removal = 0
+                        messages_removed_count = 0
+
+                        while tokens_counted_for_removal < tokens_to_clear_target and new_history:
+                            first_message = new_history[0]
+                            try:
+                                message_tokens = self.client.models.count_tokens(model=self.model_name, contents=[first_message]).total_tokens
+                            except Exception as e_count:
+                                logger.error(f"Could not count tokens for a message during /clear: {e_count}. Skipping message token count.")
+                                message_tokens = 75 # Arbitrary average, or could stop clear
                             
-                        idx_to_clear_up_to = idx - 1 # Index of the last count <= N
+                            tokens_counted_for_removal += message_tokens
+                            new_history.pop(0)
+                            messages_removed_count += 1
+                        
+                        logger.info(f"After initial pass, {messages_removed_count} messages ({tokens_counted_for_removal} tokens) selected for removal.")
+                        logger.info(f"Remaining history length before role check: {len(new_history)}")
 
-                        tokens_actually_cleared = self.prompt_time_counts[idx_to_clear_up_to]
-                        messages_to_remove = sum(self.messages_per_interval[0:idx_to_clear_up_to + 1])
-
-                        if messages_to_remove <= 0:
-                             print("No messages to clear based on calculated intervals.")
+                        # Ensure remaining history starts with a user turn
+                        if new_history and new_history[0].role != "user":
+                            logger.warning("History after initial clear pass starts with a model turn. Removing additional leading model messages.")
+                            additional_messages_removed_for_role = 0
+                            while new_history and new_history[0].role != "user":
+                                new_history.pop(0)
+                                additional_messages_removed_for_role += 1
+                            messages_removed_count += additional_messages_removed_for_role
+                            logger.info(f"Removed {additional_messages_removed_for_role} additional messages to ensure user turn start.")
+                        
+                        if not new_history and not self.conversation_history: # No change if already empty
+                             print("Chat history is already empty. No action taken.")
                              continue
-                             
-                        if messages_to_remove >= len(self.chat.history):
-                            print("Clearing entire history based on calculation.")
-                            messages_to_remove = len(self.chat.history) # Avoid index error
-                            # Reset fully
-                            self.chat.history = []
-                            self.conversation_history = []
+                        elif len(new_history) == len(self.conversation_history) and messages_removed_count == 0: # No messages were actually removed
+                            print(f"No messages were cleared. Requested {tokens_to_clear_target} tokens might be less than the first message(s) or history is too short.")
+                            continue
+
+                        self.conversation_history = new_history
+                        history_was_modified = True # Assume modification if we got this far and something changed.
+
+                        # Recalculate all tracking information based on the new history
+                        if not self.conversation_history:
                             self.current_token_count = 0
                             self.prompt_time_counts = [0]
                             self.messages_per_interval = [0]
-                            self._messages_this_interval = 0
                         else:
-                            print(f"Attempting to remove {messages_to_remove} messages, clearing up to {tokens_actually_cleared} tokens.")
-                            # Slice history
-                            self.chat.history = self.chat.history[messages_to_remove:]
-
-                            # Adjust tracking lists
-                            remaining_message_counts = self.messages_per_interval[idx_to_clear_up_to + 1:]
-                            remaining_token_counts = self.prompt_time_counts[idx_to_clear_up_to + 1:]
-                            
-                            self.messages_per_interval = [0] + remaining_message_counts
-                            self.prompt_time_counts = [0] + [count - tokens_actually_cleared for count in remaining_token_counts]
-
-                            # Recalculate the current token count accurately from the remaining history
                             self.current_token_count = self.client.models.count_tokens(
                                 model=self.model_name,
-                                contents=self.chat.history
+                                contents=self.conversation_history
                             ).total_tokens
-                            # Ensure the last tracked count matches the actual count
-                            if self.prompt_time_counts:
-                                self.prompt_time_counts[-1] = self.current_token_count
-                            else: # Should not happen if history exists, but safety check
-                                self.prompt_time_counts = [0]
-                                self.messages_per_interval = [0]
+                            # Simplified tracking reset for prompt_time_counts and messages_per_interval
+                            self.prompt_time_counts = [0, self.current_token_count] 
+                            self.messages_per_interval = [0, len(self.conversation_history)]
+                        
+                        self._messages_this_interval = 0 # Reset for the current interval
 
-                        print(f"\n✅ Approximately cleared {messages_to_remove} message(s) "
-                              f"(up to {tokens_actually_cleared} tokens). "
-                              f"New total tokens: {self.current_token_count}")
+                        if history_was_modified:
+                            try:
+                                self.chat = self.client.chats.create(model=self.model_name, history=self.conversation_history)
+                                logger.info("Chat session re-initialized after /clear operation.")
+                            except Exception as e_chat_reinit: # More general catch, includes ValueError
+                                logger.error(f"Error re-initializing chat after /clear: {e_chat_reinit}", exc_info=True)
+                                print(f"\n⚠️ Error re-initializing chat session: {e_chat_reinit}.")
+                                # If re-init fails, history might be inconsistent with self.chat. 
+                                # Forcing full clear as a fallback might be too drastic if the count was just off.
+                                # For now, we alert and the history is what it is.
 
+                            print(f"\n✅ Cleared {messages_removed_count} message(s) (approx. {tokens_counted_for_removal} tokens counted for removal). "
+                                  f"New total tokens: {self.current_token_count}")
+                        
                     except Exception as e:
                         print(f"⚠️ Error processing /clear command: {e}")
-                    continue # Skip sending this command to the model
+                        logger.error("Error in /clear command", exc_info=True)
+                    continue
 
-                # --- /prompt command ---
-                if user_input.lower().startswith("/prompt "):
-                    parts = user_input.split(maxsplit=1)
-                    prompt_name = parts[1] if len(parts) == 2 else ""
-                    prompt_content = self._load_prompt(prompt_name)
-                    if prompt_content:
-                        self.pending_prompt = prompt_content
-                        print(f"\n✅ Prompt '{prompt_name}' loaded. "
-                              "It will be included in your next message.")
+                elif user_input.lower().startswith("/run_script "):
+                    args = user_input.split()
+                    if len(args) >= 3:
+                        script_type = args[1].lower()
+                        script_path = args[2]
+                        script_arguments = args[3:]
+                        if script_type in ["python", "shell"]:
+                            self._handle_run_script_command(script_type, script_path, script_arguments)
+                        else:
+                            print("\n⚠️ Invalid script type. Must be 'python' or 'shell'. Usage: /run_script <python|shell> <script_path> [args...]")
                     else:
-                        print(f"\n❌ Prompt '{prompt_name}' not found.")
-                    continue                           # <‑‑ early return # Skip sending command to model
+                        print("\n⚠️ Usage: /run_script <python|shell> <script_path> [args...]")
+                    continue
+
+                elif user_input.lower().startswith("/cancel "):
+                    args = user_input.split(maxsplit=1)
+                    if len(args) > 1:
+                        self._handle_cancel_command(args[1])
+                    else:
+                        print("\n⚠️ Usage: /cancel <task_id>")
+                    continue
+
+                elif user_input.lower() == "/tasks":
+                    self._handle_list_tasks_command()
+                    continue
+
+                # If we haven't 'continued' from a local command, it's a message for the LLM.
+                self._messages_this_interval += 1 # Count this turn as an LLM message
+                message_to_send = user_input # Default
+
+                # Flags to track if contexts were used in this specific message
+                prompt_was_included = False
+                pdf_context_was_included = False
+                script_output_was_included = False # New flag
+                 
+                # ─── 3 · prompt injection ─────────────────────────────────────
+                if self.pending_prompt:
+                    print("[Including previously loaded prompt in this message.]\n")
+                    message_to_send = f"{self.pending_prompt}\n\n{message_to_send}"
+                    prompt_was_included = True
+                
+                # Check for PDF context AFTER prompt (so prompt comes first)
+                if self.pending_pdf_context:
+                    print("[Including context from previously processed PDF in this message.]\n")
+                    message_to_send = f"{self.pending_pdf_context}\n\n{message_to_send}"
+                    pdf_context_was_included = True
+                
+                # Prepend script output AFTER PDF but BEFORE loaded prompt
+                if self.pending_script_output:
+                    print("[Including output from previously run script in this message.]\n")
+                    # Task name might not be easily available here, use a generic header
+                    message_to_send = f"OUTPUT FROM EXECUTED SCRIPT:\n---\n{self.pending_script_output}\n---\n\n{message_to_send}"
+                    script_output_was_included = True
+                
+                # --- Log message details before sending --- 
+                prompt_len_before_send = len(self.pending_prompt) if self.pending_prompt and prompt_was_included else 0
+                pdf_context_len_before_send = len(self.pending_pdf_context) if self.pending_pdf_context and pdf_context_was_included else 0
+                script_output_len_before_send = len(self.pending_script_output) if self.pending_script_output and script_output_was_included else 0
+                final_message_len = len(message_to_send)
+                logger.info(f"Preparing to send message.")
+                logger.info(f"  - Original user input length: {len(user_input)}")
+                logger.info(f"  - Included pending prompt length: {prompt_len_before_send}")
+                logger.info(f"  - Included pending PDF context length: {pdf_context_len_before_send}")
+                logger.info(f"  - Included pending script output length: {script_output_len_before_send}")
+                logger.info(f"  - Final message_to_send length: {final_message_len}")
+                # Log snippets for verification
+                if final_message_len > 200:
+                    logger.info(f"  - Final message start: {message_to_send[:100]}...")
+                    logger.info(f"  - Final message end: ...{message_to_send[-100:]}")
+                
+                # --- Handle User Commands --- 
+                # --- /save command ---
+                # --- /load command ---
+                # --- /thinking_budget command ---
+                # --- /pdf command ---
+                # --- /reset command ---
+                # --- /clear command ---
+                # --- /prompt command ---
 
                 # --- Prepare message content (Text + Files) ---
                 message_content = [message_to_send]
@@ -671,6 +751,17 @@ class CodeAgent:
                     logger.error(f"Error calculating token count: {count_err}", exc_info=True)
                     print("🚨 Error: Failed to calculate token count.")
 
+                # --- NOW clear contexts that were actually sent --- 
+                if prompt_was_included:
+                    self.pending_prompt = None
+                    logger.info("Cleared pending_prompt after sending to LLM.")
+                if pdf_context_was_included:
+                    self.pending_pdf_context = None
+                    logger.info("Cleared pending_pdf_context after sending to LLM.")
+                if script_output_was_included:
+                    self.pending_script_output = None
+                    logger.info("Cleared pending_script_output after sending to LLM.")
+
             except KeyboardInterrupt:
                 print("\n👋 Goodbye!")
                 break
@@ -689,149 +780,498 @@ class CodeAgent:
         return wrapper
 
     def _handle_pdf_command(self, args: list):
-        """Handles the /pdf command to process a PDF file and save metadata/text.
-
-        Returns:
-            Optional[int]: The paper_id if processing is successful, otherwise None.
-        """
+        """Handles the /pdf command to asynchronously process a PDF file."""
         if not self.pdfs_dir_abs_path:
             print("\n⚠️ PDF directory not configured. Cannot process PDFs.")
-            return None
+            return
         
-        # Ensure blob_dir is a Path object (already resolved in __init__)
-        blob_dir = self.blob_dir 
-
         # Use the connection established during initialization
         if not self.conn:
              print("\n⚠️ Database connection not available. Cannot save PDF metadata.")
-             return None
-        if not blob_dir:
-             print("\n⚠️ Blob directory not configured. Cannot save extracted text.")
-             return None
-        
-        # Gemini client check - ensure it's ready if needed
-        if self.pdf_processing_method == 'Gemini' and not self.client:
-            print("\n⚠️ Gemini client not initialized, but required for Gemini processing. Cannot process PDF.")
-            return None
+             return
+
+        # Async client check (used by _process_pdf_async_v2)
+        if not self.async_client:
+            print("\n⚠️ Async Gemini client not initialized. Cannot process PDF asynchronously.")
+            return
 
         if len(args) < 1:
             print("\n⚠️ Usage: /pdf <filename> [optional: arxiv_id]")
-            # Consider adding a call to list available PDFs here if useful
-            # self._list_available_pdfs() # If such a method exists
-            return None
+            return
 
         filename_arg = args[0]
         # Basic security: Ensure filename doesn't contain path separators
         filename = Path(filename_arg).name
         if filename != filename_arg:
              print(f"\n⚠️ Invalid filename '{filename_arg}'. Please provide only the filename, not a path.")
-             return None
+             return
 
         pdf_path = self.pdfs_dir_abs_path / filename
 
         if not pdf_path.exists() or not pdf_path.is_file():
             print(f"\n⚠️ Error: PDF file '{filename}' not found in {self.pdfs_dir_abs_path}.")
-            # self._list_available_pdfs() # If exists
-            return None
+            return
 
         arxiv_id_arg = args[1] if len(args) > 1 else None
 
-        print(f"\n⏳ Processing PDF: {filename}...")
-
-        paper_id = None
-        # Remove the local try/except for connection, use self.conn directly
+        # --- Pre-async DB Operation: Create minimal paper record --- 
+        paper_id: Optional[int] = None
         try:
-            # --- Database Operations using self.conn --- 
             paper_id = database.add_minimal_paper(self.conn, filename)
             if not paper_id:
                 print("\n⚠️ Error: Failed to create initial database record.")
-                # No connection to close here
-                return None 
+                return
 
-            print(f"  📄 Created database record with ID: {paper_id}")
+            logger.info(f"Created initial DB record for {filename} with ID: {paper_id}")
 
             if arxiv_id_arg:
                 if isinstance(arxiv_id_arg, str) and len(arxiv_id_arg) > 5: 
                     database.update_paper_field(self.conn, paper_id, 'arxiv_id', arxiv_id_arg)
-                    print(f"     Updated record with provided arXiv ID: {arxiv_id_arg}")
+                    logger.info(f"Updated record {paper_id} with provided arXiv ID: {arxiv_id_arg}")
                 else:
-                    print(f"  ⚠️ Warning: Provided arXiv ID '{arxiv_id_arg}' seems invalid. Skipping update.")
-            # --- End Database Operations ---
-
-            print(f"  ⚙️  Extracting text from '{filename}' (using {self.pdf_processing_method})...")
-            extracted_text = None
-            try:
-                # TODO: Implement fallback to pypdf if configured or if gemini fails?
-                if self.pdf_processing_method.lower() == 'gemini':
-                     extracted_text = tools.extract_text_from_pdf_gemini(pdf_path, self.client, self.model_name)
-                # Add other methods like pypdf here if needed
-                # elif self.pdf_processing_method.lower() == 'pypdf':
-                #    extracted_text = tools.extract_text_from_pdf_pypdf(pdf_path) # Assuming this exists
-                else:
-                    raise ValueError(f"Unsupported pdf_processing_method: {self.pdf_processing_method}")
-                
-                if not extracted_text: # Check if extraction failed
-                    raise ValueError("Text extraction resulted in empty or failed content.")
-
-            except Exception as extract_err:
-                print(f"\n⚠️ Error during text extraction ({self.pdf_processing_method}): {extract_err}")
-                database.update_paper_field(self.conn, paper_id, 'status', 'error_process')
-                # No conn.close() needed here
-                return None 
-
-            print(f"  💬 Successfully extracted text ({len(extracted_text)} chars) [{self.pdf_processing_method}].")
-
-            blob_filename = f"paper_{paper_id}_text.txt"
-            blob_full_path = blob_dir / blob_filename
-            blob_rel_path = blob_filename # Store relative path in DB
-
-            print(f"  💾 Saving extracted text to {blob_full_path}...")
-            save_success = tools.save_text_blob(blob_full_path, extracted_text)
-
-            if not save_success:
-                print("\n⚠️ Error: Failed to save text blob.")
-                database.update_paper_field(self.conn, paper_id, 'status', 'error_blob')
-                # No conn.close() needed here
-                return None
-            else:
-                print(f"     Successfully saved text blob.")
-                update_success = database.update_paper_field(self.conn, paper_id, 'blob_path', blob_rel_path)
-                if not update_success:
-                    print(f"  ⚠️ Warning: Failed to update blob_path in database for ID {paper_id}.")
-                    # Log and continue, as text is saved locally
-
-            update_success = database.update_paper_field(self.conn, paper_id, 'status', 'processed') # Mark as processed before adding to history
-            if not update_success:
-                 logger.warning(f"Failed to update status to processed for paper ID {paper_id}")
-                 # Continue anyway, try to add to history
-
-            # Store context to be prepended next turn
-            context_header = f"CONTEXT FROM PDF ('{filename}', ID: {paper_id}):\n---"
-            if MAX_PDF_CONTEXT_LENGTH:
-                max_text_len = MAX_PDF_CONTEXT_LENGTH - len(context_header) - 50 # Reserve space for header and separators
-                truncated_text = extracted_text[:max_text_len]
-                if len(extracted_text) > max_text_len:
-                    truncated_text += "\n... [TRUNCATED]" 
-            else:
-                truncated_text = extracted_text
-            
-            self.pending_pdf_context = f"{context_header}\n{truncated_text}\n---"
-            logger.info(f"Stored context from {filename} (ID: {paper_id}) to be prepended next turn ({len(self.pending_pdf_context)} chars).")
-            print(f"\n✅ PDF processed. Content will be added to context on your next message. (ID: {paper_id}) ")
-            database.update_paper_field(self.conn, paper_id, 'status', 'processed_pending_context')
-
-            return paper_id
+                    logger.warning(f"Provided arXiv ID '{arxiv_id_arg}' seems invalid for paper {paper_id}. Skipping update.")
+            # Update status to indicate async processing is starting
+            database.update_paper_field(self.conn, paper_id, 'status', 'processing_async')
+        
         except Exception as e: # Reinstate the main exception handler for the function's try block
             logger.error(f"An error occurred during PDF processing for '{filename}': {e}", exc_info=True)
             if paper_id and self.conn:
                 try:
                     # Attempt to mark as error if possible
-                    database.update_paper_field(self.conn, paper_id, 'status', 'error_process')
+                    database.update_paper_field(self.conn, paper_id, 'status', 'error_setup')
                 except Exception as db_err:
                     logger.error(f"Additionally failed to update status to error for paper {paper_id}: {db_err}")
-            # No conn.close() needed here
-            print(f"\n❌ An unexpected error occurred: {e}")
-            return None # Return None on major processing error
+            print(f"\n❌ An unexpected error occurred before starting async processing: {e}")
+            return
+
+        # --- Launch Asynchronous Task --- 
+        # Use functools.partial to prepare the coroutine with its specific arguments
+        # The _process_pdf_async_v2 coroutine expects (task_id, progress_bar, rich_task_id) from _launch_background_task
+        # and we add pdf_path, arxiv_id_arg, and paper_id via partial.
+        specific_pdf_task_coro_creator = functools.partial(self._process_pdf_async_v2,
+                                                       pdf_path=pdf_path,
+                                                       arxiv_id=arxiv_id_arg,
+                                                       paper_id=paper_id) # _process_pdf_async_v2 will access self.db_path_str
+
+        self._launch_background_task(specific_pdf_task_coro_creator, task_name=f"PDF-{pdf_path.name}")
+        # The _launch_background_task will print a message like:
+        # "⏳ 'PDF-mypaper.pdf' (ID: <uuid>) started in background – you can keep chatting."
+        # The actual result/feedback will come from the _on_task_done callback via prints.
+
+    def _finalize_pdf_ingest(self, pdf_file_resource: types.File, arxiv_id: Optional[str], original_pdf_path: Path, paper_id: Optional[int], db_path_str: Optional[str]):
+        """Synchronous method for final PDF ingestion steps after GenAI processing is ACTIVE.
+        This method is called via asyncio.to_thread() from an async task.
+        It handles text extraction (potentially blocking), blob saving (blocking), 
+        database updates, and preparing chat context.
+        Args:
+            pdf_file_resource: The genai.File object (after it's ACTIVE).
+            arxiv_id: Optional arXiv ID from the user or previous steps.
+            original_pdf_path: The original Path to the PDF file on local disk.
+            paper_id: The database paper_id created before async processing started.
+            db_path_str: The database path string to establish a new connection in this thread.
+        """
+        logger.info(f"Finalize Thread (Paper ID: {paper_id}): Starting for '{pdf_file_resource.display_name}'. Using DB path: {db_path_str}")
+
+        local_conn: Optional[sqlite3.Connection] = None
+        try:
+            if not paper_id:
+                logger.error(f"Finalize Thread: Critical - Missing paper_id for {pdf_file_resource.display_name}. Aborting finalization.")
+                return
+
+            if not db_path_str:
+                logger.error(f"Finalize Thread Paper ID {paper_id}: Database path not provided. Aborting.")
+                return # Cannot update status without DB path
+            
+            local_conn = database.get_db_connection(Path(db_path_str))
+            if not local_conn:
+                logger.error(f"Finalize Thread Paper ID {paper_id}: Could not establish new DB connection. Aborting.")
+                return # Cannot update status without DB connection
+
+            # Ensure synchronous GenAI client is available (it's on self, created in main thread, typically fine for read-only attributes or creating new requests)
+            if not self.client:
+                logger.error(f"Finalize Thread Paper ID {paper_id}: Synchronous GenAI client (self.client) not available. Aborting text extraction.")
+                database.update_paper_field(local_conn, paper_id, 'status', 'error_extraction_final_no_client')
+                return
+
+            extracted_text: Optional[str] = None
+            try:
+                logger.info(f"Finalize Thread Paper ID {paper_id}: Extracting text from '{original_pdf_path.name}'.")
+                extracted_text = tools.extract_text_from_pdf_gemini(original_pdf_path, self.client, self.model_name)
+                if not extracted_text:
+                    logger.warning(f"Finalize Thread Paper ID {paper_id}: Text extraction returned no content for '{original_pdf_path.name}'.")
+                    database.update_paper_field(local_conn, paper_id, 'status', 'error_extraction_final_empty')
+                    return
+                logger.info(f"Finalize Thread Paper ID {paper_id}: Successfully extracted text ({len(extracted_text)} chars).")
+            except Exception as e:
+                logger.error(f"Finalize Thread Paper ID {paper_id}: Error during text extraction for '{original_pdf_path.name}': {e}", exc_info=True)
+                database.update_paper_field(local_conn, paper_id, 'status', 'error_extraction_final')
+                return
+
+            if self.blob_dir:
+                blob_filename = f"paper_{paper_id}_text.txt"
+                blob_full_path = self.blob_dir / blob_filename
+                try:
+                    logger.info(f"Finalize Thread Paper ID {paper_id}: Saving extracted text to {blob_full_path}.")
+                    save_success = tools.save_text_blob(blob_full_path, extracted_text)
+                    if not save_success:
+                        logger.error(f"Finalize Thread Paper ID {paper_id}: Failed to save text blob to {blob_full_path}.")
+                        database.update_paper_field(local_conn, paper_id, 'status', 'error_blob_final')
+                    else:
+                        logger.info(f"Finalize Thread Paper ID {paper_id}: Successfully saved text blob. Updating DB.")
+                        database.update_paper_field(local_conn, paper_id, 'blob_path', blob_filename)
+                except Exception as e:
+                    logger.error(f"Finalize Thread Paper ID {paper_id}: Error saving text blob to {blob_full_path}: {e}", exc_info=True)
+                    database.update_paper_field(local_conn, paper_id, 'status', 'error_blob_final_exception')
+            else:
+                logger.warning(f"Finalize Thread Paper ID {paper_id}: Blob directory not configured. Skipping saving text.")
+
+            database.update_paper_field(local_conn, paper_id, 'genai_file_uri', pdf_file_resource.uri)
+            database.update_paper_field(local_conn, paper_id, 'processed_timestamp', datetime.now(timezone.utc))
+
+            try:
+                context_header = f"CONTEXT FROM PDF ('{pdf_file_resource.display_name}', ID: {paper_id}):\n---"
+                if MAX_PDF_CONTEXT_LENGTH is not None and isinstance(MAX_PDF_CONTEXT_LENGTH, int) and MAX_PDF_CONTEXT_LENGTH > 0:
+                    text_to_truncate = extracted_text if extracted_text else ""
+                    max_text_len = MAX_PDF_CONTEXT_LENGTH - len(context_header) - 50
+                    if max_text_len < 0: max_text_len = 0
+                    truncated_text = text_to_truncate[:max_text_len]
+                    if len(text_to_truncate) > max_text_len:
+                        truncated_text += "\n... [TRUNCATED]"
+                else:
+                    truncated_text = extracted_text if extracted_text else "[No text extracted or available for context]"
+                self.pending_pdf_context = f"{context_header}\n{truncated_text}\n---"
+                logger.info(f"Finalize Thread Paper ID {paper_id}: Stored context ({len(self.pending_pdf_context)} chars). Updating status.")
+                database.update_paper_field(local_conn, paper_id, 'status', 'completed_pending_context')
+            except Exception as e:
+                logger.error(f"Finalize Thread Paper ID {paper_id}: Error preparing chat context: {e}", exc_info=True)
+                database.update_paper_field(local_conn, paper_id, 'status', 'error_context_prep_final')
+
+            logger.info(f"Finalize Thread Paper ID {paper_id}: Finalization complete for '{pdf_file_resource.display_name}'.")
+        
+        except Exception as e: # Catch-all for unexpected errors during setup or within the try block
+            logger.error(f"Finalize Thread Paper ID {paper_id if paper_id else 'Unknown'}: Unhandled exception: {e}", exc_info=True)
+            if local_conn and paper_id:
+                try:
+                    database.update_paper_field(local_conn, paper_id, 'status', 'error_finalize_unhandled')
+                except Exception as db_err:
+                    logger.error(f"Finalize Thread Paper ID {paper_id if paper_id else 'Unknown'}: Failed to update status to unhandled error: {db_err}")
+        finally:
+            if local_conn:
+                logger.info(f"Finalize Thread Paper ID {paper_id if paper_id else 'Unknown'}: Closing thread-local DB connection.")
+                database.close_db_connection(local_conn)
+
+    async def _process_pdf_async_v2(self, task_id: str, pdf_path: Path, arxiv_id: str | None, progress_bar: Progress, rich_task_id, paper_id: Optional[int]):
+        """
+        Processes a PDF file asynchronously using client.aio.files: uploads to GenAI, monitors processing,
+        and finalizes ingestion. Designed for cooperative cancellation.
+        """
+        if not self.async_client:
+            error_message = f"Task {task_id}: Async client not available. Cannot process {pdf_path.name}."
+            logging.error(error_message)
+            progress_bar.update(rich_task_id, description=f"❌ {pdf_path.name} failed: Async client missing", completed=100, total=100)
+            raise RuntimeError(error_message)
+
+        client = self.async_client
+        pdf_file_display_name = pdf_path.name
+        progress_bar.update(rich_task_id, description=f"Starting {pdf_file_display_name}…")
+
+        genai_file_resource: Optional[types.File] = None
+
+        try:
+            progress_bar.update(rich_task_id, description=f"Uploading {pdf_file_display_name}…")
+            # TODO: Add timeout for upload if necessary, e.g., asyncio.timeout(60, ...)
+            upload_config = types.UploadFileConfig(
+                display_name=pdf_path.name # Use the original PDF filename as the display name
+            )
+            genai_file_resource = await client.files.upload(
+                file=pdf_path, 
+                config=upload_config
+            )
+            logger.info(f"Task {task_id}: Uploaded {pdf_file_display_name} as {genai_file_resource.name} ({genai_file_resource.display_name})")
+
+            progress_bar.update(rich_task_id, description=f"Processing {genai_file_resource.display_name} with GenAI…")
+            while genai_file_resource.state.name == "PROCESSING":
+                await asyncio.sleep(5) # Non-blocking poll interval
+                # Refresh file state using its unique resource name (genai_file_resource.name)
+                # TODO: Add timeout for get if necessary
+                genai_file_resource = await client.files.get(name=genai_file_resource.name)
+                logger.debug(f"Task {task_id}: Polled {genai_file_resource.name}, state: {genai_file_resource.state.name}")
+
+            if genai_file_resource.state.name != "ACTIVE": # Check for "ACTIVE" as the desired terminal success state
+                error_message = f"Task {task_id}: PDF {genai_file_resource.display_name} processing failed or unexpected state: {genai_file_resource.state.name}"
+                logging.error(error_message)
+                if genai_file_resource.state.name == "FAILED" and hasattr(genai_file_resource, 'error') and genai_file_resource.error:
+                    genai_error_msg = f"GenAI Error Code: {genai_file_resource.error.code}, Message: {genai_file_resource.error.message}"
+                    logging.error(f"Task {task_id}: {genai_error_msg}")
+                    error_message += f" ({genai_error_msg})"
+                progress_bar.update(rich_task_id, description=f"❌ {genai_file_resource.display_name} failed: {genai_file_resource.state.name}", completed=100, total=100)
+                raise RuntimeError(error_message)
+
+            progress_bar.update(rich_task_id, description=f"✅ {genai_file_resource.display_name} ready for finalization.", completed=100, total=100)
+            logger.info(f"Task {task_id}: {genai_file_resource.display_name} is ACTIVE.")
+
+            # Finalize: DB insert, text extraction (if local), etc.
+            # _finalize_pdf_ingest contains blocking calls (text extraction, file I/O for blob)
+            # so it must be run in a separate thread to avoid blocking the asyncio event loop.
+            await asyncio.to_thread(
+                self._finalize_pdf_ingest, 
+                genai_file_resource, 
+                arxiv_id, 
+                pdf_path, # This is original_pdf_path
+                paper_id,
+                self.db_path_str # Pass the DB path string from self
+            )
+            
+            logging.info(f"Task {task_id}: Successfully processed and finalized {genai_file_resource.display_name}")
+            return f"Successfully processed {genai_file_resource.display_name}"
+
+        except asyncio.CancelledError:
+            display_name = genai_file_resource.display_name if genai_file_resource else pdf_file_display_name
+            logging.info(f"Task {task_id} ({display_name}): Cancelled.")
+            progress_bar.update(rich_task_id, description=f"🚫 {display_name} cancelled.", completed=100, total=100)
+            # Perform any necessary cleanup specific to this task on cancellation
+            if genai_file_resource and genai_file_resource.name:
+                try:
+                    logger.info(f"Task {task_id} ({display_name}): Attempting to delete GenAI file {genai_file_resource.name} due to cancellation.")
+                    await client.files.delete(name=genai_file_resource.name)
+                    logger.info(f"Task {task_id} ({display_name}): Successfully deleted GenAI file {genai_file_resource.name} after cancellation.")
+                except Exception as del_e:
+                    logger.error(f"Task {task_id} ({display_name}): Failed to delete GenAI file {genai_file_resource.name} after cancellation: {del_e}")
+            raise
+
+        except Exception as e:
+            display_name = genai_file_resource.display_name if genai_file_resource else pdf_file_display_name
+            logging.exception(f"Task {task_id} ({display_name}): Error during processing: {str(e)}")
+            progress_bar.update(rich_task_id, description=f"❌ {display_name} error: {type(e).__name__}", completed=100, total=100)
+            # Optionally, attempt to delete the file from GenAI if it was uploaded before erroring
+            if genai_file_resource and genai_file_resource.name:
+                try:
+                    logger.info(f"Task {task_id} ({display_name}): Attempting to delete GenAI file {genai_file_resource.name} due to error.")
+                    await client.files.delete(name=genai_file_resource.name)
+                    logger.info(f"Task {task_id} ({display_name}): Successfully deleted GenAI file {genai_file_resource.name} after error.")
+                except Exception as del_e:
+                    logger.error(f"Task {task_id} ({display_name}): Failed to delete GenAI file {genai_file_resource.name} after error: {del_e}")
+            raise
+
+        finally:
+            # Ensure progress bar always stops if not already explicitly marked completed/failed by an update.
+            # This check might be overly cautious if all paths correctly update and stop the bar.
+            # progress_bar.stop() # This is handled by _on_task_done
+            pass
+
+    def _on_task_done(self, task_id: str, task_name: str, future: asyncio.Future):
+        """Callback executed when a background task finishes."""
+        try:
+            result = future.result() # Raise exception if task failed
+            print(f"\n✅ Task '{task_name}' (ID: {task_id}) completed successfully. Result: {result}")
+            logging.info(f"Task '{task_name}' (ID: {task_id}) completed successfully. Result: {result}")
+        except asyncio.CancelledError:
+            print(f"\n🚫 Task '{task_name}' (ID: {task_id}) was cancelled.")
+            logging.warning(f"Task '{task_name}' (ID: {task_id}) was cancelled.")
+        except Exception as e:
+            print(f"\n❌ Task '{task_name}' (ID: {task_id}) failed: {type(e).__name__}: {e}")
+            logging.error(f"Task '{task_name}' (ID: {task_id}) failed.", exc_info=True)
+        finally:
+            # Remove task from active list
+            task_info = self.active_background_tasks.pop(task_id, None)
+            # Stop progress bar if it exists and task_info is not None
+            if task_info and "progress_bar" in task_info:
+                task_info["progress_bar"].stop()
+            # Potentially refresh prompt or UI
+            # Check task_meta for script execution output
+            if task_info and future.exception() is None and not future.cancelled():
+                meta = task_info.get("meta", {})
+                if meta.get("type") == "script_execution":
+                    script_output = future.result() # This is the string output from _execute_script_async
+                    self.pending_script_output = script_output
+                    original_command = meta.get("original_command", "Unknown script")
+                    # Truncate for print message if too long
+                    output_summary = (script_output[:100] + '...') if len(script_output) > 103 else script_output
+                    print(f"\n📄 Output from '{original_command}' is ready and will be included in the next context. Output preview:\n{output_summary}")
+                    logger.info(f"Task '{task_name}' (ID: {task_id}) was a script execution. Output stored in pending_script_output.")
+
+    def _launch_background_task(self, coro_func, task_name: str, progress_total: float = 100.0, task_meta: Optional[dict] = None):
+        """
+        Launches a coroutine as a background task with progress display.
+        `coro_func` should be a functools.partial or lambda that creates the coroutine,
+        and the coroutine it creates should accept (task_id, progress_bar, rich_task_id) as arguments.
+        `task_meta` is an optional dictionary to store extra info about the task.
+        """
+        task_id = str(uuid.uuid4())
+
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            # transient=True # Consider if progress should disappear after completion
+        )
+        rich_task_id = progress.add_task(description=f"Initializing {task_name}...", total=progress_total)
+
+        # The coroutine (created by coro_func) must accept these specific arguments.
+        task_coro = coro_func(task_id=task_id, progress_bar=progress, rich_task_id=rich_task_id)
+
+        fut = asyncio.run_coroutine_threadsafe(task_coro, self.loop)
+        self.active_background_tasks[task_id] = {
+            "future": fut,
+            "name": task_name,
+            "progress_bar": progress, # Store to stop it in _on_task_done
+            "rich_task_id": rich_task_id,
+            "meta": task_meta if task_meta else {} # Store metadata
+        }
+
+        fut.add_done_callback(
+            lambda f: self._on_task_done(task_id, task_name, f)
+        )
+
+        print(f"⏳ '{task_name}' (ID: {task_id}) started in background – you can keep chatting.")
+        # The Progress object itself will be updated by the task coroutine.
+        # How it's displayed (e.g., via rich.Live or direct printing) will be
+        # handled by the calling environment or a dedicated UI management part.
+        return task_id # Return task_id along with progress for better management if needed in future
+
+    def _handle_cancel_command(self, task_id_str: str):
+        """Attempts to cancel an active background task."""
+        task_info = self.active_background_tasks.get(task_id_str)
+        if not task_info:
+            print(f"\n❌ Task ID '{task_id_str}' not found or already completed.")
+            return
+
+        future = task_info.get("future")
+        task_name = task_info.get("name", "Unnamed Task")
+
+        if future and not future.done():
+            cancelled = future.cancel()
+            if cancelled:
+                print(f"\n➡️ Cancellation request sent for task '{task_name}' (ID: {task_id_str}).")
+                # The _on_task_done callback will eventually report it as cancelled.
+            else:
+                print(f"\n❌ Failed to send cancellation request for task '{task_name}' (ID: {task_id_str}). It might be already completing or uncancelable.")
+        elif future and future.done():
+            print(f"\nℹ️ Task '{task_name}' (ID: {task_id_str}) has already completed.")
+        else:
+            print(f"\n⚠️ Could not cancel task '{task_name}' (ID: {task_id_str}). Future object missing or invalid state.")
+
+    def _handle_list_tasks_command(self):
+        """Lists active background tasks."""
+        if not self.active_background_tasks:
+            print("\nℹ️ No active background tasks.")
+            return
+
+        print("\n📋 Active Background Tasks:")
+        for task_id, info in self.active_background_tasks.items():
+            future = info.get("future")
+            name = info.get("name", "Unnamed Task")
+            status = "Running"
+            if future:
+                if future.cancelled():
+                    status = "Cancelling"
+                elif future.done(): # Should ideally be removed by _on_task_done, but check just in case
+                    status = "Completed (Pending Removal)"
+            print(f"  - ID: {task_id}, Name: {name}, Status: {status}")
+
+    def _handle_run_script_command(self, script_type: str, script_path: str, script_args: list[str]):
+        """Handles the /run_script command to execute a script asynchronously."""
+        logger.info(f"Received /run_script command: type={script_type}, path={script_path}, args={script_args}")
+        
+        # Basic validation for script_path to prevent execution of arbitrary system commands if script_type is 'shell'
+        # and script_path is not a path but a command itself. For now, we assume script_path is a path.
+        # More robust validation might be needed depending on security requirements.
+        if ".." in script_path or script_path.startswith("/"):
+            print("\n⚠️ Error: Script path should be relative and within the current workspace/scripts directory.")
+            logger.warning(f"Potentially unsafe script path provided: {script_path}")
+            return
+
+        task_name = f"Script-{Path(script_path).name}"
+        original_full_command = f"{script_type} {script_path} {' '.join(script_args)}".strip()
+        task_meta = {"type": "script_execution", "original_command": original_full_command}
+
+        script_coro_creator = functools.partial(self._execute_script_async,
+                                              script_type=script_type,
+                                              script_path_str=script_path,
+                                              script_args=script_args)
+        
+        self._launch_background_task(script_coro_creator, task_name=task_name, task_meta=task_meta)
+
+    async def _execute_script_async(self, task_id: str, progress_bar: Progress, rich_task_id, script_type: str, script_path_str: str, script_args: list[str]):
+        """Asynchronously executes a python or shell script and captures its output."""
+        progress_bar.update(rich_task_id, description=f"Preparing {script_type} script: {Path(script_path_str).name}")
+        
+        # Define a scripts directory (e.g., project_root / 'scripts')
+        # For now, let's assume scripts are relative to the workspace_root (agent's CWD)
+        # A more robust solution would involve a config for allowed script directories.
+        workspace_root = Path(os.getcwd()) # Or a configured workspace root
+        abs_script_path = (workspace_root / script_path_str).resolve()
+
+        # Security check: Ensure the script is within the intended workspace/scripts directory
+        # This is a basic check; more sophisticated sandboxing might be needed for untrusted scripts.
+        if not str(abs_script_path).startswith(str(workspace_root)):
+            error_msg = f"Error: Script path '{script_path_str}' is outside the allowed workspace."
+            logger.error(f"Task {task_id}: {error_msg}")
+            progress_bar.update(rich_task_id, description=f"❌ Error: Path outside workspace", completed=100, total=100)
+            return error_msg # Return error message for _on_task_done to handle
+
+        if not abs_script_path.is_file():
+            error_msg = f"Error: Script not found at '{abs_script_path}'."
+            logger.error(f"Task {task_id}: {error_msg}")
+            progress_bar.update(rich_task_id, description=f"❌ Error: Script not found", completed=100, total=100)
+            return error_msg
+
+        command_list = []
+        if script_type == "python":
+            command_list = [sys.executable, str(abs_script_path)] + script_args
+        elif script_type == "shell":
+            # Ensure the shell script itself is executable by the user
+            if not os.access(abs_script_path, os.X_OK):
+                error_msg = f"Error: Shell script '{abs_script_path}' is not executable. Please use chmod +x."
+                logger.error(f"Task {task_id}: {error_msg}")
+                progress_bar.update(rich_task_id, description=f"❌ Error: Script not executable", completed=100, total=100)
+                return error_msg
+            command_list = [str(abs_script_path)] + script_args
+        else:
+            error_msg = f"Error: Unsupported script type '{script_type}'. Must be 'python' or 'shell'."
+            logger.error(f"Task {task_id}: {error_msg}")
+            progress_bar.update(rich_task_id, description=f"❌ Error: Invalid script type", completed=100, total=100)
+            return error_msg
+
+        try:
+            progress_bar.update(rich_task_id, description=f"Running {Path(script_path_str).name}...")
+            logger.info(f"Task {task_id}: Executing command: {' '.join(command_list)}")
+
+            # Execute in a separate thread as subprocess.run is blocking
+            process = await asyncio.to_thread(
+                subprocess.run, 
+                command_list, 
+                capture_output=True, 
+                text=True, 
+                check=False, # Handle non-zero exit codes manually
+                cwd=workspace_root # Run script with CWD as workspace root
+            )
+            
+            output = f"--- Script: {Path(script_path_str).name} ---"
+            output += f"\n--- Return Code: {process.returncode} ---"
+            if process.stdout:
+                output += f"\n--- STDOUT ---\n{process.stdout.strip()}"
+            if process.stderr:
+                output += f"\n--- STDERR ---\n{process.stderr.strip()}"
+            
+            if process.returncode == 0:
+                progress_bar.update(rich_task_id, description=f"✅ {Path(script_path_str).name} finished.", completed=100, total=100)
+            else:
+                progress_bar.update(rich_task_id, description=f"⚠️ {Path(script_path_str).name} finished with errors.", completed=100, total=100)
+            
+            logger.info(f"Task {task_id}: Script '{Path(script_path_str).name}' finished. RC: {process.returncode}")
+            return output
+
+        except asyncio.CancelledError:
+            logger.info(f"Task {task_id} (Script: {Path(script_path_str).name}): Cancelled.")
+            progress_bar.update(rich_task_id, description=f"🚫 {Path(script_path_str).name} cancelled.", completed=100, total=100)
+            raise # Re-raise to be handled by _on_task_done
+        except Exception as e:
+            logger.exception(f"Task {task_id} (Script: {Path(script_path_str).name}): Error during execution.")
+            progress_bar.update(rich_task_id, description=f"❌ {Path(script_path_str).name} error: {type(e).__name__}", completed=100, total=100)
+            return f"Error executing script {Path(script_path_str).name}: {type(e).__name__}: {e}" # Return error for _on_task_done
 
 def main():
     config_path = Path('src/config.yaml')
