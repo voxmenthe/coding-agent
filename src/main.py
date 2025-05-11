@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from . import database
 from . import tools
+from .autocomplete import PdfCompleter  # <-- Import PdfCompleter
 import traceback
 import argparse
 import functools
@@ -274,14 +275,14 @@ class CodeAgent:
 
         # Define slash commands and setup nested completer
         slash_commands = ['/reset', '/exit', '/q', '/clear', '/save', '/thinking_budget'] # Added /thinking_budget
-        pdf_files = []
-        if self.pdfs_dir_abs_path.is_dir():
-            try:
-                pdf_files = [f.name for f in self.pdfs_dir_abs_path.glob('*.pdf') if f.is_file()]
-            except Exception as e:
-                print(f"\n⚠️ Error listing PDF files in {self.pdfs_dir_abs_path}: {e}")
-        else:
-            print(f"\n⚠️ PDF directory not found: {self.pdfs_dir_abs_path}. /pdf command may not work correctly.")
+        # pdf_files = [] # <-- Remove old pdf_files list creation
+        # if self.pdfs_dir_abs_path.is_dir():
+        #     try:
+        #         pdf_files = [f.name for f in self.pdfs_dir_abs_path.glob('*.pdf') if f.is_file()]
+        #     except Exception as e:
+        #         print(f"\n⚠️ Error listing PDF files in {self.pdfs_dir_abs_path}: {e}")
+        # else:
+        #     print(f"\n⚠️ PDF directory not found: {self.pdfs_dir_abs_path}. /pdf command may not work correctly.")
 
         # List saved conversations for /load autocomplete
         saved_conversations_dir_path = self.config.get('SAVED_CONVERSATIONS_DIRECTORY')
@@ -305,7 +306,8 @@ class CodeAgent:
 
         # Nested completer for commands and their potential arguments (like PDF files)
         completer_dict = {cmd: None for cmd in slash_commands}
-        completer_dict['/pdf'] = WordCompleter(pdf_files, ignore_case=True)
+        # completer_dict['/pdf'] = WordCompleter(pdf_files, ignore_case=True) # <-- Comment out or remove old completer
+        completer_dict['/pdf'] = PdfCompleter(self)  # <-- Use PdfCompleter
         completer_dict['/load'] = WordCompleter(saved_files, ignore_case=True)
         completer_dict['/prompt'] = WordCompleter(self._list_available_prompts(), ignore_case=True)
 
