@@ -21,6 +21,8 @@ import sqlite3
 from typing import Optional
 from dotenv import load_dotenv # Import dotenv
 from datetime import datetime, timezone # Added for processed_timestamp
+import sys # For sys.executable
+import subprocess # For running scripts
 # from google.generativeai import types as genai_types # This was incorrect for the new SDK as the `google.generativeai` SDK is deprecated and we should use `google.genai` SDK instead
 
 
@@ -144,6 +146,7 @@ class CodeAgent:
 
         # Collection to keep track of active background tasks (Future objects and metadata)
         self.active_background_tasks = {}
+        self.pending_script_output: Optional[str] = None # For output from /run_script
         
         self.conversation_history = [] # Manual history for token counting ONLY
         self.current_token_count = 0 # Store token count for the next prompt
@@ -280,13 +283,14 @@ class CodeAgent:
         print(f"   Use '/thinking_budget <value>' to set tool thinking budget (current: {self.thinking_budget}).") # Updated help
         print(f"   Use '/cancel <task_id>' to attempt to cancel a background task.")
         print(f"   Use '/tasks' to list active background tasks.")
+        print(f"   Use '/run_script <python|shell> <script_path> [args...]' to run a script.")
 
         # Set initial thinking budget from default/config
         self.thinking_config = types.ThinkingConfig(thinking_budget=self.thinking_budget)
         print(f"\n🧠 Initial thinking budget set to: {self.thinking_budget} tokens.")
 
         # Define slash commands and setup nested completer
-        slash_commands = ['/reset', '/exit', '/q', '/clear', '/save', '/thinking_budget', '/cancel', '/tasks']
+        slash_commands = ['/reset', '/exit', '/q', '/clear', '/save', '/thinking_budget', '/cancel', '/tasks', '/run_script']
         # pdf_files = [] # <-- Remove old pdf_files list creation
         # if self.pdfs_dir_abs_path.is_dir():
         #     try:
@@ -583,6 +587,20 @@ class CodeAgent:
                         logger.error("Error in /clear command", exc_info=True)
                     continue
 
+                elif user_input.lower().startswith("/run_script "):
+                    args = user_input.split()
+                    if len(args) >= 3:
+                        script_type = args[1].lower()
+                        script_path = args[2]
+                        script_arguments = args[3:]
+                        if script_type in ["python", "shell"]:
+                            self._handle_run_script_command(script_type, script_path, script_arguments)
+                        else:
+                            print("\n⚠️ Invalid script type. Must be 'python' or 'shell'. Usage: /run_script <python|shell> <script_path> [args...]")
+                    else:
+                        print("\n⚠️ Usage: /run_script <python|shell> <script_path> [args...]")
+                    continue
+
                 elif user_input.lower().startswith("/cancel "):
                     args = user_input.split(maxsplit=1)
                     if len(args) > 1:
@@ -602,6 +620,7 @@ class CodeAgent:
                 # Flags to track if contexts were used in this specific message
                 prompt_was_included = False
                 pdf_context_was_included = False
+                script_output_was_included = False # New flag
                  
                 # ─── 3 · prompt injection ─────────────────────────────────────
                 if self.pending_prompt:
@@ -615,15 +634,23 @@ class CodeAgent:
                     message_to_send = f"{self.pending_pdf_context}\n\n{message_to_send}"
                     pdf_context_was_included = True
                 
+                # Prepend script output AFTER PDF but BEFORE loaded prompt
+                if self.pending_script_output:
+                    print("[Including output from previously run script in this message.]\n")
+                    # Task name might not be easily available here, use a generic header
+                    message_to_send = f"OUTPUT FROM EXECUTED SCRIPT:\n---\n{self.pending_script_output}\n---\n\n{message_to_send}"
+                    script_output_was_included = True
                 
                 # --- Log message details before sending --- 
                 prompt_len_before_send = len(self.pending_prompt) if self.pending_prompt and prompt_was_included else 0
                 pdf_context_len_before_send = len(self.pending_pdf_context) if self.pending_pdf_context and pdf_context_was_included else 0
+                script_output_len_before_send = len(self.pending_script_output) if self.pending_script_output and script_output_was_included else 0
                 final_message_len = len(message_to_send)
                 logger.info(f"Preparing to send message.")
                 logger.info(f"  - Original user input length: {len(user_input)}")
                 logger.info(f"  - Included pending prompt length: {prompt_len_before_send}")
                 logger.info(f"  - Included pending PDF context length: {pdf_context_len_before_send}")
+                logger.info(f"  - Included pending script output length: {script_output_len_before_send}")
                 logger.info(f"  - Final message_to_send length: {final_message_len}")
                 # Log snippets for verification
                 if final_message_len > 200:
@@ -731,6 +758,9 @@ class CodeAgent:
                 if pdf_context_was_included:
                     self.pending_pdf_context = None
                     logger.info("Cleared pending_pdf_context after sending to LLM.")
+                if script_output_was_included:
+                    self.pending_script_output = None
+                    logger.info("Cleared pending_script_output after sending to LLM.")
 
             except KeyboardInterrupt:
                 print("\n👋 Goodbye!")
@@ -1048,12 +1078,24 @@ class CodeAgent:
             if task_info and "progress_bar" in task_info:
                 task_info["progress_bar"].stop()
             # Potentially refresh prompt or UI
+            # Check task_meta for script execution output
+            if task_info and future.exception() is None and not future.cancelled():
+                meta = task_info.get("meta", {})
+                if meta.get("type") == "script_execution":
+                    script_output = future.result() # This is the string output from _execute_script_async
+                    self.pending_script_output = script_output
+                    original_command = meta.get("original_command", "Unknown script")
+                    # Truncate for print message if too long
+                    output_summary = (script_output[:100] + '...') if len(script_output) > 103 else script_output
+                    print(f"\n📄 Output from '{original_command}' is ready and will be included in the next context. Output preview:\n{output_summary}")
+                    logger.info(f"Task '{task_name}' (ID: {task_id}) was a script execution. Output stored in pending_script_output.")
 
-    def _launch_background_task(self, coro_func, task_name: str, progress_total: float = 100.0):
+    def _launch_background_task(self, coro_func, task_name: str, progress_total: float = 100.0, task_meta: Optional[dict] = None):
         """
         Launches a coroutine as a background task with progress display.
         `coro_func` should be a functools.partial or lambda that creates the coroutine,
         and the coroutine it creates should accept (task_id, progress_bar, rich_task_id) as arguments.
+        `task_meta` is an optional dictionary to store extra info about the task.
         """
         task_id = str(uuid.uuid4())
 
@@ -1075,7 +1117,8 @@ class CodeAgent:
             "future": fut,
             "name": task_name,
             "progress_bar": progress, # Store to stop it in _on_task_done
-            "rich_task_id": rich_task_id
+            "rich_task_id": rich_task_id,
+            "meta": task_meta if task_meta else {} # Store metadata
         }
 
         fut.add_done_callback(
@@ -1086,7 +1129,7 @@ class CodeAgent:
         # The Progress object itself will be updated by the task coroutine.
         # How it's displayed (e.g., via rich.Live or direct printing) will be
         # handled by the calling environment or a dedicated UI management part.
-        return task_id
+        return task_id # Return task_id along with progress for better management if needed in future
 
     def _handle_cancel_command(self, task_id_str: str):
         """Attempts to cancel an active background task."""
@@ -1127,6 +1170,108 @@ class CodeAgent:
                 elif future.done(): # Should ideally be removed by _on_task_done, but check just in case
                     status = "Completed (Pending Removal)"
             print(f"  - ID: {task_id}, Name: {name}, Status: {status}")
+
+    def _handle_run_script_command(self, script_type: str, script_path: str, script_args: list[str]):
+        """Handles the /run_script command to execute a script asynchronously."""
+        logger.info(f"Received /run_script command: type={script_type}, path={script_path}, args={script_args}")
+        
+        # Basic validation for script_path to prevent execution of arbitrary system commands if script_type is 'shell'
+        # and script_path is not a path but a command itself. For now, we assume script_path is a path.
+        # More robust validation might be needed depending on security requirements.
+        if ".." in script_path or script_path.startswith("/"):
+            print("\n⚠️ Error: Script path should be relative and within the current workspace/scripts directory.")
+            logger.warning(f"Potentially unsafe script path provided: {script_path}")
+            return
+
+        task_name = f"Script-{Path(script_path).name}"
+        original_full_command = f"{script_type} {script_path} {' '.join(script_args)}".strip()
+        task_meta = {"type": "script_execution", "original_command": original_full_command}
+
+        script_coro_creator = functools.partial(self._execute_script_async,
+                                              script_type=script_type,
+                                              script_path_str=script_path,
+                                              script_args=script_args)
+        
+        self._launch_background_task(script_coro_creator, task_name=task_name, task_meta=task_meta)
+
+    async def _execute_script_async(self, task_id: str, progress_bar: Progress, rich_task_id, script_type: str, script_path_str: str, script_args: list[str]):
+        """Asynchronously executes a python or shell script and captures its output."""
+        progress_bar.update(rich_task_id, description=f"Preparing {script_type} script: {Path(script_path_str).name}")
+        
+        # Define a scripts directory (e.g., project_root / 'scripts')
+        # For now, let's assume scripts are relative to the workspace_root (agent's CWD)
+        # A more robust solution would involve a config for allowed script directories.
+        workspace_root = Path(os.getcwd()) # Or a configured workspace root
+        abs_script_path = (workspace_root / script_path_str).resolve()
+
+        # Security check: Ensure the script is within the intended workspace/scripts directory
+        # This is a basic check; more sophisticated sandboxing might be needed for untrusted scripts.
+        if not str(abs_script_path).startswith(str(workspace_root)):
+            error_msg = f"Error: Script path '{script_path_str}' is outside the allowed workspace."
+            logger.error(f"Task {task_id}: {error_msg}")
+            progress_bar.update(rich_task_id, description=f"❌ Error: Path outside workspace", completed=100, total=100)
+            return error_msg # Return error message for _on_task_done to handle
+
+        if not abs_script_path.is_file():
+            error_msg = f"Error: Script not found at '{abs_script_path}'."
+            logger.error(f"Task {task_id}: {error_msg}")
+            progress_bar.update(rich_task_id, description=f"❌ Error: Script not found", completed=100, total=100)
+            return error_msg
+
+        command_list = []
+        if script_type == "python":
+            command_list = [sys.executable, str(abs_script_path)] + script_args
+        elif script_type == "shell":
+            # Ensure the shell script itself is executable by the user
+            if not os.access(abs_script_path, os.X_OK):
+                error_msg = f"Error: Shell script '{abs_script_path}' is not executable. Please use chmod +x."
+                logger.error(f"Task {task_id}: {error_msg}")
+                progress_bar.update(rich_task_id, description=f"❌ Error: Script not executable", completed=100, total=100)
+                return error_msg
+            command_list = [str(abs_script_path)] + script_args
+        else:
+            error_msg = f"Error: Unsupported script type '{script_type}'. Must be 'python' or 'shell'."
+            logger.error(f"Task {task_id}: {error_msg}")
+            progress_bar.update(rich_task_id, description=f"❌ Error: Invalid script type", completed=100, total=100)
+            return error_msg
+
+        try:
+            progress_bar.update(rich_task_id, description=f"Running {Path(script_path_str).name}...")
+            logger.info(f"Task {task_id}: Executing command: {' '.join(command_list)}")
+
+            # Execute in a separate thread as subprocess.run is blocking
+            process = await asyncio.to_thread(
+                subprocess.run, 
+                command_list, 
+                capture_output=True, 
+                text=True, 
+                check=False, # Handle non-zero exit codes manually
+                cwd=workspace_root # Run script with CWD as workspace root
+            )
+            
+            output = f"--- Script: {Path(script_path_str).name} ---"
+            output += f"\n--- Return Code: {process.returncode} ---"
+            if process.stdout:
+                output += f"\n--- STDOUT ---\n{process.stdout.strip()}"
+            if process.stderr:
+                output += f"\n--- STDERR ---\n{process.stderr.strip()}"
+            
+            if process.returncode == 0:
+                progress_bar.update(rich_task_id, description=f"✅ {Path(script_path_str).name} finished.", completed=100, total=100)
+            else:
+                progress_bar.update(rich_task_id, description=f"⚠️ {Path(script_path_str).name} finished with errors.", completed=100, total=100)
+            
+            logger.info(f"Task {task_id}: Script '{Path(script_path_str).name}' finished. RC: {process.returncode}")
+            return output
+
+        except asyncio.CancelledError:
+            logger.info(f"Task {task_id} (Script: {Path(script_path_str).name}): Cancelled.")
+            progress_bar.update(rich_task_id, description=f"🚫 {Path(script_path_str).name} cancelled.", completed=100, total=100)
+            raise # Re-raise to be handled by _on_task_done
+        except Exception as e:
+            logger.exception(f"Task {task_id} (Script: {Path(script_path_str).name}): Error during execution.")
+            progress_bar.update(rich_task_id, description=f"❌ {Path(script_path_str).name} error: {type(e).__name__}", completed=100, total=100)
+            return f"Error executing script {Path(script_path_str).name}: {type(e).__name__}: {e}" # Return error for _on_task_done
 
 def main():
     config_path = Path('src/config.yaml')
