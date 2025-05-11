@@ -1,6 +1,7 @@
 import os
 import re
 from pathlib import Path
+from datetime import datetime
 from prompt_toolkit.completion import Completer, Completion
 from typing import TYPE_CHECKING, List, Tuple, Optional, Dict, Any
 
@@ -245,13 +246,19 @@ idx_of_current_word_in_words > 1 and words[idx_of_current_word_in_words - 2] == 
                  yield Completion('--filter ', start_position=-len(current_word), display_meta='Filter PDF list by name')
         
         # Always offer matching filenames based on the current prefix and parsed arguments
-        for fname, _, _ in sorted_pdfs:
+        for fname, fpath, ftime in sorted_pdfs:
             if fname.lower().startswith(current_filename_prefix.lower()):
-                # If current_word is part of an option, this completion might look weird.
-                # We want to replace only the filename part.
+                display_meta_text = 'PDF File'
+                if temp_sort_attribute == 'time':
+                    try:
+                        formatted_date = datetime.fromtimestamp(ftime).strftime('%Y%m%d')
+                        display_meta_text = f'{formatted_date} - PDF File'
+                    except ValueError: # Handle potential errors with timestamp
+                        pass # Stick to default meta text
+
                 yield Completion(
                     fname,
                     start_position=-len(current_filename_prefix),
-                    display_meta='PDF File'
+                    display_meta=display_meta_text
                 )
         return 
