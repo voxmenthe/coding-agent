@@ -79,6 +79,7 @@ def create_tables(conn: sqlite3.Connection):
             summary TEXT,                          -- Optional: Extracted abstract/summary
             blob_path TEXT,                        -- Optional: Path to the saved text blob (relative to BLOBS_DIR)
             source_pdf_url TEXT UNIQUE,            -- Optional: Direct link to arXiv PDF or other source
+            genai_file_uri TEXT,                 -- Optional: URI of the file stored in GenAI File Service
             publication_date TIMESTAMP,            -- Optional: Extracted from metadata
             last_updated_date TIMESTAMP,           -- Optional: From arXiv metadata or manual update
             categories TEXT,                       -- Optional: Stored as JSON string list (e.g., from arXiv)
@@ -210,7 +211,8 @@ def _parse_paper_row(row: sqlite3.Row) -> Dict[str, Any]:
     expected_keys = [
         'id', 'source_filename', 'arxiv_id', 'title', 'authors', 'summary',
         'blob_path', 'source_pdf_url', 'publication_date', 'last_updated_date',
-        'categories', 'status', 'notes', 'processed_timestamp', 'added_date', 'updated_date'
+        'categories', 'status', 'notes', 'processed_timestamp', 'added_date', 'updated_date',
+        'genai_file_uri'
     ]
     for key in expected_keys:
         if key not in paper_dict:
