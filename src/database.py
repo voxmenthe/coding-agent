@@ -365,6 +365,48 @@ def delete_paper(conn: sqlite3.Connection, paper_id: int) -> bool:
         logger.error(f"Database error deleting paper with ID {paper_id}: {e}", exc_info=True)
         return False
 
+def get_paper_id_by_filename(conn, filename: str) -> Optional[int]:
+    sql = "SELECT id FROM papers WHERE source_filename = ?"
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql, (filename,))
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+        else:
+            logger.info(f"No paper found with filename '{filename}'.")
+            return None
+    except sqlite3.Error as e:
+        logger.error(f"Database error retrieving paper ID by filename '{filename}': {e}", exc_info=True)
+        return None
+
+def get_processed_paper_by_filename(conn, filename: str) -> Optional[Dict[str, Any]]:
+    """
+    Retrieves paper details if it has been successfully processed and has a blob_path.
+    Checks for status 'completed_pending_context'.
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, source_filename, status, blob_path, genai_file_uri, processed_timestamp
+            FROM papers
+            WHERE source_filename = ? AND status = 'completed_pending_context' AND blob_path IS NOT NULL
+        """, (filename,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                "paper_id": row[0],
+                "filename": row[1],
+                "status": row[2],
+                "blob_path": row[3],
+                "genai_file_uri": row[4],
+                "processed_timestamp": row[5]
+            }
+        return None
+    except sqlite3.Error as e:
+        logger.error(f"Database error in get_processed_paper_by_filename for {filename}: {e}", exc_info=True)
+        return None
+
 # --- Helper/Utility Functions ---
 # ...
 

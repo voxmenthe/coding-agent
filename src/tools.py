@@ -11,7 +11,6 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from src.find_arxiv_papers import build_query, fetch_entries # build_query now in find_arxiv_papers.py
 from google import genai
-from google.api_core import exceptions as google_exceptions
 from pypdf import PdfReader
 import yaml
 
@@ -28,6 +27,8 @@ logger = logging.getLogger(__name__)
 config_path = Path(__file__).parent / "config.yaml"
 with open(config_path) as f:
     config = yaml.safe_load(f)
+
+MODEL_NAME = config.get('model_name', "gemini-2.5-flash-preview-04-17")
 
 # --- Constants ---
 MAX_GEMINI_PDF_SIZE_BYTES = 200 * 1024 * 1024 # 200 MB, adjust as needed
@@ -126,7 +127,7 @@ def extract_text_from_pdf_gemini(
             logger.warning(f"Gemini response format unexpected or empty for {pdf_path.name}. Response: {response}")
             return None
 
-    except google_exceptions.GoogleAPIError as e: 
+    except Exception as e: 
         logger.error(f"Gemini API error during processing {pdf_path.name}: {e}")
         return None
     except Exception as e:
@@ -139,7 +140,7 @@ def extract_text_from_pdf_gemini(
                 logger.info(f"Deleting Gemini file {uploaded_file.name}...")
                 genai_client.files.delete(name=uploaded_file.name)
                 logger.info(f"Successfully deleted Gemini file {uploaded_file.name}.")
-            except google_exceptions.GoogleAPIError as e: 
+            except Exception as e: 
                 logger.error(f"Failed to delete Gemini file {uploaded_file.name}: {e}")
             except Exception as e:
                 logger.error(f"Unexpected error deleting Gemini file {uploaded_file.name}: {e}", exc_info=True)
@@ -201,6 +202,23 @@ def execute_bash_command(command: str) -> str:
     - git status ...
     - git commit ...
     - git push ...
+    - git branch ...
+    - git worktree ...
+    - git checkout ...
+    - git merge ...
+    - git pull ...
+    - git fetch ...
+    - git reset ...
+    - git revert ...
+    - grep ...
+    - find ...
+    - sed ...
+    - awk ...
+    - sort ...
+    - uniq ...
+    - wc ...
+    - history ...
+    - touch
 
     Args:
         command: The full bash command string to execute.
@@ -210,7 +228,7 @@ def execute_bash_command(command: str) -> str:
     """
     print(f"\n\u2692\ufe0f Tool: Executing bash command: {command}")
 
-    whitelist = ["ls", "cat", "git add", "git status", "git commit", "git push"]
+    whitelist = ["ls", "cat", "git add", "git status", "git commit", "git push", "git branch", "git worktree", "git checkout", "git merge", "git pull", "git fetch", "git reset", "git revert", "grep", "find", "sed", "awk", "sort", "uniq", "wc", "history", "touch"]
 
     is_whitelisted = False
     for prefix in whitelist:
@@ -368,6 +386,123 @@ def find_arxiv_papers(keywords: str, start_date: str, end_date: str, max_results
     print(f"\n🔍 Filtered entries count: {len(results)}")
     return json.dumps(results, indent=2)
 
+def download_arxiv_paper(arxiv_page_url: str, title: str) -> str:
+    """Downloads an arXiv PDF to a specified directory.
+
+    The filename is constructed from a cleaned title and the arXiv ID.
+
+    Args:
+        arxiv_page_url: The URL of the arXiv abstract page (e.g., http://arxiv.org/abs/2305.05427v1).
+        title: The title of the paper.
+
+    Returns:
+        A message indicating success or failure.
+    """
+    print(f"\n\u2692\ufe0f Tool: Downloading arXiv paper: '{title}' from {arxiv_page_url}")
+
+    # 1. Extract arXiv ID from arxiv_page_url
+    match = re.search(r'abs/([^/]+)$', arxiv_page_url)
+    if not match:
+        error_msg = f"Error: Could not extract arXiv ID from URL: {arxiv_page_url}"
+        logger.error(error_msg)
+        return error_msg
+    arxiv_id = match.group(1)  # e.g., 2305.05427v1
+
+    # 2. Construct PDF download URL
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+
+    # 3. Clean the title (remove spaces, punctuation, special characters)
+    cleaned_title = re.sub(r'[^a-zA-Z0-9]', '', title)
+    if not cleaned_title:  # Handle cases where title becomes empty after cleaning
+        cleaned_title = "untitled"
+
+    # 4. Construct filename: cleaned_title concatenated with arxiv_id + .pdf
+    filename = f"{cleaned_title}{arxiv_id}.pdf"
+
+    # 5. Get PDFS_TO_CHAT_WITH_DIRECTORY from config and resolve path
+    try:
+        if 'config' not in globals() or 'PDFS_TO_CHAT_WITH_DIRECTORY' not in config:
+            error_msg = "Error: Configuration for PDFS_TO_CHAT_WITH_DIRECTORY not found."
+            logger.error(error_msg)
+            return error_msg
+        
+        pdf_dir_path_str = config['PDFS_TO_CHAT_WITH_DIRECTORY']
+        if not pdf_dir_path_str:
+            error_msg = "Error: PDFS_TO_CHAT_WITH_DIRECTORY is not set in the configuration."
+            logger.error(error_msg)
+            return error_msg
+
+        # Define or use project_root to resolve relative paths
+        global project_root
+        if 'project_root' not in globals() or not project_root:
+            # Attempt to define project_root if not already defined or is None/empty
+            current_file_path = Path(__file__).resolve()
+            project_root = current_file_path.parents[1] # Assumes tools.py is in src/, so parents[1] is project root
+            logger.info(f"Attempted to define 'project_root' as {project_root} for download_arxiv_paper.")
+            if not project_root.exists(): # Basic check
+                 error_msg = f"Error: Deduced project_root '{project_root}' does not exist. Cannot resolve PDF directory."
+                 logger.error(error_msg)
+                 return error_msg
+        
+        pdf_dir_path = Path(pdf_dir_path_str)
+        if not pdf_dir_path.is_absolute():
+            pdf_dir = (project_root / pdf_dir_path).resolve()
+        else:
+            pdf_dir = pdf_dir_path.resolve()
+        
+    except KeyError:
+        error_msg = "Error: 'PDFS_TO_CHAT_WITH_DIRECTORY' key not found in config."
+        logger.error(error_msg)
+        return error_msg
+    except Exception as e:
+        error_msg = f"Error accessing or resolving PDF directory configuration: {e}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg
+
+    # 6. Create target directory if it doesn't exist
+    try:
+        pdf_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        error_msg = f"Error: Could not create directory {pdf_dir}: {e}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg
+
+    file_path = pdf_dir / filename
+
+    # 7. Download the PDF
+    try:
+        logger.info(f"Attempting to download PDF from {pdf_url} to {file_path}")
+        response = requests.get(pdf_url, stream=True, timeout=60)  # Increased timeout
+        response.raise_for_status()  # Raise HTTPError for bad responses (4XX or 5XX)
+
+        with open(file_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        success_msg = f"Successfully downloaded '{title}' to '{file_path}'."
+        logger.info(success_msg)
+        return success_msg
+
+    except requests.exceptions.RequestException as e:
+        error_msg = f"Error downloading PDF from {pdf_url}: {e}"
+        logger.error(error_msg, exc_info=True)
+        # Clean up partially downloaded file if it exists
+        if file_path.exists():
+            try:
+                file_path.unlink()
+                logger.info(f"Cleaned up partially downloaded file: {file_path}")
+            except OSError as ose:
+                logger.error(f"Error cleaning up partial file {file_path}: {ose}")
+        return error_msg
+    except IOError as e:
+        error_msg = f"Error saving PDF to {file_path}: {e}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg
+    except Exception as e:
+        error_msg = f"An unexpected error occurred during download/saving of '{title}': {e}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg
+
 def upload_pdf_for_gemini(pdf_path_str: str) -> genai.types.File | None:
     """
     Uploads a PDF file relative to the project root to Google Gemini
@@ -448,18 +583,24 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> genai.types.File | None:
                  print(f"⚠️ Could not delete file during error cleanup: {delete_e}")
         return None
 
-def google_search(query: str) -> str:
-    """Search Google for the given query using browser-use and return JSON-formatted results."""
+def google_search(query: str, num_results: int = 10) -> str:
+    """Search Google for the given query using browser-use and return JSON-formatted results.
+    Args:
+        query: The search query.
+        num_results: The number of results to return.
+    Returns:
+        A JSON-formatted string of the search results.
+    """
     try:
         llm = ChatGoogleGenerativeAI(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17"),
+            model=MODEL_NAME,
             api_key=SecretStr(os.getenv("GEMINI_API_KEY"))
         )
         browser, context = asyncio.run(setup_browser(headless=True))
         result = asyncio.run(agent_loop(
             llm,
             context,
-            f"Search Google for '{query}' and extract the first 10 results as JSON list of {{'title','url'}}.",
+            f"Search Google for '{query}' and extract the first {num_results} results as JSON list of {{'title','url'}}.",
             initial_url=f"https://www.google.com/search?q={query}"
         ))
         return result or "No results."
@@ -470,7 +611,7 @@ def open_url(url: str) -> str:
     """Open a URL using browser-use and return the page's visible text content."""
     try:
         llm = ChatGoogleGenerativeAI(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17"),
+            model=MODEL_NAME,
             api_key=SecretStr(os.getenv("GEMINI_API_KEY"))
         )
         browser, context = asyncio.run(setup_browser(headless=True))

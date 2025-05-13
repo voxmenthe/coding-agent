@@ -6,9 +6,6 @@ set -e  # Exit immediately if a command exits with a non-zero status
 pip install --upgrade pip
 pip install poetry
 
-# Install dependencies without the project itself
-poetry install --no-root
-
 # Update the lock file if necessary
 poetry lock
 

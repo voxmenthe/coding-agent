@@ -10,14 +10,17 @@ packages = [
 
 [tool.poetry.dependencies]
 anthropic = {version = "^0.42.0", extras = ["vertex"]}
+browser-use = {version = "*", extras = ["memory"]}
 db-dtypes = "^1.2.0"
 docker = "^7.1.0"
 fastapi = "^0.111.0"
 gunicorn = "^22.0.0"
+google = "*"
 google-genai = "^1.13.0"
 googlemaps = "^4.10.0"
 instructor = ">=1.4.3,<2.0.0"
 ipykernel = ">=6.29,<7.0"
+langchain-google-genai = "*"
 markdown = "^3.7.0"
 matplotlib = ">=3.9.0,<4.0.0"
 notebook = ">=7.2.0,<8.0.0"

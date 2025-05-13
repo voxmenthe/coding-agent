@@ -18,12 +18,15 @@ from prompt_toolkit.history import InMemoryHistory
 import bisect # Added for efficient searching
 import yaml
 import sqlite3
-from typing import Optional
+from typing import Optional, List, Dict, Callable 
 from dotenv import load_dotenv # Import dotenv
 from datetime import datetime, timezone # Added for processed_timestamp
 import sys # For sys.executable
 import subprocess # For running scripts
 # from google.generativeai import types as genai_types # This was incorrect for the new SDK as the `google.generativeai` SDK is deprecated and we should use `google.genai` SDK instead
+
+# --- Import slash command handlers ---
+from . import slashcommands # Import the new module
 
 
 # Setup basic logging
@@ -31,22 +34,16 @@ import subprocess # For running scripts
 logging.basicConfig(level=logging.INFO) # Basic config for now
 logger = logging.getLogger(__name__) # Define module-level logger
 
-# Choose your Gemini model - unless you want something crazy "gemini-2.5-flash-preview-04-17" is the default model
-MODEL_NAME = "gemini-2.5-flash-preview-04-17"
-DEFAULT_THINKING_BUDGET = 256
-MAX_PDF_CONTEXT_LENGTH = None # Max chars from PDF to prepend - TODO: get this from config.yaml
 
-# Default configuration values
-DEFAULT_CONFIG = {
-    'gemini_api_key': None,
-    'model_name': 'gemini-2.5-flash-preview-04-17',
-    'verbose': False,
-    'default_thinking_budget': 256,
-    'PDFS_TO_CHAT_WITH_DIRECTORY': 'PDFS/',
-    'SAVED_CONVERSATIONS_DIRECTORY': 'SAVED_CONVERSATIONS/',
-    'PAPER_DB_PATH': 'paper_database.db',
-    'PAPER_BLOBS_DIR': 'paper_blobs/'
-}
+# Load config
+config_path = Path(__file__).parent / "config.yaml"
+with open(config_path) as f:
+    config = yaml.safe_load(f)
+
+
+MODEL_NAME = config.get('model_name', "gemini-2.5-flash-preview-04-17")
+DEFAULT_THINKING_BUDGET = config.get('default_thinking_budget', 256)
+MAX_PDF_CONTEXT_LENGTH = config.get('MAX_PDF_CONTEXT_LENGTH', None) # Max chars from PDF to prepend 
 
 # --- Utility Functions ---
 def load_config(config_path: Path):
@@ -64,21 +61,6 @@ def load_config(config_path: Path):
     # 2. Check for API key in environment variables first
     env_api_key = os.getenv('GEMINI_API_KEY')
 
-    # 3. Load base configuration from YAML
-    config = DEFAULT_CONFIG.copy()
-    yaml_data = {}
-    if config_path.is_file():
-        try:
-            with open(config_path, 'r') as f:
-                yaml_data = yaml.safe_load(f) or {}
-                config.update(yaml_data)
-                logger.info(f"Loaded configuration overrides from {config_path}")
-        except Exception as e:
-            logger.error(f"Error loading config file {config_path}: {e}", exc_info=True)
-            # Continue with defaults and environment variables
-    else:
-         logger.info(f"Config file {config_path} not found. Using defaults and environment variables.")
-
     # 4. Prioritize environment variable for API key
     if env_api_key:
         config['gemini_api_key'] = env_api_key
@@ -88,7 +70,6 @@ def load_config(config_path: Path):
         # It's already in config from the update() step
     else:
         logger.warning("GEMINI_API_KEY not found in environment or config.yaml.")
-        # config['gemini_api_key'] will remain None from DEFAULT_CONFIG
 
     # 5. Resolve paths (relative to project root, which is parent of src/)
     project_root = Path(__file__).parent.parent 
@@ -128,11 +109,12 @@ class CodeAgent:
         """Initializes the CodeAgent."""
         self.config = config
         self.api_key = config.get('gemini_api_key') # Correct key name
-        self.model_name = config.get('model_name', 'gemini-2.5-flash-preview-04-17') # Default model
+        self.model_name = MODEL_NAME
         self.pdf_processing_method = config.get('pdf_processing_method', 'Gemini') # Default method
         self.client = None
         self.chat = None
         self.db_path_str = str(config.get('PAPER_DB_PATH')) if config.get('PAPER_DB_PATH') else None # Store DB path string
+        self.prefill_prompt_content: Optional[str] = None # For pre-filling the next prompt
         
         # Background asyncio loop (daemon so app exits cleanly)
         self.loop = asyncio.new_event_loop()
@@ -170,11 +152,13 @@ class CodeAgent:
             tools.execute_bash_command,
             tools.run_in_sandbox,
             tools.find_arxiv_papers,
+            tools.download_arxiv_paper,
             tools.get_current_date_and_time,
             tools.google_search,
-            tools.open_url
+            tools.open_url,
+            tools.upload_pdf_for_gemini
         ]
-        if self.config.get('verbose', DEFAULT_CONFIG['verbose']):
+        if self.config.get('verbose', config.get('verbose', False)):
             self.tool_functions = [self._make_verbose_tool(f) for f in self.tool_functions]
         if self.pdfs_dir_abs_path:
             self.pdfs_dir_abs_path.mkdir(parents=True, exist_ok=True)
@@ -199,7 +183,6 @@ class CodeAgent:
                 self._initialize_chat()
 
         self.pending_pdf_context: Optional[str] = None # For prepending PDF context
-        self.pending_prompt: Optional[str] = None # For prepending loaded prompt
         self.prompts_dir = Path('src/prompts').resolve()
 
         # Ensure directories exist (moved from load_config for clarity)
@@ -268,66 +251,76 @@ class CodeAgent:
              return None
     # ---------------------------
 
+    def print_initial_help(self):
+        """Prints the initial brief help message."""
+        print("\n\u2692\ufe0f Agent ready. Ask me anything or type '/help' for commands.")
+        print("   Type '/exit' or '/q' to quit.")
+        # Key commands can be highlighted if desired, but /help is the main source.
+
     def start_interaction(self):
         """Starts the main interaction loop using a stateful ChatSession via client.chats.create."""
         if not self.client:
             print("\n\u274c Client not configured. Exiting.")
             return
 
-        print("\n\u2692\ufe0f Agent ready. Ask me anything. Type '/exit' or '/q' to quit.")
-        print("   Use '/pdf <filename>' to seed PDF into context from the specified directory.")
-        print("   Use '/reset' to clear the chat and start fresh.")
-        print("   Use '/clear <n_tokens>' to remove <tokens> from the start of history.")
-        print("   Use '/save <optional_filename>' to save the current conversation.")
-        print("   Use '/load <filename>' to load a saved conversation.")
-        print(f"   Use '/thinking_budget <value>' to set tool thinking budget (current: {self.thinking_budget}).") # Updated help
-        print(f"   Use '/cancel <task_id>' to attempt to cancel a background task.")
-        print(f"   Use '/tasks' to list active background tasks.")
-        print(f"   Use '/run_script <python|shell> <script_path> [args...]' to run a script.")
+        self.print_initial_help() # Use the new brief help message
 
         # Set initial thinking budget from default/config
         self.thinking_config = types.ThinkingConfig(thinking_budget=self.thinking_budget)
         print(f"\n🧠 Initial thinking budget set to: {self.thinking_budget} tokens.")
 
         # Define slash commands and setup nested completer
-        slash_commands = ['/reset', '/exit', '/q', '/clear', '/save', '/thinking_budget', '/cancel', '/tasks', '/run_script']
-        # pdf_files = [] # <-- Remove old pdf_files list creation
-        # if self.pdfs_dir_abs_path.is_dir():
-        #     try:
-        #         pdf_files = [f.name for f in self.pdfs_dir_abs_path.glob('*.pdf') if f.is_file()]
-        #     except Exception as e:
-        #         print(f"\n⚠️ Error listing PDF files in {self.pdfs_dir_abs_path}: {e}")
-        # else:
-        #     print(f"\n⚠️ PDF directory not found: {self.pdfs_dir_abs_path}. /pdf command may not work correctly.")
+        # The keys in slash_command_completer_map should match COMMAND_HANDLERS keys
+        slash_command_completer_map: Dict[str, Optional[Completer]] = {
+            '/reset': None,
+            '/exit': None,
+            '/q': None,
+            '/clear': None, # Takes an arg, but simple WordCompleter not ideal
+            '/save': None,  # Takes an optional arg
+            '/thinking_budget': None, # Takes an arg
+            '/cancel': None, # Takes an arg (task_id)
+            '/tasks': None,
+            '/run_script': None, # Complex args, PathCompleter for script_path might be good
+            '/help': None,
+            '/history': None, # New history command
+             # /pdf and /load have specific completers
+        }
 
-        # List saved conversations for /load autocomplete
+        # PDF file completer
+        # PdfCompleter now takes 'self' (the CodeAgent instance)
+        slash_command_completer_map['/pdf'] = PdfCompleter(self)
+
+        # Saved conversations completer
         saved_conversations_dir_path = self.config.get('SAVED_CONVERSATIONS_DIRECTORY')
         saved_files = []
         if saved_conversations_dir_path and isinstance(saved_conversations_dir_path, Path) and saved_conversations_dir_path.is_dir():
              saved_files = [f.name for f in saved_conversations_dir_path.glob('*.json') if f.is_file()]
-        elif isinstance(saved_conversations_dir_path, str): # Fallback if somehow it's still a string
-             # This case should ideally not happen due to load_config resolving paths
+        elif isinstance(saved_conversations_dir_path, str): 
              logger.warning("SAVED_CONVERSATIONS_DIRECTORY was a string, expected Path. Attempting to resolve.")
              try:
-                  resolved_path = Path(__file__).parent.parent / saved_conversations_dir_path
+                  # Assuming project_root is defined if this fallback is hit, or use Path(__file__).parent.parent
+                  project_root = Path(__file__).parent.parent 
+                  resolved_path = project_root / saved_conversations_dir_path
                   if resolved_path.is_dir():
                        saved_files = [f.name for f in resolved_path.glob('*.json') if f.is_file()]
              except Exception as e:
                   logger.error(f"Error resolving string path for saved conversations: {e}")
         else: 
-             # Use default relative path if config value is missing or invalid type
              default_save_dir = Path(__file__).parent.parent / 'SAVED_CONVERSATIONS/'
              if default_save_dir.is_dir():
                   saved_files = [f.name for f in default_save_dir.glob('*.json') if f.is_file()]
+        slash_command_completer_map['/load'] = WordCompleter(saved_files, ignore_case=True)
 
-        # Nested completer for commands and their potential arguments (like PDF files)
-        completer_dict = {cmd: None for cmd in slash_commands}
-        # completer_dict['/pdf'] = WordCompleter(pdf_files, ignore_case=True) # <-- Comment out or remove old completer
-        completer_dict['/pdf'] = PdfCompleter(self)  # <-- Use PdfCompleter
-        completer_dict['/load'] = WordCompleter(saved_files, ignore_case=True)
-        completer_dict['/prompt'] = WordCompleter(self._list_available_prompts(), ignore_case=True)
+        # Prompt name completer
+        slash_command_completer_map['/prompt'] = WordCompleter(self._list_available_prompts(), ignore_case=True)
+        
+        # Add all command names from COMMAND_HANDLERS to the completer if not already specified
+        for cmd_name in slashcommands.COMMAND_HANDLERS.keys():
+            if cmd_name not in slash_command_completer_map:
+                slash_command_completer_map[cmd_name] = None
 
-        command_completer = NestedCompleter.from_nested_dict(completer_dict)
+
+        command_completer = NestedCompleter.from_nested_dict(slash_command_completer_map)
 
         history = InMemoryHistory()
         session = PromptSession(">", completer=command_completer, history=history)
@@ -340,294 +333,57 @@ class CodeAgent:
                 self._messages_this_interval = 0
 
                 active_files_info = f" [{len(self.active_files)} files]" if self.active_files else ""
-                prompt_text = f"\n🔵 You ({self.current_token_count}{active_files_info}): "
-                user_input = session.prompt(prompt_text).strip()
+                prompt_prefix = f"\n🔵 You ({self.current_token_count}{active_files_info}): "
+                
+                # Check if there's content to prefill from /prompt command
+                prefill_text = ""
+                if self.prefill_prompt_content:
+                    prefill_text = self.prefill_prompt_content
+                    self.prefill_prompt_content = None # Clear after retrieving
+
+                user_input = session.prompt(prompt_prefix, default=prefill_text).strip()
 
                 # ─── 2 · trivial exits / empty line ─────────────────────────────
-                if user_input.lower() in {"exit", "quit", "/exit", "/quit", "/q"}:
+                if user_input.lower() in {"exit", "quit", "/exit", "/q"}: # Keep direct exit for simplicity
                     print("\n👋 Goodbye!")
                     break
 
                 if not user_input:
-                    # unwind the stats we pushed at the top of the loop
                     self.prompt_time_counts.pop()
                     self.messages_per_interval.pop()
                     continue
 
-                # --- Handle User Commands FIRST --- 
-                # (This is important so local commands don't accidentally consume contexts
-                # that were meant for an LLM call that happens later)
-                if user_input.lower().startswith("/pdf"): # Already handles its own continue
-                    args = user_input.split()[1:]
-                    self._handle_pdf_command(args)
-                    # self._messages_this_interval is not incremented for this local command
-                    continue  
+                # --- 3 · Command Parsing and Dispatch ---
+                command_parts = user_input.split()
+                command_name = command_parts[0].lower()
+                command_args = command_parts[1:]
 
-                elif user_input.lower().startswith("/prompt "):
-                    parts = user_input.split(maxsplit=1)
-                    prompt_name = parts[1] if len(parts) == 2 else ""
-                    prompt_content = self._load_prompt(prompt_name)
-                    if prompt_content:
-                        self.pending_prompt = prompt_content
-                        print(f"\n✅ Prompt '{prompt_name}' loaded. "
-                              "It will be included in your next message to the LLM.")
+                handler: Optional[Callable] = slashcommands.COMMAND_HANDLERS.get(command_name)
+
+                if handler:
+                    # Determine if the handler takes arguments.
+                    # This is a simple check; more robust would be `inspect.signature`.
+                    # For now, we assume handlers like /reset, /tasks, /help don't need args.
+                    # Updated logic to pass session to /prompt handler
+                    if command_name in ["/reset", "/tasks", "/help"]:
+                        handler(self) # Call with agent only
+                    elif command_name == "/prompt":
+                        handler(self, session, command_args) # Call /prompt with agent, session, args
+                    elif command_name == "/save" and not command_args:
+                        handler(self, []) # Call /save with agent and empty args list
                     else:
-                        print(f"\n❌ Prompt '{prompt_name}' not found.")
-                    # self._messages_this_interval is not incremented
-                    continue
+                        # Default for commands taking agent and args
+                        handler(self, command_args)
 
-                elif user_input.lower().startswith("/save"):
-                    # ... (existing /save logic) ... 
-                    # Ensure it continues and does not increment _messages_this_interval
-                    import json
-                    import datetime
-                    parts = user_input.split()
-                    if len(parts) > 1:
-                        filename = parts[1]
-                        if not filename.endswith('.json'):
-                            filename += '.json'
-                    else:
-                            now = datetime.datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
-                            filename = f'{now}.json'
+                    continue # Command handled, loop to next prompt
+                
+                # --- If not a known slash command, proceed as LLM message ---
+                self._messages_this_interval += 1 
+                message_to_send = user_input 
 
-                    save_path = Path(__file__).parent.parent / self.config.get('SAVED_CONVERSATIONS_DIRECTORY', 'SAVED_CONVERSATIONS/') / filename
-                    save_state = {
-                        'conversation_history': [],
-                        'current_token_count': self.current_token_count,
-                        'prompt_time_counts': self.prompt_time_counts,
-                        'messages_per_interval': self.messages_per_interval,
-                        '_messages_this_interval': self._messages_this_interval, # Save current state before potential LLM call
-                        'active_files': [getattr(f, 'name', str(f)) for f in self.active_files],
-                        'thinking_budget': self.thinking_budget,
-                        'pending_prompt': self.pending_prompt, # Save pending states
-                        'pending_pdf_context': self.pending_pdf_context
-                    }
-                    serializable_history = []
-                    for content in self.conversation_history:
-                        parts_text = [part.text for part in content.parts if hasattr(part, 'text') and part.text is not None]
-                        serializable_history.append({
-                            'role': content.role,
-                            'parts': parts_text
-                        })
-                    save_state['conversation_history'] = serializable_history
-                    try:
-                        with open(save_path, 'w') as f:
-                            json.dump(save_state, f, indent=2)
-                        print(f"\n💾 Conversation saved as: {filename}")
-                    except Exception as e:
-                        print(f"\n❌ Failed to save conversation: {e}")
-                    continue
-
-                elif user_input.lower().startswith("/load"):
-                    # ... (existing /load logic) ...
-                    # Ensure it continues and does not increment _messages_this_interval
-                    import json
-                    parts = user_input.split()
-                    if len(parts) > 1:
-                        filename = parts[1]
-                    else:
-                        print("\n⚠️ Usage: /load <filename>")
-                        continue
-                    load_path = Path(__file__).parent.parent / self.config.get('SAVED_CONVERSATIONS_DIRECTORY', 'SAVED_CONVERSATIONS/') / filename
-                    if not load_path.is_file():
-                        print(f"\n❌ File not found: {filename}")
-                        continue
-                    try:
-                        with open(load_path, 'r') as f:
-                            load_state = json.load(f)
-                        reconstructed_history = []
-                        if 'conversation_history' in load_state and isinstance(load_state['conversation_history'], list):
-                            for item in load_state['conversation_history']:
-                                if isinstance(item, dict) and 'role' in item and 'parts' in item and isinstance(item['parts'], list):
-                                    parts = [types.Part(text=part_text) for part_text in item['parts'] if isinstance(part_text, str)]
-                                    content = types.Content(role=item['role'], parts=parts)
-                                    reconstructed_history.append(content)
-                                else:
-                                    logger.warning(f"Skipping invalid item in loaded history: {item}")
-                        else:
-                             logger.warning(f"'conversation_history' key missing or not a list in {filename}")
-
-                        self.conversation_history = reconstructed_history
-                        self.current_token_count = load_state.get('current_token_count', 0)
-                        self.prompt_time_counts = load_state.get('prompt_time_counts', [0])
-                        self.messages_per_interval = load_state.get('messages_per_interval', [0])
-                        self._messages_this_interval = load_state.get('_messages_this_interval', 0) # Restore this carefully
-                        self.active_files = []  # Don't restore files by default
-                        self.thinking_budget = load_state.get('thinking_budget', DEFAULT_THINKING_BUDGET)
-                        self.pending_prompt = load_state.get('pending_prompt') # Restore pending states
-                        self.pending_pdf_context = load_state.get('pending_pdf_context')
-                        self.chat = self.client.chats.create(model=self.model_name, history=self.conversation_history)
-                        print(f"\n📂 Loaded conversation from: {filename}")
-                        if self.pending_prompt: print("   Loaded pending prompt is active.")
-                        if self.pending_pdf_context: print("   Loaded pending PDF context is active.")
-                    except Exception as e:
-                        print(f"\n❌ Failed to load conversation: {e}")
-                    continue
-
-                elif user_input.lower().startswith("/thinking_budget"):
-                    # ... (existing /thinking_budget logic) ...
-                    parts = user_input.split()
-                    if len(parts) == 2:
-                        try:
-                            new_budget = int(parts[1])
-                            if 0 <= new_budget <= 24000: # Example range validation
-                                self.thinking_budget = new_budget
-                                self.thinking_config = types.ThinkingConfig(thinking_budget=self.thinking_budget)
-                                print(f"\n🧠 Thinking budget updated to: {self.thinking_budget} tokens.")
-                            else:
-                                print("\n⚠️ Thinking budget must be between 0 and 24000.")
-                        except ValueError:
-                            print("\n⚠️ Invalid number format for thinking budget.")
-                    else:
-                        print("\n⚠️ Usage: /thinking_budget <number_of_tokens>")
-                    continue
-
-                elif user_input.lower() == "/reset":
-                    # ... (existing /reset logic) ...
-                    print("\n🎯 Resetting context and starting a new chat session...")
-                    self.chat = self.client.chats.create(model=self.model_name, history=[])
-                    self.conversation_history = []
-                    self.current_token_count = 0
-                    self.active_files = []
-                    self.prompt_time_counts = [0]
-                    self.messages_per_interval = [0]
-                    self._messages_this_interval = 0 
-                    self.pending_prompt = None # Clear pending states on reset
-                    self.pending_pdf_context = None
-                    print("\n✅ Chat session and history cleared.")
-                    continue
-
-                elif user_input.lower().startswith("/clear "):
-                    # ... (existing /clear logic) ...
-                    try:
-                        parts = user_input.split()
-                        if len(parts) != 2:
-                            raise ValueError("Usage: /clear <number_of_tokens>")
-                        tokens_to_clear_target = int(parts[1])
-                        if tokens_to_clear_target <= 0:
-                            raise ValueError("Number of tokens must be positive.")
-
-                        if not self.conversation_history:
-                            print("Chat history is already empty.")
-                            continue
-
-                        logger.info(f"Attempting to clear approx. {tokens_to_clear_target} tokens from history.")
-                        
-                        new_history = list(self.conversation_history)
-                        tokens_counted_for_removal = 0
-                        messages_removed_count = 0
-
-                        while tokens_counted_for_removal < tokens_to_clear_target and new_history:
-                            first_message = new_history[0]
-                            try:
-                                message_tokens = self.client.models.count_tokens(model=self.model_name, contents=[first_message]).total_tokens
-                            except Exception as e_count:
-                                logger.error(f"Could not count tokens for a message during /clear: {e_count}. Skipping message token count.")
-                                message_tokens = 75 # Arbitrary average, or could stop clear
-                            
-                            tokens_counted_for_removal += message_tokens
-                            new_history.pop(0)
-                            messages_removed_count += 1
-                        
-                        logger.info(f"After initial pass, {messages_removed_count} messages ({tokens_counted_for_removal} tokens) selected for removal.")
-                        logger.info(f"Remaining history length before role check: {len(new_history)}")
-
-                        # Ensure remaining history starts with a user turn
-                        if new_history and new_history[0].role != "user":
-                            logger.warning("History after initial clear pass starts with a model turn. Removing additional leading model messages.")
-                            additional_messages_removed_for_role = 0
-                            while new_history and new_history[0].role != "user":
-                                new_history.pop(0)
-                                additional_messages_removed_for_role += 1
-                            messages_removed_count += additional_messages_removed_for_role
-                            logger.info(f"Removed {additional_messages_removed_for_role} additional messages to ensure user turn start.")
-                        
-                        if not new_history and not self.conversation_history: # No change if already empty
-                             print("Chat history is already empty. No action taken.")
-                             continue
-                        elif len(new_history) == len(self.conversation_history) and messages_removed_count == 0: # No messages were actually removed
-                            print(f"No messages were cleared. Requested {tokens_to_clear_target} tokens might be less than the first message(s) or history is too short.")
-                            continue
-
-                        self.conversation_history = new_history
-                        history_was_modified = True # Assume modification if we got this far and something changed.
-
-                        # Recalculate all tracking information based on the new history
-                        if not self.conversation_history:
-                            self.current_token_count = 0
-                            self.prompt_time_counts = [0]
-                            self.messages_per_interval = [0]
-                        else:
-                            self.current_token_count = self.client.models.count_tokens(
-                                model=self.model_name,
-                                contents=self.conversation_history
-                            ).total_tokens
-                            # Simplified tracking reset for prompt_time_counts and messages_per_interval
-                            self.prompt_time_counts = [0, self.current_token_count] 
-                            self.messages_per_interval = [0, len(self.conversation_history)]
-                        
-                        self._messages_this_interval = 0 # Reset for the current interval
-
-                        if history_was_modified:
-                            try:
-                                self.chat = self.client.chats.create(model=self.model_name, history=self.conversation_history)
-                                logger.info("Chat session re-initialized after /clear operation.")
-                            except Exception as e_chat_reinit: # More general catch, includes ValueError
-                                logger.error(f"Error re-initializing chat after /clear: {e_chat_reinit}", exc_info=True)
-                                print(f"\n⚠️ Error re-initializing chat session: {e_chat_reinit}.")
-                                # If re-init fails, history might be inconsistent with self.chat. 
-                                # Forcing full clear as a fallback might be too drastic if the count was just off.
-                                # For now, we alert and the history is what it is.
-
-                            print(f"\n✅ Cleared {messages_removed_count} message(s) (approx. {tokens_counted_for_removal} tokens counted for removal). "
-                                  f"New total tokens: {self.current_token_count}")
-                        
-                    except Exception as e:
-                        print(f"⚠️ Error processing /clear command: {e}")
-                        logger.error("Error in /clear command", exc_info=True)
-                    continue
-
-                elif user_input.lower().startswith("/run_script "):
-                    args = user_input.split()
-                    if len(args) >= 3:
-                        script_type = args[1].lower()
-                        script_path = args[2]
-                        script_arguments = args[3:]
-                        if script_type in ["python", "shell"]:
-                            self._handle_run_script_command(script_type, script_path, script_arguments)
-                        else:
-                            print("\n⚠️ Invalid script type. Must be 'python' or 'shell'. Usage: /run_script <python|shell> <script_path> [args...]")
-                    else:
-                        print("\n⚠️ Usage: /run_script <python|shell> <script_path> [args...]")
-                    continue
-
-                elif user_input.lower().startswith("/cancel "):
-                    args = user_input.split(maxsplit=1)
-                    if len(args) > 1:
-                        self._handle_cancel_command(args[1])
-                    else:
-                        print("\n⚠️ Usage: /cancel <task_id>")
-                    continue
-
-                elif user_input.lower() == "/tasks":
-                    self._handle_list_tasks_command()
-                    continue
-
-                # If we haven't 'continued' from a local command, it's a message for the LLM.
-                self._messages_this_interval += 1 # Count this turn as an LLM message
-                message_to_send = user_input # Default
-
-                # Flags to track if contexts were used in this specific message
-                prompt_was_included = False
                 pdf_context_was_included = False
                 script_output_was_included = False # New flag
                  
-                # ─── 3 · prompt injection ─────────────────────────────────────
-                if self.pending_prompt:
-                    print("[Including previously loaded prompt in this message.]\n")
-                    message_to_send = f"{self.pending_prompt}\n\n{message_to_send}"
-                    prompt_was_included = True
-                
                 # Check for PDF context AFTER prompt (so prompt comes first)
                 if self.pending_pdf_context:
                     print("[Including context from previously processed PDF in this message.]\n")
@@ -642,13 +398,11 @@ class CodeAgent:
                     script_output_was_included = True
                 
                 # --- Log message details before sending --- 
-                prompt_len_before_send = len(self.pending_prompt) if self.pending_prompt and prompt_was_included else 0
                 pdf_context_len_before_send = len(self.pending_pdf_context) if self.pending_pdf_context and pdf_context_was_included else 0
                 script_output_len_before_send = len(self.pending_script_output) if self.pending_script_output and script_output_was_included else 0
                 final_message_len = len(message_to_send)
                 logger.info(f"Preparing to send message.")
                 logger.info(f"  - Original user input length: {len(user_input)}")
-                logger.info(f"  - Included pending prompt length: {prompt_len_before_send}")
                 logger.info(f"  - Included pending PDF context length: {pdf_context_len_before_send}")
                 logger.info(f"  - Included pending script output length: {script_output_len_before_send}")
                 logger.info(f"  - Final message_to_send length: {final_message_len}")
@@ -656,21 +410,12 @@ class CodeAgent:
                 if final_message_len > 200:
                     logger.info(f"  - Final message start: {message_to_send[:100]}...")
                     logger.info(f"  - Final message end: ...{message_to_send[-100:]}")
-                
-                # --- Handle User Commands --- 
-                # --- /save command ---
-                # --- /load command ---
-                # --- /thinking_budget command ---
-                # --- /pdf command ---
-                # --- /reset command ---
-                # --- /clear command ---
-                # --- /prompt command ---
 
                 # --- Prepare message content (Text + Files) ---
                 message_content = [message_to_send]
                 if self.active_files:
                     message_content.extend(self.active_files)
-                    if self.config.get('verbose', DEFAULT_CONFIG['verbose']):
+                    if self.config.get('verbose', False):
                         print(f"\n📎 Attaching {len(self.active_files)} files to the prompt:")
                         for f in self.active_files:
                             print(f"   - {f.display_name} ({f.name})")
@@ -752,9 +497,6 @@ class CodeAgent:
                     print("🚨 Error: Failed to calculate token count.")
 
                 # --- NOW clear contexts that were actually sent --- 
-                if prompt_was_included:
-                    self.pending_prompt = None
-                    logger.info("Cleared pending_prompt after sending to LLM.")
                 if pdf_context_was_included:
                     self.pending_pdf_context = None
                     logger.info("Cleared pending_pdf_context after sending to LLM.")
@@ -807,6 +549,57 @@ class CodeAgent:
              return
 
         pdf_path = self.pdfs_dir_abs_path / filename
+
+        # --- Check for cached version first ---
+        cached_paper_info = database.get_processed_paper_by_filename(self.conn, filename)
+        if cached_paper_info and self.blob_dir:
+            blob_filename = cached_paper_info.get("blob_path")
+            paper_id = cached_paper_info.get("paper_id")
+            if blob_filename:
+                blob_full_path = self.blob_dir / blob_filename
+                if blob_full_path.is_file():
+                    try:
+                        extracted_text = blob_full_path.read_text()
+                        context_header = f"CONTEXT FROM CACHED PDF (\'{filename}\', ID: {paper_id}):\\n---"
+                        
+                        if MAX_PDF_CONTEXT_LENGTH is not None and isinstance(MAX_PDF_CONTEXT_LENGTH, int) and MAX_PDF_CONTEXT_LENGTH > 0:
+                            text_to_truncate = extracted_text
+                            # Adjust max_text_len to account for the header and truncation marker
+                            max_text_len = MAX_PDF_CONTEXT_LENGTH - len(context_header) - len("\\n---") - 20 # a bit of buffer
+                            if max_text_len < 0: max_text_len = 0
+                            
+                            truncated_text = text_to_truncate[:max_text_len]
+                            if len(text_to_truncate) > max_text_len:
+                                truncated_text += "\\n... [TRUNCATED]"
+                        else:
+                            truncated_text = extracted_text
+                        
+                        self.pending_pdf_context = f"{context_header}\\n{truncated_text}\\n---"
+                        print(f"\n📄 Using cached version of \'{filename}\'. Context prepared.")
+                        logger.info(f"Loaded cached PDF \'{filename}\' (ID: {paper_id}) from blob: {blob_filename}")
+                        
+                        # Optionally, if you want to also add the GenAI file to active_files if available
+                        genai_uri = cached_paper_info.get("genai_file_uri")
+                        if genai_uri and self.client:
+                            try:
+                                # We need to "reconstruct" a File object or decide if it's needed
+                                # For now, we focus on context. If direct file interaction is needed,
+                                # this part might require fetching the file resource via client.files.get(uri)
+                                # and then potentially adding it to self.active_files.
+                                # However, this adds complexity (async call in sync context or another bg task)
+                                # For now, let's assume context from text is primary.
+                                logger.info(f"Cached PDF \'{filename}\' also has GenAI URI: {genai_uri}. Context set from text blob.")
+                            except Exception as e:
+                                logger.warning(f"Could not fully utilize cached GenAI URI {genai_uri} for {filename}: {e}")
+                        return # Skip reprocessing
+                    except Exception as e:
+                        logger.error(f"Error reading cached blob for {filename}: {e}", exc_info=True)
+                        print(f"\n⚠️ Error reading cached version of \'{filename}\'. Will attempt to reprocess.")
+                else:
+                    logger.warning(f"Blob file {blob_full_path} not found for cached PDF \'{filename}\'. Will reprocess.")
+            else:
+                logger.warning(f"Cached PDF record for \'{filename}\' found but blob_path is missing. Will reprocess.")
+        # --- End cache check ---
 
         if not pdf_path.exists() or not pdf_path.is_file():
             print(f"\n⚠️ Error: PDF file '{filename}' not found in {self.pdfs_dir_abs_path}.")
