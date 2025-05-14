@@ -442,18 +442,28 @@ def handle_history_command(agent: 'CodeAgent', args: List[str]):
 
 
 def handle_toggle_verbose_command(agent: 'CodeAgent'):
-    """Toggles verbose logging on/off."""
+    """Toggles verbose logging on/off for all loggers in the application."""
     import logging
     root_logger = logging.getLogger()
     
     if root_logger.level == logging.WARNING:
         # Currently not verbose, switch to verbose (INFO)
-        root_logger.setLevel(logging.INFO)
-        print("\n🔊 Verbose logging enabled (INFO level)")
+        level = logging.INFO
+        message = "\n🔊 Verbose logging enabled (INFO level)"
     else:
         # Currently verbose, switch to non-verbose (WARNING)
-        root_logger.setLevel(logging.WARNING)
-        print("\n🔇 Verbose logging disabled (WARNING level)")
+        level = logging.WARNING
+        message = "\n🔇 Verbose logging disabled (WARNING level)"
+    
+    # Set level for root logger
+    root_logger.setLevel(level)
+    
+    # Set level for all existing loggers
+    for logger_name in logging.root.manager.loggerDict:
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(level)
+    
+    print(message)
 
 
 # --- Command Dispatcher ---

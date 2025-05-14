@@ -20,6 +20,7 @@ from pydantic import SecretStr
 from dotenv import load_dotenv
 from src.agent_browser_utils import setup_browser, agent_loop
 import logging
+import sqlite3
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,10 @@ with open(config_path) as f:
     config = yaml.safe_load(f)
 
 MODEL_NAME = config.get('model_name', "gemini-2.5-flash-preview-04-17")
+
+# Set default database path
+project_root = Path(__file__).resolve().parents[1]
+DEFAULT_DB_PATH = project_root / config.get('PAPER_DB_PATH', "processed_papers/metadata.db")
 
 # --- Constants ---
 MAX_GEMINI_PDF_SIZE_BYTES = 200 * 1024 * 1024 # 200 MB, adjust as needed
@@ -624,3 +629,71 @@ def open_url(url: str) -> str:
         return result or "No content."
     except Exception as e:
         return f"Error during open_url: {e}"
+
+def run_sql_query(query: str) -> str:
+    """Executes a SQLITE3 SQL query against the LLM's own database.
+
+    Args:
+        query: The SQL query to execute.
+
+    Returns:
+        The query results as a string in a tabular format or an error message.
+    """
+    print(f"\n\u2692\ufe0f Tool: Executing SQL query: {query}")
+
+    try:
+        # Use the global default database path
+        db_path = DEFAULT_DB_PATH
+        if not db_path.parent.exists():
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"Created directory: {db_path.parent}")
+
+        # Connect to the database with row factory to get dictionary-like results
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+
+        # Execute the query
+        cursor = conn.cursor()
+        cursor.execute(query)
+
+        # Format the results
+        if query.strip().upper().startswith("SELECT"):
+            # For SELECT queries, fetch and format results
+            rows = cursor.fetchall()
+            if not rows:
+                return "Query executed successfully. No results returned."
+
+            # Get column names
+            columns = [description[0] for description in cursor.description]
+
+            # Calculate column widths based on data
+            col_widths = [len(col) for col in columns]
+            for row in rows:
+                for i, col in enumerate(columns):
+                    value = str(row[col])
+                    col_widths[i] = max(col_widths[i], len(value))
+
+            # Format header
+            header = "| " + " | ".join(col.ljust(col_widths[i]) for i, col in enumerate(columns)) + " |"
+            separator = "|-" + "-|-".join("-" * width for width in col_widths) + "-|"
+
+            # Format rows
+            result_rows = []
+            for row in rows:
+                row_str = "| " + " | ".join(str(row[col]).ljust(col_widths[i]) for i, col in enumerate(columns)) + " |"
+                result_rows.append(row_str)
+
+            # Combine all parts
+            result = f"\n{header}\n{separator}\n" + "\n".join(result_rows) + f"\n\nTotal rows: {len(rows)}"
+            return result
+        else:
+            # For non-SELECT queries, return the number of affected rows
+            return f"Query executed successfully. Rows affected: {cursor.rowcount}"
+
+    except sqlite3.Error as e:
+        return f"SQLite error: {e}"
+    except Exception as e:
+        return f"Error executing SQL query: {e}"
+    finally:
+        if 'conn' in locals():
+            conn.close()

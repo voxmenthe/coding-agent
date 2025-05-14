@@ -159,7 +159,8 @@ class CodeAgent:
             tools.get_current_date_and_time,
             tools.google_search,
             tools.open_url,
-            tools.upload_pdf_for_gemini
+            tools.upload_pdf_for_gemini,
+            tools.run_sql_query
         ]
         if self.config.get('verbose', config.get('verbose', False)):
             self.tool_functions = [self._make_verbose_tool(f) for f in self.tool_functions]
