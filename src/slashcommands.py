@@ -29,6 +29,8 @@ def handle_help_command(agent: 'CodeAgent'):
     print("  /cancel <task_id>      - Attempt to cancel a background task.")
     print("  /run_script <py|sh> <path> [args...] - Run a script.")
     print("  /history <mode> <n_tokens> - Display parts of the conversation history.")
+    print("  /toggle_verbose        - Toggle verbose logging on/off.")
+
     # Potentially list dynamically discovered prompts or other contextual help.
 
 def handle_pdf_command(agent: 'CodeAgent', args: List[str]):
@@ -338,6 +340,7 @@ def handle_run_script_command(agent: 'CodeAgent', args: List[str]):
     else:
         print("\n⚠️ Usage: /run_script <python|shell> <script_path> [args...]")
 
+
 def handle_cancel_task_command(agent: 'CodeAgent', args: List[str]):
     """Handles the /cancel command."""
     if args:
@@ -345,9 +348,11 @@ def handle_cancel_task_command(agent: 'CodeAgent', args: List[str]):
     else:
         print("\n⚠️ Usage: /cancel <task_id>")
 
+
 def handle_list_tasks_command(agent: 'CodeAgent'):
     """Handles the /tasks command."""
     agent._handle_list_tasks_command()
+
 
 def handle_history_command(agent: 'CodeAgent', args: List[str]):
     """Handles the /history command to display parts of the conversation history."""
@@ -435,6 +440,22 @@ def handle_history_command(agent: 'CodeAgent', args: List[str]):
     
     print(f"\n(Displayed approx. {tokens_counted} tokens from {len(messages_to_display)} messages)")
 
+
+def handle_toggle_verbose_command(agent: 'CodeAgent'):
+    """Toggles verbose logging on/off."""
+    import logging
+    root_logger = logging.getLogger()
+    
+    if root_logger.level == logging.WARNING:
+        # Currently not verbose, switch to verbose (INFO)
+        root_logger.setLevel(logging.INFO)
+        print("\n🔊 Verbose logging enabled (INFO level)")
+    else:
+        # Currently verbose, switch to non-verbose (WARNING)
+        root_logger.setLevel(logging.WARNING)
+        print("\n🔇 Verbose logging disabled (WARNING level)")
+
+
 # --- Command Dispatcher ---
 COMMAND_HANDLERS: Dict[str, callable] = {
     "/pdf": handle_pdf_command,
@@ -449,4 +470,5 @@ COMMAND_HANDLERS: Dict[str, callable] = {
     "/tasks": handle_list_tasks_command,
     "/help": handle_help_command, 
     "/history": handle_history_command,
+    "/toggle_verbose": handle_toggle_verbose_command,
 } 

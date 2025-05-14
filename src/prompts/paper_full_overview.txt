@@ -1,0 +1,16 @@
+Review the attached paper and provide a detailed overview.
+
+### Overview & Context
+- Motivation and context?
+- Problem addressed and importance?
+
+### Methodology & Approach
+- Step-by-step methodology? (include high-level python-like pseudocode ONLY if appropriate)
+- Innovations compared to previous methods? (include a brief refresher on the previous methods it builds on)
+
+### Results & Findings
+- Explain the top 6 most interesting and surprising insights from the paper.
+
+### Limitations & Critiques
+- Potential limitations or weaknesses?
+- Possible criticisms or improvements?

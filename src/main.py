@@ -30,8 +30,8 @@ from . import slashcommands # Import the new module
 
 
 # Setup basic logging
-# TODO: Configure logging more robustly (e.g., level, format, handler) if needed
-logging.basicConfig(level=logging.INFO) # Basic config for now
+# Configure logging with a default of WARNING (less verbose)
+logging.basicConfig(level=logging.WARNING) # Default to less verbose logging
 logger = logging.getLogger(__name__) # Define module-level logger
 
 
@@ -70,6 +70,9 @@ def load_config(config_path: Path):
         # It's already in config from the update() step
     else:
         logger.warning("GEMINI_API_KEY not found in environment or config.yaml.")
+
+
+    logger.info(f"Using model: {MODEL_NAME}")
 
     # 5. Resolve paths (relative to project root, which is parent of src/)
     project_root = Path(__file__).parent.parent 
