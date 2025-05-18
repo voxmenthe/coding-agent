@@ -150,6 +150,269 @@ def extract_text_from_pdf_gemini(
             except Exception as e:
                 logger.error(f"Unexpected error deleting Gemini file {uploaded_file.name}: {e}", exc_info=True)
 
+def extract_paper_metadata(
+    pdf_text: str,
+    genai_client: genai.client.Client,
+    model_name: str,
+    source_filename: str = None
+) -> dict:
+    """
+    Extracts structured metadata from PDF text content using Gemini's structured output.
+    
+    Args:
+        pdf_text: The extracted text content from the PDF.
+        genai_client: An initialized google.genai.client.Client instance.
+        model_name: The name of the Gemini model to use.
+        source_filename: Optional filename to help with extraction.
+        
+    Returns:
+        A dictionary containing extracted metadata fields.
+    """
+    logger.info("Extracting structured metadata from PDF content...")
+    
+    # Define paper metadata schema for structured output
+    paper_schema = {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "The title of the academic paper"
+            },
+            "authors": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "description": "List of author names"
+            },
+            "arxiv_id": {
+                "type": "string",
+                "description": "The arXiv ID if present (e.g. '2305.05427v1')"
+            },
+            "publication_date": {
+                "type": "string",
+                "description": "Publication date in ISO format (YYYY-MM-DD)"
+            },
+            "summary": {
+                "type": "string",
+                "description": "Abstract or summary of the paper"
+            },
+            "categories": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "description": "Academic categories or subject areas"
+            },
+            "source_pdf_url": {
+                "type": "string",
+                "description": "URL to the source PDF if found in the text"
+            }
+        },
+        "required": ["title", "authors", "summary"]
+    }
+    
+    # Set up the prompt to guide the extraction
+    prompt = f"""Extract detailed metadata from the following academic paper text.
+    
+    I need you to extract the following fields using the information in the document:
+    1. title - Extract the full title of the paper
+    2. authors - Extract all author names as an array of strings
+    3. arxiv_id - If present, extract the arXiv ID exactly (e.g., '2305.05427v1')
+    4. summary - Extract the abstract or summary section
+    5. categories - If present, extract academic categories (e.g., cs.AI, cs.LG)
+    6. publication_date - If present, extract the publication date in YYYY-MM-DD format
+    7. source_pdf_url - If present, extract any URL to the original PDF
+    
+    Use exactly these field names in your response as valid JSON. The response should be structured as a JSON object with these keys.
+    
+    Filename hint: {source_filename if source_filename else 'Not provided'}
+    
+    The first part of the paper content is provided here (which might include the title, authors, abstract):
+    
+    {pdf_text[:5000]}... (content continues)
+    """
+    
+    try:
+        # Configure the request for structured output
+        generation_config = genai.types.GenerationConfig(
+            response_mime_type="application/json",
+            temperature=0.1  # Low temperature for more deterministic extraction
+        )
+        
+        # Generate structured content
+        response = genai_client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            generation_config=generation_config,
+            response_schema=paper_schema
+        )
+        
+        # Process the response
+        if not response.candidates or not response.candidates[0].content.parts:
+            logger.warning("No valid response received for metadata extraction")
+            return {}
+            
+        # Extract the JSON structured data
+        if response.candidates and response.candidates[0].content.parts:
+            # Check if we have structured data response
+            import json
+            for part in response.candidates[0].content.parts:
+                # First approach: Check if it's returned as structured data via function_call
+                if hasattr(part, 'function_call') and part.function_call.response:
+                    metadata = part.function_call.response
+                    logger.info(f"Successfully extracted metadata with fields: {list(metadata.keys())}")
+                    return metadata
+                # Second approach: Check if it's returned as text that contains JSON
+                elif hasattr(part, 'text'):
+                    # First try to extract JSON directly from the text
+                    try:
+                        # Look for JSON in the text
+                        text = part.text
+                        # Try to find a JSON block in the text
+                        if '{' in text and '}' in text:
+                            start_idx = text.find('{')
+                            json_text = text[start_idx:]
+                            metadata = json.loads(json_text)
+                            logger.info(f"Extracted JSON from text with fields: {list(metadata.keys())}")
+                            return metadata
+                    except json.JSONDecodeError:
+                        try:
+                            # Try to parse the entire text as JSON
+                            metadata = json.loads(text)
+                            logger.info(f"Parsed metadata as JSON with fields: {list(metadata.keys())}")
+                            return metadata
+                        except json.JSONDecodeError:
+                            # If structured output failed, try a basic extraction with regex
+                            logger.warning("Failed to parse metadata as JSON, trying regex fallback")
+                            # Extract title, authors, and summary using regex
+                            import re
+                            metadata = {}
+                            
+                            # Try to extract title - usually at the beginning of the document
+                            title_match = re.search(r'^\s*([^\n]{10,200})\n', text[:1000], re.MULTILINE)
+                            if title_match:
+                                metadata['title'] = title_match.group(1).strip()
+                            
+                            # Try to extract authors - often following the title
+                            author_text = text[1000:2000] if len(text) > 1000 else text[:1000]
+                            # Look for author patterns like "Author 1, Author 2, and Author 3"
+                            authors_match = re.search(r'(?:authors?|by)\s*[:;\-]?\s*([^\n]{10,300})\n', 
+                                                    author_text, re.IGNORECASE)
+                            if authors_match:
+                                author_list = [a.strip() for a in re.split(r',|\band\b|;', authors_match.group(1))
+                                             if len(a.strip()) > 2]
+                                if author_list:
+                                    metadata['authors'] = author_list
+                            
+                            # Try to extract abstract/summary
+                            abstract_match = re.search(r'(?:abstract|summary)\s*[:;\-]?\s*([^\n]{100,2000})', 
+                                                     text[:5000], re.IGNORECASE)
+                            if abstract_match:
+                                metadata['summary'] = abstract_match.group(1).strip()
+                                
+                            # Try to extract arXiv ID if present
+                            arxiv_match = re.search(r'\barXiv:?\s*([0-9]{4}\.[0-9]{4,5}(?:v[0-9]+)?)', 
+                                                   text[:5000], re.IGNORECASE)
+                            if arxiv_match:
+                                metadata['arxiv_id'] = arxiv_match.group(1).strip()
+                                
+                            if metadata:
+                                logger.info(f"Extracted metadata using regex fallback: {list(metadata.keys())}")
+                                return metadata
+                    
+        logger.warning("Could not extract structured metadata")
+        return {}
+        
+    except Exception as e:
+        logger.error(f"Error extracting metadata: {e}", exc_info=True)
+        return {}
+
+
+def update_paper_with_metadata(
+    paper_id: int,
+    metadata: dict,
+    db_path: Path = None
+) -> bool:
+    """
+    Updates a paper record in the database with extracted metadata.
+    
+    Args:
+        paper_id: The ID of the paper record to update.
+        metadata: Dictionary containing extracted metadata fields.
+        db_path: Optional custom database path. Uses the default if not provided.
+        
+    Returns:
+        Boolean indicating success of the update operation.
+    """
+    from src.database import get_db_connection, close_db_connection, update_paper_field
+    
+    if not metadata:
+        logger.warning(f"No metadata provided to update paper ID {paper_id}")
+        return False
+        
+    # Use default DB path if not specified
+    if db_path is None:
+        db_path = DEFAULT_DB_PATH
+    
+    logger.info(f"Updating paper ID {paper_id} with extracted metadata")
+    
+    # Connect to the database
+    conn = get_db_connection(db_path)
+    if not conn:
+        logger.error(f"Failed to connect to database at {db_path}")
+        return False
+    
+    try:
+        # Update each field if present in metadata
+        success = True
+        updated_fields = []
+        
+        # Field mapping: metadata key -> database field
+        field_mapping = {
+            "title": "title",
+            "authors": "authors",
+            "summary": "summary",
+            "arxiv_id": "arxiv_id",
+            "publication_date": "publication_date",
+            "categories": "categories",
+            "source_pdf_url": "source_pdf_url"
+        }
+        
+        # For each field in our mapping, update if present in metadata
+        for meta_key, db_field in field_mapping.items():
+            if meta_key in metadata and metadata[meta_key]:
+                update_success = update_paper_field(conn, paper_id, db_field, metadata[meta_key])
+                if update_success:
+                    updated_fields.append(db_field)
+                else:
+                    success = False
+                    logger.warning(f"Failed to update field '{db_field}' for paper ID {paper_id}")
+        
+        # Mark as completed if we were able to update fields
+        if updated_fields:
+            status_update = update_paper_field(conn, paper_id, "status", "completed_pending_context")
+            if status_update:
+                updated_fields.append("status")
+            else:
+                logger.warning(f"Failed to update status for paper ID {paper_id}")
+                
+            # Update processed_timestamp
+            from datetime import datetime, timezone
+            now_utc = datetime.now(timezone.utc)
+            timestamp_update = update_paper_field(conn, paper_id, "processed_timestamp", now_utc)
+            if timestamp_update:
+                updated_fields.append("processed_timestamp")
+        
+        logger.info(f"Successfully updated {len(updated_fields)} fields for paper ID {paper_id}: {updated_fields}")
+        return success
+        
+    except Exception as e:
+        logger.error(f"Error updating paper ID {paper_id} with metadata: {e}", exc_info=True)
+        return False
+    finally:
+        close_db_connection(conn)
+
 
 # --- Tool Functions ---
 def read_file(path: str) -> str:
