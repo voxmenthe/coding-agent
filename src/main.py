@@ -716,39 +716,18 @@ class CodeAgent:
                     
                     # Update the database with extracted metadata
                     if metadata:
-                        logger.info(f"Finalize Thread Paper ID {paper_id}: Updating DB with extracted metadata fields: {list(metadata.keys())}")
-                        
-                        # DIRECT DB UPDATES: Update fields one by one as a fallback
-                        # This ensures the metadata gets into the database even if update_paper_with_metadata fails
-                        if 'title' in metadata and metadata['title']:
-                            database.update_paper_field(local_conn, paper_id, 'title', metadata['title'])
-                            logger.info(f"Finalize Thread Paper ID {paper_id}: Updated title directly: {metadata['title'][:50]}...")
-                            
-                        if 'authors' in metadata and metadata['authors']:
-                            database.update_paper_field(local_conn, paper_id, 'authors', metadata['authors'])
-                            logger.info(f"Finalize Thread Paper ID {paper_id}: Updated authors directly: {metadata['authors']}")
-                            
-                        if 'summary' in metadata and metadata['summary']:
-                            database.update_paper_field(local_conn, paper_id, 'summary', metadata['summary'])
-                            logger.info(f"Finalize Thread Paper ID {paper_id}: Updated summary directly")
-                            
-                        if 'arxiv_id' in metadata and metadata['arxiv_id']:
-                            database.update_paper_field(local_conn, paper_id, 'arxiv_id', metadata['arxiv_id'])
-                            logger.info(f"Finalize Thread Paper ID {paper_id}: Updated arxiv_id directly: {metadata['arxiv_id']}")
-                            
-                        if 'categories' in metadata and metadata['categories']:
-                            database.update_paper_field(local_conn, paper_id, 'categories', metadata['categories'])
-                            logger.info(f"Finalize Thread Paper ID {paper_id}: Updated categories directly: {metadata['categories']}")
-                            
-                        if 'publication_date' in metadata and metadata['publication_date']:
-                            database.update_paper_field(local_conn, paper_id, 'publication_date', metadata['publication_date'])
-                            logger.info(f"Finalize Thread Paper ID {paper_id}: Updated publication_date directly: {metadata['publication_date']}")
-                            
-                        if 'source_pdf_url' in metadata and metadata['source_pdf_url']:
-                            database.update_paper_field(local_conn, paper_id, 'source_pdf_url', metadata['source_pdf_url'])
-                            logger.info(f"Finalize Thread Paper ID {paper_id}: Updated source_pdf_url directly: {metadata['source_pdf_url']}")
+                        logger.info(f"Finalize Thread Paper ID {paper_id}: Attempting to update DB with extracted metadata fields via tools.update_paper_with_metadata.")
+                        update_success = tools.update_paper_with_metadata(
+                            paper_id=paper_id,
+                            metadata=metadata,
+                            db_path=Path(db_path_str) # Ensure db_path is correctly passed
+                        )
+                        if update_success:
+                            logger.info(f"Finalize Thread Paper ID {paper_id}: Successfully updated metadata via tools.update_paper_with_metadata.")
+                        else:
+                            logger.warning(f"Finalize Thread Paper ID {paper_id}: tools.update_paper_with_metadata reported an issue.")
                     else:
-                        logger.warning(f"Finalize Thread Paper ID {paper_id}: No metadata could be extracted from PDF")
+                        logger.warning(f"Finalize Thread Paper ID {paper_id}: No metadata extracted, skipping call to tools.update_paper_with_metadata.")
                 except Exception as e:
                     logger.error(f"Finalize Thread Paper ID {paper_id}: Error during metadata extraction or update: {e}")
                     # Continue with the rest of processing even if metadata extraction fails

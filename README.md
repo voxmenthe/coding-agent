@@ -89,9 +89,9 @@ coding-agent
 
 The agent can include PDF documents in the conversation context, allowing you to discuss and ask questions about their content:
 
-1. **Upload a PDF:** Use the `/upload` command followed by the path to the PDF (relative to the project directory):
+1. **Upload a PDF:** Use the `/pdf` command followed by the path to the PDF (relative to the project directory):
    ```
-   /upload path/to/your/document.pdf
+   /pdf path/to/your/document.pdf
    ```
 
 2. **Ask Questions:** Once uploaded, you can directly ask questions about the document:
@@ -101,9 +101,9 @@ The agent can include PDF documents in the conversation context, allowing you to
    Extract all tables from this document.
    ```
 
-3. **PDF Ingestion:** Use the `/upload` command to seed an uploaded PDF’s text into the chat context (only once per file):
+3. **PDF Ingestion:** Use the `/pdf` command to seed an uploaded PDF’s text into the chat context (only once per file):
    ```
-   /upload path/to/your/document.pdf
+   /pdf path/to/your/document.pdf
    ```
    After ingestion, the PDF is not reprocessed on each query.
 

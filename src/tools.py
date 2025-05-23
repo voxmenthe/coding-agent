@@ -230,22 +230,22 @@ def extract_paper_metadata(
     
     The first part of the paper content is provided here (which might include the title, authors, abstract):
     
-    {pdf_text[:5000]}... (content continues)
+    {pdf_text}... (content continues)
     """
     
     try:
         # Configure the request for structured output
         generation_config = genai.types.GenerationConfig(
             response_mime_type="application/json",
-            temperature=0.1  # Low temperature for more deterministic extraction
+            temperature=0.1,  # Low temperature for more deterministic extraction
+            response_schema=paper_schema
         )
         
         # Generate structured content
         response = genai_client.models.generate_content(
             model=model_name,
             contents=prompt,
-            generation_config=generation_config,
-            response_schema=paper_schema
+            config=generation_config
         )
         
         # Process the response
@@ -382,7 +382,37 @@ def update_paper_with_metadata(
         # For each field in our mapping, update if present in metadata
         for meta_key, db_field in field_mapping.items():
             if meta_key in metadata and metadata[meta_key]:
-                update_success = update_paper_field(conn, paper_id, db_field, metadata[meta_key])
+                value_to_update = metadata[meta_key]
+
+                # Handle list types for specific fields
+                if meta_key in ["authors", "categories"] and isinstance(value_to_update, list):
+                    logger.debug(f"Converting list for {meta_key} to comma-separated string.")
+                    value_to_update = ", ".join(str(item) for item in value_to_update)
+                elif meta_key in ["authors", "categories"] and not isinstance(value_to_update, (str, list)):
+                    logger.warning(f"Unexpected type for {meta_key}: {type(value_to_update)}. Expected list or str. Attempting to cast to string.")
+                    value_to_update = str(value_to_update)
+                elif meta_key == "publication_date" and not isinstance(value_to_update, str): # Add more specific validation as needed
+                    logger.warning(f"Unexpected type for publication_date: {type(value_to_update)}. Expected str. Attempting to cast to string.")
+                    value_to_update = str(value_to_update)
+                elif meta_key == "title" and not isinstance(value_to_update, str):
+                     logger.warning(f"Unexpected type for title: {type(value_to_update)}. Expected str. Attempting to cast to string.")
+                     value_to_update = str(value_to_update)
+                elif meta_key == "summary" and not isinstance(value_to_update, str):
+                    logger.warning(f"Unexpected type for summary: {type(value_to_update)}. Expected str. Attempting to cast to string.")
+                    value_to_update = str(value_to_update)
+                elif meta_key == "arxiv_id" and not isinstance(value_to_update, str):
+                    logger.warning(f"Unexpected type for arxiv_id: {type(value_to_update)}. Expected str. Attempting to cast to string.")
+                    value_to_update = str(value_to_update)
+                elif meta_key == "source_pdf_url" and not isinstance(value_to_update, str):
+                    logger.warning(f"Unexpected type for source_pdf_url: {type(value_to_update)}. Expected str. Attempting to cast to string.")
+                    value_to_update = str(value_to_update)
+
+
+                if not value_to_update: # Skip if value became empty after processing (e.g. empty list)
+                    logger.debug(f"Skipping update for {db_field} as value is empty/None after processing.")
+                    continue
+
+                update_success = update_paper_field(conn, paper_id, db_field, value_to_update)
                 if update_success:
                     updated_fields.append(db_field)
                 else:
