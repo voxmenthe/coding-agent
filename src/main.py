@@ -12,9 +12,18 @@ import functools
 import logging
 import asyncio, threading, uuid # Added uuid
 from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, TextColumn, BarColumn # Added TextColumn, BarColumn
-from prompt_toolkit.completion import WordCompleter, NestedCompleter, PathCompleter, Completer, Completion
+from prompt_toolkit.document import Document # For completer
+from prompt_toolkit.completion import Completer, Completion, NestedCompleter, WordCompleter, PathCompleter, FuzzyWordCompleter, CompleteEvent # For completer, Added CompleteEvent
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.filters import Condition # Added
+from prompt_toolkit.keys import Keys # Added
+from prompt_toolkit.application.current import get_app # Added
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.shortcuts import CompleteStyle # Added for complete_style argument
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from typing import Iterable, Dict, Any, Optional, Set, Union # For completer and CustomNestedCompleter
 import bisect # Added for efficient searching
 import yaml
 import sqlite3
@@ -34,6 +43,52 @@ from . import slashcommands # Import the new module
 logging.basicConfig(level=logging.WARNING) # Default to less verbose logging
 logger = logging.getLogger(__name__) # Define module-level logger
 
+
+# --- Completer Logging Wrapper ---
+class LoggingCompleterWrapper(Completer):
+    def __init__(self, wrapped_completer: Completer, name: str = "Wrapped"):
+        self.wrapped_completer = wrapped_completer
+        self.name = name
+
+    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Iterable[Completion]:
+        logger.info(f"[{self.name}] get_completions CALLED. Text: '{document.text_before_cursor}', UserInvoked: {complete_event.completion_requested}")
+        raw_completions = list(self.wrapped_completer.get_completions(document, complete_event))
+        logger.info(f"[{self.name}] Raw completions from wrapped: {[c.text for c in raw_completions]} for input '{document.text_before_cursor}'")
+        yield from raw_completions
+# --- End Completer Logging Wrapper ---
+
+class CustomNestedCompleter(NestedCompleter):
+    def __init__(self, options: Dict[str, Optional[Completer]], ignore_case: bool = True):
+        super().__init__(options, ignore_case=ignore_case)
+
+    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Iterable[Completion]:
+        text_before_cursor = document.text_before_cursor.lstrip()
+
+        # If there are no spaces in the text before the cursor (after stripping leading space),
+        # it means we are typing the first command word.
+        if ' ' not in text_before_cursor:
+            # Get actual top-level command strings from the options dictionary keys
+            actual_keys = [k for k in self.options.keys() if isinstance(k, str)]
+            
+            first_word_completer = WordCompleter(
+                words=actual_keys,
+                ignore_case=self.ignore_case,
+                match_middle=True,  # Key for filtering as we type
+                sentence=False      # Match the whole command like "/help" as one word
+            )
+            # logger.debug(f"CustomNestedCompleter: Using FirstWordCompleter for '{document.text_before_cursor}'") # Optional debug
+            yield from first_word_completer.get_completions(document, complete_event)
+        else:
+            # If there are spaces, it means we are beyond the first command word.
+            # Delegate to the original NestedCompleter logic to handle sub-commands.
+            # logger.debug(f"CustomNestedCompleter: Delegating to super for '{document.text_before_cursor}'") # Optional debug
+            yield from super().get_completions(document, complete_event)
+
+# Helper function for the key binding condition
+def is_typing_slash_command_prefix(current_buffer):
+    text = current_buffer.text
+    # Only trigger if text starts with / and has no spaces, and is not just "/"
+    return text.startswith('/') and ' ' not in text and len(text) > 0
 
 # Load config
 config_path = Path(__file__).parent / "config.yaml"
@@ -255,6 +310,97 @@ class CodeAgent:
              return None
     # ---------------------------
 
+    def _get_dynamic_prompt_message(self):
+        """Returns the dynamic prompt message with status indicators."""
+        active_files_info = f" [{len(self.active_files)} files]" if self.active_files else ""
+        token_info = f"({self.current_token_count})"
+        
+        return HTML(
+            f'<ansiblue>🔵 You</ansiblue> '
+            f'<ansicyan>{token_info}</ansicyan>'
+            f'<ansigreen>{active_files_info}</ansigreen>: '
+        )
+
+    def _get_continuation_prompt(self, width, line_number, is_soft_wrap):
+        """Returns the continuation prompt for multi-line input."""
+        if is_soft_wrap:
+            return ' ' * 2  # Indent for soft wraps
+        return HTML('<ansiyellow>│ </ansiyellow>')  # Visual line continuation
+
+    def _get_bottom_toolbar(self):
+        """Returns the bottom toolbar with helpful key bindings."""
+        return HTML(
+            '<ansigray>'
+            '[Alt+Enter] Submit │ [Enter] New line │ [Ctrl+D] Quit │ '
+            '[↑↓] History │ [Tab] Complete'
+            '</ansigray>'
+        )
+
+    def _create_enhanced_prompt_session(self, command_completer, history):
+        """Creates an enhanced PromptSession with multi-line editing capabilities."""
+        
+        # Custom key bindings for multi-line editing
+        kb = KeyBindings()
+        
+        @kb.add('enter')
+        def _(event):
+            """Enter creates a new line in multi-line mode."""
+            event.current_buffer.insert_text('\n')
+        
+        @kb.add('escape', 'enter')  # Alt+Enter or Esc then Enter
+        def _(event):
+            """Alt+Enter submits the multi-line input."""
+            event.current_buffer.validate_and_handle()
+        
+        @kb.add('c-j')  # Ctrl+J as alternative submit
+        def _(event):
+            """Ctrl+J submits the multi-line input (alternative)."""
+            event.current_buffer.validate_and_handle()
+        
+        @kb.add('c-d')  # Ctrl+D to quit on empty line
+        def _(event):
+            """Ctrl+D on empty line to quit."""
+            if not event.current_buffer.text.strip():
+                event.app.exit(result='exit_eof') # Changed result to distinguish from KeyboardInterrupt
+
+        @kb.add(Keys.Any, filter=Condition(lambda: is_typing_slash_command_prefix(get_app().current_buffer)))
+        def _handle_slash_command_typing(event):
+            """
+            Handles typing characters for slash commands, inserts the char,
+            and forces completion refresh.
+            """
+            event.current_buffer.insert_text(event.data) # Insert the character typed
+            event.app.current_buffer.start_completion(select_first=False)
+
+        # @kb.add('tab')
+        # def _(event):
+        #     """Handle tab completion."""
+        #     b = event.current_buffer
+        #     if b.complete_state:
+        #         b.complete_next()
+        #     else:
+        #         b.start_completion(select_first=False) # Use select_first=False for a better UX usually
+        
+        # Create the enhanced session
+        return PromptSession(
+            message=self._get_dynamic_prompt_message,  # Dynamic prompt function
+            multiline=True, # Re-enable multi-line
+            wrap_lines=True, # Re-enable wrap lines
+            mouse_support=True,  # Enable mouse support
+            complete_style=CompleteStyle.MULTI_COLUMN, # Optional: can be nice with more completions
+            completer=command_completer, # Now using CustomNestedCompleter
+            history=history,
+            key_bindings=kb, # Enable our custom key bindings
+            auto_suggest=AutoSuggestFromHistory(), # Can re-enable if desired
+            # enable_history_search=True, # Keep False with complete_while_typing=True
+            search_ignore_case=True, # Good for history search if enabled
+            prompt_continuation=self._get_continuation_prompt,  # Custom continuation
+            bottom_toolbar=self._get_bottom_toolbar,  # Status bar
+            complete_while_typing=True,  # THE KEY SETTING TO TEST
+            enable_history_search=False, # Must be False if complete_while_typing is True
+            # input_processors=None, 
+        )
+
     def print_initial_help(self):
         """Prints the initial brief help message."""
         print("\n\u2692\ufe0f Agent ready. Ask me anything or type '/help' for commands.")
@@ -262,7 +408,7 @@ class CodeAgent:
         # Key commands can be highlighted if desired, but /help is the main source.
 
     def start_interaction(self):
-        """Starts the main interaction loop using a stateful ChatSession via client.chats.create."""
+        """Starts the main interaction loop with enhanced multi-line editing."""
         if not self.client:
             print("\n\u274c Client not configured. Exiting.")
             return
@@ -272,6 +418,13 @@ class CodeAgent:
         # Set initial thinking budget from default/config
         self.thinking_config = types.ThinkingConfig(thinking_budget=self.thinking_budget)
         print(f"\n🧠 Initial thinking budget set to: {self.thinking_budget} tokens.")
+
+        # Print multi-line editing instructions
+        print("\n📝 Multi-line editing enabled:")
+        print("   • Press [Enter] to create new lines")
+        print("   • Press [Alt+Enter] or [Ctrl+J] to submit")
+        print("   • Use mouse to select text and position cursor")
+        print("   • Press [↑↓] to navigate history")
 
         # Define slash commands and setup nested completer
         # The keys in slash_command_completer_map should match COMMAND_HANDLERS keys
@@ -316,18 +469,24 @@ class CodeAgent:
         slash_command_completer_map['/load'] = WordCompleter(saved_files, ignore_case=True)
 
         # Prompt name completer
-        slash_command_completer_map['/prompt'] = WordCompleter(self._list_available_prompts(), ignore_case=True)
+        # slash_command_completer_map['/prompt'] = WordCompleter(self._list_available_prompts(), ignore_case=True) # Temporarily disable for flat test
         
         # Add all command names from COMMAND_HANDLERS to the completer if not already specified
         for cmd_name in slashcommands.COMMAND_HANDLERS.keys():
             if cmd_name not in slash_command_completer_map:
                 slash_command_completer_map[cmd_name] = None
 
+        # Create the CustomNestedCompleter instance
+        command_completer_instance = CustomNestedCompleter(
+            options=slash_command_completer_map,
+            ignore_case=True
+        )
 
-        command_completer = NestedCompleter.from_nested_dict(slash_command_completer_map)
+        logger.debug(f"Using CustomNestedCompleter with options: {list(slash_command_completer_map.keys())}")
 
         history = InMemoryHistory()
-        session = PromptSession(">", completer=command_completer, history=history)
+        # Create enhanced session
+        session = self._create_enhanced_prompt_session(command_completer_instance, history)
 
         while True:
             try:
@@ -336,21 +495,39 @@ class CodeAgent:
                 self.messages_per_interval.append(self._messages_this_interval)
                 self._messages_this_interval = 0
 
-                active_files_info = f" [{len(self.active_files)} files]" if self.active_files else ""
-                prompt_prefix = f"\n🔵 You ({self.current_token_count}{active_files_info}): "
+                # Get multi-line input with the enhanced session
+                # The prompt message is now handled by _get_dynamic_prompt_message
+                # Prefill logic needs to be integrated with PromptSession's `default` if needed, or handled before prompt.
+                # For now, we simplify and remove direct prefill_text here as the plan's session.prompt() is simpler.
+                # If prefill is critical, it should be passed to session.prompt(default=prefill_text)
                 
                 # Check if there's content to prefill from /prompt command
-                prefill_text = ""
+                current_prefill_text = ""
                 if self.prefill_prompt_content:
-                    prefill_text = self.prefill_prompt_content
+                    current_prefill_text = self.prefill_prompt_content
                     self.prefill_prompt_content = None # Clear after retrieving
-
-                user_input = session.prompt(prompt_prefix, default=prefill_text).strip()
-
-                # ─── 2 · trivial exits / empty line ─────────────────────────────
-                if user_input.lower() in {"exit", "quit", "/exit", "/q"}: # Keep direct exit for simplicity
+                
+                try:
+                    user_input = session.prompt(default=current_prefill_text).strip()
+                except KeyboardInterrupt:
                     print("\n👋 Goodbye!")
                     break
+                except EOFError:  # Ctrl+D (or result from custom keybinding)
+                    print("\n👋 Goodbye!") # Or handle 'exit_eof' if needed
+                    break
+
+                # ─── 2 · trivial exits / empty line ─────────────────────────────
+                # Handle exit commands (already covered by Ctrl+D and KeyboardInterrupt for session)
+                # The custom Ctrl+D binding in _create_enhanced_prompt_session handles empty line exit.
+                # If user types 'exit' or 'quit' it will be processed as a command or message.
+                # The plan's version of this check is slightly different, let's ensure it's robust.
+                if user_input.lower() in {"exit", "quit"}: # This is from the plan, simpler than existing /exit /q
+                    print("\n👋 Goodbye!")
+                    break
+                
+                # If Ctrl+D was used on an empty line, app.exit(result='exit_eof') is called.
+                # The prompt loop will break due to EOFError in that case.
+                # No specific check for 'exit_eof' needed here if EOFError is caught.
 
                 if not user_input:
                     self.prompt_time_counts.pop()
@@ -514,6 +691,7 @@ class CodeAgent:
             except Exception as e:
                 print(f"\n🔴 An error occurred during interaction: {e}")
                 traceback.print_exc()
+                # Potentially add a small delay or a prompt to continue/exit here
 
     def _make_verbose_tool(self, func):
         """Wrap tool function to print verbose info when called."""

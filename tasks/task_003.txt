@@ -1,11 +1,11 @@
 # Task ID: 3
-# Title: Implement `/sql` Command with Read-Only Security
+# Title: Verify Full Multi-line Input Reception
 # Status: pending
-# Dependencies: None
+# Dependencies: 2
 # Priority: high
-# Description: Implement `/sql` to allow users to run arbitrary read-only SQL queries against the paper metadata database specified in `database.py`.
+# Description: Ensure that the application's input handling logic correctly receives the complete multi-line string, with all newline characters (`\n`) preserved, when submitted by the user.
 # Details:
-The command should accept the SQL query as an argument (e.g., `/sql "SELECT * FROM papers"`). Connect to the database (details from `database.py`). CRITICAL: Implement a strong mechanism to ensure only read-only queries (primarily `SELECT`) are permitted. This can involve parsing the SQL query to check for forbidden keywords (e.g., `INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`) before execution. Database user permissions for read-only access are a more secure alternative if feasible. Execute the query and display results in a formatted way (e.g., simple table). Handle SQL errors gracefully. Register in `slashcommands.py`.
+In `src/main.py`, locate the line where user input is obtained from `session.prompt(...)` (e.g., `user_input = session.prompt(...)`). Add temporary logging or use a debugger to inspect the `user_input` variable immediately after a multi-line input is submitted. Confirm that the variable contains the full text, including `\n` characters representing the newlines typed by the user.
 
 # Test Strategy:
-1. Setup a test database with sample data. 2. Execute valid `SELECT` queries (e.g., `SELECT * FROM table`, `SELECT col1, col2 FROM table WHERE condition`) and verify results are displayed correctly. 3. Attempt to execute non-read-only queries (`INSERT`, `UPDATE`, `DELETE`, `DROP TABLE`) and verify they are blocked with an error message and no changes occur in the database. 4. Test queries with SQL syntax errors and verify graceful error reporting.
+Type a multi-line message like "Hello\nWorld\nTest" into the CLI. Submit it using the configured submission key. Check the application logs or debugger to verify that the received `user_input` string is exactly "Hello\nWorld\nTest" (or its equivalent with OS-specific line endings if `prompt_toolkit` normalizes, though `\n` is standard).

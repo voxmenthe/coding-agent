@@ -15,27 +15,43 @@ logger = logging.getLogger(__name__)
 # --- Command Handler Functions ---
 
 def handle_help_command(agent: 'CodeAgent'):
-    """Prints the help message with all available commands."""
-    print("\nAvailable commands:")
-    print("  /exit, /q              - Quit the agent.")
-    print("  /pdf <filename> [id]   - Process a PDF file from PDFS_TO_CHAT_WITH_DIRECTORY.")
-    print("  /prompt <name>         - Load a system prompt to prepend to the next message.")
-    print("  /reset                 - Clear chat history and start fresh.")
-    print("  /clear <n_tokens>      - Remove <tokens> from the start of history.")
-    print("  /save [filename]       - Save the current conversation.")
-    print("  /load <filename>       - Load a saved conversation.")
-    print(f"  /thinking_budget <val> - Set tool thinking budget (current: {agent.thinking_budget}).")
-    print("  /tasks                 - List active background tasks.")
-    print("  /cancel <task_id>      - Attempt to cancel a background task.")
-    print("  /run_script <py|sh> <path> [args...] - Run a script.")
-    print("  /history [--full|--head|--tail <n_tokens>] - Display conversation history")
-    print("  /toggle_verbose        - Toggle verbose logging on/off.")
-    print("\nHistory command examples:")
-    print("  /history               - Show full conversation history")
-    print("  /history --head 500    - Show first ~500 tokens of history")
-    print("  /history --tail 500    - Show last ~500 tokens of history")
-
-    # Potentially list dynamically discovered prompts or other contextual help.
+    """Prints the enhanced help message with editing instructions."""
+    print("\n" + "="*60)
+    print("🤖 CODE AGENT - HELP")
+    print("="*60)
+    
+    print("\n📝 MULTI-LINE EDITING:")
+    print("   [Enter]           Create new line")
+    print("   [Alt+Enter]       Submit input")
+    print("   [Ctrl+J]          Submit input (alternative)")
+    print("   [Ctrl+D]          Quit (on empty line)")
+    print("   [↑↓ arrows]       Navigate history")
+    print("   [Mouse]           Select text, position cursor")
+    print("   [Tab]             Auto-complete")
+    
+    print("\n🛠️  AVAILABLE COMMANDS:")
+    print("   /exit, /q              - Quit the agent")
+    print("   /pdf <filename> [id]   - Process a PDF file")
+    print("   /prompt <name>         - Load a system prompt")
+    print("   /reset                 - Clear chat history")
+    print("   /clear <n_tokens>      - Remove tokens from history")
+    print("   /save [filename]       - Save conversation")
+    print("   /load <filename>       - Load conversation")
+    print(f"   /thinking_budget <val> - Set thinking budget (current: {agent.thinking_budget})")
+    print("   /tasks                 - List background tasks")
+    print("   /cancel <task_id>      - Cancel background task")
+    print("   /run_script <py|sh>    - Run a script")
+    print("   /history [options]     - Display conversation history")
+    print("   /toggle_verbose        - Toggle verbose logging")
+    print("   /help                  - Show this help")
+    
+    print("\n💡 TIPS:")
+    print("   • Use Ctrl+C to interrupt without quitting")
+    print("   • Copy/paste works with mouse selection")
+    print("   • Large inputs are automatically handled")
+    print("   • Commands can be used within multi-line input")
+    
+    print("="*60)
 
 def handle_pdf_command(agent: 'CodeAgent', args: List[str]):
     """Handles the /pdf command to process a PDF file."""

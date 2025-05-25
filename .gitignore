@@ -16,10 +16,10 @@ examples/outputs
 examples/output
 .DS_Store
 **/.DS_Store
-PROJECT_PLANS_PRDS
 PERSONAL_NOTES
 processed_papers
 SAVED_CONVERSATIONS
+# todo - add back PROJECT_PLANS_PRDS
 
 # Added by Claude Task Master
 # Logs

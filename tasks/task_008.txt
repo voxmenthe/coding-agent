@@ -1,11 +1,16 @@
 # Task ID: 8
-# Title: Develop ArXiv API Integration Utilities and Configuration
+# Title: Perform Basic Multi-line Editing and Submission Tests
 # Status: pending
-# Dependencies: None
+# Dependencies: 3
 # Priority: high
-# Description: Create utility functions for interacting with the ArXiv API (search, download papers) and manage related configurations like PDF download directory.
+# Description: Conduct comprehensive testing of basic multi-line editing features such as cursor movement across lines, text insertion/deletion on different lines, and verify correct submission of the edited multi-line text.
 # Details:
-Create a new module (e.g., `arxiv_utils.py`). Implement functions using the `arxiv` Python library: 1. `search_papers(query, max_results, sort_by, date_range_filter)`: to search ArXiv. 2. `download_paper(paper_result_object_or_id, download_dir)`: to download a paper's PDF. Handle API keys (if needed by library version or direct calls), rate limiting considerations, and API errors gracefully. Add configuration for `pdfs_dir` (e.g., `arxiv_pdfs_dir: "downloaded_arxiv_papers"`) to `config.yaml` and ensure the directory is created if it doesn't exist. Add `arxiv` to `requirements.txt`.
+This task involves systematically testing the editing capabilities provided by `prompt_toolkit` in multi-line mode. Key aspects to test: 
+- Moving the cursor up and down between lines using arrow keys. 
+- Editing text on any line. 
+- Deleting characters and entire lines. 
+- Inserting new lines between existing lines. 
+- Ensuring the final, edited multi-line string is submitted correctly.
 
 # Test Strategy:
-1. Unit test `search_papers` function (mocking `arxiv.Search` and `arxiv.Client().results`): verify correct query construction for various inputs (keywords, date ranges) and parsing of results. 2. Unit test `download_paper` function (mocking `arxiv.Result.download_pdf`): verify correct file path generation and handling of download success/failure. 3. Verify that `pdfs_dir` from `config.yaml` is correctly read and used, and the directory is created.
+Execute the following: 1. Type 'Line 1', press `Enter`. 2. Type 'Line 3', press `Enter`. 3. Move cursor up to the line after 'Line 1'. Type 'Line 2'. 4. Move cursor to 'Line 1', edit its content. 5. Move cursor to 'Line 3', delete it. 6. Submit the input. Verify the agent receives the correctly edited multi-line string (e.g., 'Edited Line 1\nLine 2').

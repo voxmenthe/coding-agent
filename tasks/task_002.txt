@@ -1,61 +1,20 @@
 # Task ID: 2
-# Title: Design and Implement `/edit_history` Command
+# Title: Configure Submission Keys for Multi-line Input
 # Status: pending
 # Dependencies: 1
-# Priority: medium
-# Description: Implement `/edit_history` to allow users to modify conversation history entries by index (replace content or delete entry).
+# Priority: high
+# Description: Configure distinct key bindings for creating a new line (using `Enter`) and for submitting the entire multi-line input (e.g., `Meta-Enter`, `Alt-Enter`, or `Esc` then `Enter`).
 # Details:
-Decide on and implement an editing mechanism. Recommended: index-based commands like `/edit_history <index> "new content"` (to replace message content) and `/edit_history delete <index>` (to delete an entry). Implement parsing for these commands and logic to modify the `self.conversation_history` list. Include robust error handling for invalid indices, malformed commands, or unintended consequences of edits. Register in `slashcommands.py`. Consider safety against data corruption. The primary target for editing is the 'content' of a message; role should typically remain unchanged.
+In `src/main.py`, review the default behavior of `prompt_toolkit` for submitting multi-line input. The common default is `Meta-Enter` or `Alt-Enter`. If this is not the case or a different key binding is preferred, explicitly configure it using `prompt_toolkit.key_binding.KeyBindings`. `Enter` should create a new line. A specific, discoverable key combination should submit. Example: 
+```python
+from prompt_toolkit.key_binding import KeyBindings
+kb = KeyBindings()
+@kb.add('meta-enter') # Or 'alt-enter', 'escape', 'enter'
+def _(event):
+    event.app.current_buffer.validate_and_handle()
+session = PromptSession(key_bindings=kb, ...)
+```
+Ensure this configuration is applied to the `PromptSession`.
 
 # Test Strategy:
-1. Populate history with 3-5 entries. 2. Test `/edit_history <valid_index> "new message content"`: verify the specific entry's content is updated. 3. Test `/edit_history delete <valid_index>`: verify entry is removed and history list adjusts. 4. Test with out-of-bounds indices for both operations. 5. Test with malformed commands (e.g., missing index, missing content for edit). 6. Ensure informative error messages are displayed for all error conditions.
-
-# Subtasks:
-## 1. Design Command Syntax and User Interaction Flow [pending]
-### Dependencies: None
-### Description: Define the precise command structure for listing history, replacing content (e.g., `/edit_history <index> "new content"`), and deleting entries (e.g., `/edit_history delete <index>`). Outline how users will view history to obtain the correct index for editing.
-### Details:
-Consider 1-based vs 0-based indexing for user input and clearly communicate the chosen convention. Specify handling of quoted multi-word content and potential subcommands for clarity (e.g., `list`, `replace`, `delete`).
-
-## 2. Implement History Display with Indexing [pending]
-### Dependencies: 2.1
-### Description: Implement functionality for the `/edit_history` command (e.g., when called without modification arguments or via a specific subcommand like `/edit_history list`) to display the conversation history. Each entry must have a clear, user-friendly (e.g., 1-based) index.
-### Details:
-Output format should be easy to read in a CLI. Consider displaying a snippet of each history entry alongside its index. Ensure consistent indexing presentation to the user.
-
-## 3. Implement Command Parsing Logic [pending]
-### Dependencies: 2.1
-### Description: Develop the parser to correctly interpret the `/edit_history` command, distinguishing between list, replace, and delete operations. Extract parameters like index, new content (if applicable), and operation type based on the designed syntax.
-### Details:
-Handle variations in spacing and ensure robust extraction of quoted strings for new content. Convert user-facing index (e.g., 1-based) to internal (e.g., 0-based) index during parsing.
-
-## 4. Implement Core Logic for History Replacement [pending]
-### Dependencies: 2.3
-### Description: Implement the functionality to modify `self.conversation_history` by replacing an entry at a specified internal index with new content. This involves updating the existing list structure.
-### Details:
-Ensure the `self.conversation_history` list is correctly updated. Handle the storage of the new content, potentially overwriting or modifying the existing entry object/structure.
-
-## 5. Implement Core Logic for History Deletion [pending]
-### Dependencies: 2.3
-### Description: Implement the functionality to modify `self.conversation_history` by deleting an entry at a specified internal index. This involves removing an element from the list.
-### Details:
-Ensure the correct element is removed from `self.conversation_history`. Be mindful of list index changes if multiple operations are performed sequentially without re-fetching indices.
-
-## 6. Implement Robust Error Handling and User Feedback [pending]
-### Dependencies: 2.2, 2.4, 2.5
-### Description: Implement comprehensive error handling for scenarios like invalid index (out of bounds, non-numeric, non-integer), malformed command syntax, or missing arguments. Provide clear, informative feedback messages to the user for both successful operations and errors.
-### Details:
-Error messages should guide the user on how to correct the command (e.g., 'Invalid index. Please use a number between 1 and N.'). Success messages should confirm the action (e.g., 'Entry 5 replaced.', 'Entry 3 deleted.').
-
-## 7. Add Confirmation Prompt for Destructive Operations (Deletion) [pending]
-### Dependencies: 2.5
-### Description: For deletion operations, implement an interactive confirmation prompt (e.g., "Are you sure you want to delete entry X: '[snippet of content]'? [y/N]") to prevent accidental data loss, enhancing user safety.
-### Details:
-The prompt should clearly indicate which entry is targeted, possibly showing a snippet of its content. Only proceed with deletion if the user confirms affirmatively (e.g., 'y' or 'yes').
-
-## 8. Register Command and Write Comprehensive Tests [pending]
-### Dependencies: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7
-### Description: Register the `/edit_history` command with the application's command handling system. Develop a comprehensive suite of unit and integration tests covering all functionalities: listing, replacement, deletion, valid inputs, error conditions, edge cases (e.g., empty history, editing first/last item), and confirmation flows.
-### Details:
-Tests should verify changes to `self.conversation_history`, the output/feedback provided to the user, and correct handling of user input for confirmations. Mock dependencies as needed.
-
+In the CLI: 1. Type text and press `Enter`. Expect a new line to be created. 2. Type text on multiple lines and press the configured submission key (e.g., `Meta-Enter`). Expect the entire multi-line input to be submitted.

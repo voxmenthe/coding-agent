@@ -1,11 +1,11 @@
 # Task ID: 4
-# Title: Research and Document CLI Multi-line Input Methods
+# Title: Update CLI Welcome Message with Multi-line Instructions
 # Status: pending
-# Dependencies: None
-# Priority: low
-# Description: Research and document methods for users to input multi-line text in the CLI and investigate libraries like `prompt_toolkit` for future advanced CLI editing capabilities.
+# Dependencies: 2
+# Priority: medium
+# Description: Update the initial welcome message displayed when the CLI starts to include clear instructions on how to use multi-line input, including how to create new lines and how to submit the input.
 # Details:
-1. Research standard shell capabilities or workarounds for multi-line input with Python's `input()` (e.g., pasting, OS-specific terminal behavior). 2. Investigate the `prompt_toolkit` library for its features (multi-line input, history, syntax highlighting, autocompletion). 3. Create documentation (e.g., a markdown file or a section in existing docs) summarizing findings. This should include simple guidance for users on current multi-line input methods and their limitations. 4. The documentation should explicitly recommend `prompt_toolkit` for future enhancement, outlining its benefits for a richer CLI experience. This task fulfills the 'Initial Scope' for PRD section 4.3.1.
+Locate the code responsible for printing the welcome message in `src/main.py`. Modify the message string to include guidance such as: "Press Enter for a new line. Press [Submission Key Combination, e.g., Meta-Enter or Alt-Enter] to submit your message." Ensure the key combination mentioned matches the one configured in Task 2.
 
 # Test Strategy:
-Review the generated documentation for clarity, accuracy of described methods for multi-line input. Verify that the limitations of standard `input()` are mentioned and that `prompt_toolkit` is recommended with its benefits for future implementation.
+Start the CLI application. Observe the welcome message. Verify that it now includes clear and accurate instructions for multi-line input and submission.

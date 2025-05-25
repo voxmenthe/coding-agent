@@ -1,11 +1,11 @@
 # Task ID: 1
-# Title: Implement `/history` Command
+# Title: Verify and Enable `multiline` in `PromptSession`
 # Status: pending
 # Dependencies: None
 # Priority: high
-# Description: Implement a slash command `/history` that prints the current conversation history (`self.conversation_history`) to the CLI, formatted for readability.
+# Description: Verify that `prompt_toolkit`'s `PromptSession` is correctly configured for multi-line input, or enable it if necessary. This involves checking the `multiline` parameter and ensuring no conflicts with Vi/Emacs keybinding modes if they are enabled.
 # Details:
-Access `self.conversation_history` from the main agent class (e.g., in `main.py`). Format the output to clearly distinguish user and agent messages, including timestamps if available. Register the command in `slashcommands.py`. Example entry format: `[YYYY-MM-DD HH:MM:SS] User: Hello`. If no timestamp, `User: Hello`.
+Locate the `PromptSession` instantiation in `src/main.py` (likely within `CodeAgent.start_interaction()` or a similar input loop). Check if the `multiline` parameter is explicitly set to `True`. `prompt_toolkit` often defaults to multi-line, but confirm this. If `multiline` is `False` or not behaving as expected, set `multiline=True`. Also, verify that if Vi or Emacs keybindings are active, they do not interfere with standard multi-line input expectations (e.g., `Enter` for newline). Consider adding `prompt_continuation='> '` for better UX if not already present. Example snippet: `session = PromptSession(multiline=True, prompt_continuation='> ', ...)`.
 
 # Test Strategy:
-Execute `/history` with an empty conversation. Add several user/agent messages to the history. Execute `/history` again and verify the output matches the known conversation history, is correctly ordered, and well-formatted.
+Manually start the CLI. Attempt to type multiple lines by pressing `Enter`. Observe if the cursor moves to a new line within the input prompt, allowing multi-line text entry. If `Enter` submits the input, this task is not yet complete.

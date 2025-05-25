@@ -1,11 +1,11 @@
 # Task ID: 10
-# Title: Implement `/arxiv_find` Command
+# Title: Code Review, Final Integration, and Documentation Check
 # Status: pending
-# Dependencies: 8
+# Dependencies: 1, 2, 3, 4, 5, 6, 7, 8, 9
 # Priority: medium
-# Description: Implement `/arxiv_find` to find specific ArXiv papers based on a query (description or title keywords) and optionally download and load the top result.
+# Description: Perform a final code review of all changes, conduct comprehensive integration testing, and ensure all user-facing documentation (welcome message, help command) is accurate and reflects the new multi-line capabilities.
 # Details:
-Command syntax: `/arxiv_find "query describing paper or title keywords" [--load]`. Use `argparse` or similar for argument parsing. Utilize `search_papers` from `arxiv_utils.py`. If multiple papers match, list them (e.g., title, authors, ArXiv ID). If `--load` is specified and results are found, download the top matching paper to `pdfs_dir` using `download_paper` and trigger PDF processing logic. If the query is very specific (e.g., an ArXiv ID) and returns a single high-confidence match, it could be directly downloaded/loaded if `--load` is present. For CLI simplicity, initially, `--load` might always act on the top result. Register in `slashcommands.py`.
+Review all modified files (primarily `src/main.py`, potentially `src/slashcommands.py` or `src/autocomplete.py`) for code quality, correctness, and adherence to project standards. Perform end-to-end testing covering all aspects of the multi-line editing feature and its interaction with other CLI functionalities. Double-check that the welcome message and `/help` text accurately describe the multi-line input mechanism, especially the key bindings for newline and submission. Ensure no regressions in existing features.
 
 # Test Strategy:
-1. Test with a general query: verify a list of relevant papers is displayed. 2. Test with a specific query (e.g., paper title or ArXiv ID) that should yield one or few results. 3. Test with the `--load` flag: verify the top paper is downloaded and processed into context. 4. Test with a query that yields no results. 5. Test error handling for API issues or download failures.
+1. Peer code review of all related changes. 2. Execute a holistic test plan covering all test cases mentioned in the PRD (sections 5.1-5.7) and in individual tasks. 3. Verify welcome message and `/help` output for accuracy. 4. Confirm that existing features like specific slash commands, history, and general CLI stability are unaffected.

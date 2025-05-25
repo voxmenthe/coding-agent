@@ -1,11 +1,14 @@
 # Task ID: 6
-# Title: Implement `/model` Command for Model Switching
+# Title: Test Slash Command Handling with Multi-line Context
 # Status: pending
-# Dependencies: None
-# Priority: high
-# Description: Implement a `/model` command to allow users to list available language models and switch the active model used by the agent.
+# Dependencies: 3
+# Priority: medium
+# Description: Verify that existing slash commands (e.g., `/pdf <filename>`) continue to parse and function correctly even when entered in a multi-line input context or with accidental newlines.
 # Details:
-Implement sub-commands: `/model list` to display available models and the currently active one, and `/model set <model_name>` to change the active model. Model configurations (name, provider, API keys, endpoints) should be managed, potentially in `config.yaml`. The application needs to store the current model selection (runtime state or in config). The agent's API call logic must be updated to use the currently selected model's configuration. Example config structure: `models: [{name: 'gemini-pro', ...}, {name: 'gemini-1.5-flash', ...}], current_model: 'gemini-pro'`.
+The primary goal is to ensure the input mechanism doesn't break slash command parsing. Slash commands are typically expected on a single line. Test scenarios: 
+1. `/command arg` on the first line, followed by `Enter` and then other text on subsequent lines (which might be part of a prompt if the command takes multi-line arguments, or just extraneous text for testing the input mechanism). 
+2. Accidental `Enter` before typing `/command arg`. 
+The command processing logic itself is not expected to change, only that it correctly receives the command part of the input.
 
 # Test Strategy:
-1. Execute `/model list` and verify it shows available models from config and highlights the current one. 2. Execute `/model set <valid_model_name>`: verify success message. 3. Perform an action that uses the LLM and confirm (e.g., via logs or mocked API calls) that the newly set model is used. 4. Execute `/model set <invalid_model_name>` and verify an appropriate error message is shown. 5. Verify the agent uses the default model on startup.
+1. Type a valid slash command (e.g., `/help`) on the first line, press `Enter`, type additional unrelated text on a second line, then submit. Verify the slash command executes correctly. 2. Press `Enter` (creating an empty first line), then type a slash command on the second line, then submit. Verify the slash command executes. 3. Type a slash command, submit. Verify it works as before.

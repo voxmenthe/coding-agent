@@ -1,11 +1,12 @@
 # Task ID: 9
-# Title: Implement `/arxiv_pull` Command
+# Title: Test Advanced Multi-line Input Scenarios (Paste, Empty Submission)
 # Status: pending
-# Dependencies: 8
+# Dependencies: 3
 # Priority: medium
-# Description: Implement `/arxiv_pull` to download the latest ArXiv papers based on topic and date range, save them to disk, and optionally load them into the conversation context.
+# Description: Test advanced multi-line input scenarios, including pasting multi-line text from an external source and handling the submission of empty or cleared multi-line inputs.
 # Details:
-Command syntax: `/arxiv_pull --topic "LLM reasoning" --start_date YYYY-MM-DD --end_date YYYY-MM-DD [--load]`. Use `argparse` for robust argument parsing. Utilize `search_papers` from `arxiv_utils.py` to find papers matching the criteria. Construct the ArXiv query string carefully, especially for date ranges (e.g., `submittedDate:[YYYYMMDDHHMMSS TO YYYYMMDDHHMMSS]`). Download PDFs of found papers to the configured `pdfs_dir` using `download_paper`. If `--load` flag is present, trigger existing PDF processing logic (similar to `/pdf` command) for each downloaded paper. Register in `slashcommands.py`.
+1. **Pasting Multi-line Text:** Copy a block of text containing multiple lines (e.g., from a text editor) to the clipboard. Paste this text into the CLI prompt. Verify it appears correctly formatted across multiple lines. 
+2. **Empty/Cleared Submission:** Test submitting an input that is effectively empty: (a) Press the submission key on a completely empty prompt. (b) Type multiple lines, then delete all content, then press the submission key. The behavior should be consistent with submitting a single empty line (e.g., re-prompt, or specific handling for empty input per project design).
 
 # Test Strategy:
-1. Test with `--topic` and valid `--start_date`/`--end_date`. Verify matching papers are downloaded to `pdfs_dir`. 2. Test with the `--load` option: ensure downloaded papers are processed and added to conversation context (mock PDF processing if necessary). 3. Test with topic only. 4. Test invalid date formats or date ranges. 5. Test with a topic that yields no results. 6. Test error handling for ArXiv API issues.
+1. Copy multi-line text (3+ lines) from a text editor. Paste into the CLI prompt. Verify it displays correctly. Submit and check if the full pasted text is received. 2. Without typing anything, press the submission key. Observe behavior. 3. Type several lines, then use backspace/delete keys to remove all text. Press the submission key. Observe behavior. It should be consistent with submitting a single empty line.

@@ -1,11 +1,11 @@
 # Task ID: 7
-# Title: Implement `/toggle_verbose` Command
+# Title: Test Autocompletion in Multi-line Input
 # Status: pending
-# Dependencies: None
+# Dependencies: 3
 # Priority: medium
-# Description: Implement a `/toggle_verbose` command to switch verbose logging on or off and inform the user of the current setting.
+# Description: Confirm that the existing autocompletion functionality (for commands, file paths, etc.) remains operational and accurate within a multi-line input field.
 # Details:
-Implement a global state variable for verbosity (e.g., in `config` module or `main.py`). The `/toggle_verbose` command should flip this boolean state. Logging statements throughout the codebase (especially in `tools.py`, `main.py`) should conditionally execute based on this state. Standard Python `logging` library levels should be adjusted (e.g., switch application's root logger between `logging.INFO` and `logging.DEBUG`, or a more verbose level like `logging.INFO` if default is `logging.WARNING`). The command must print the new state to the user (e.g., "Verbose logging enabled."). Register in `slashcommands.py`.
+This task involves testing the autocompletion features, likely managed by `prompt_toolkit` and configured in `src/autocomplete.py` or `src/main.py`. `prompt_toolkit` should handle autocompletion in multi-line contexts gracefully. Test triggering autocompletion (e.g., by typing `/` or parts of commands/paths) when the cursor is on various lines of a multi-line input.
 
 # Test Strategy:
-1. Execute `/toggle_verbose`. Verify the command output indicates the new state (e.g., "Verbose logging enabled."). 2. Execute it again; verify the state flips and is reported. 3. Observe application log output: when verbose is enabled, more detailed logs (e.g., DEBUG or INFO level) should appear. When disabled, log output should be less verbose (e.g., INFO or WARNING level).
+1. Type a few lines of text. 2. Move the cursor to an appropriate position (e.g., after typing `/` or a partial command/filename). 3. Trigger autocompletion (often `Tab`). Verify that suggestions appear and can be selected correctly, irrespective of the current line number or existing text on other lines.
