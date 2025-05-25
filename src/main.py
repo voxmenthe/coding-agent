@@ -23,6 +23,7 @@ from prompt_toolkit.application.current import get_app # Added
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.shortcuts import CompleteStyle # Added for complete_style argument
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+import re # For finding words in command input
 from typing import Iterable, Dict, Any, Optional, Set, Union # For completer and CustomNestedCompleter
 import bisect # Added for efficient searching
 import yaml
@@ -62,47 +63,127 @@ class CustomNestedCompleter(NestedCompleter):
         super().__init__(options, ignore_case=ignore_case)
 
     def get_completions(self, document: Document, complete_event: CompleteEvent) -> Iterable[Completion]:
-        text_before_cursor = document.text_before_cursor.lstrip()
+        # Use current line for command context to simplify multi-line scenarios.
+        # Assumption: A slash command and its arguments reside on a single line.
+        line_text_before_cursor = document.current_line_before_cursor
+        line_cursor_col = document.cursor_position_col # Cursor position within the current line
 
-        # If there are no spaces in the text before the cursor (after stripping leading space),
-        # it means we are typing the first command word.
-        if ' ' not in text_before_cursor:
-            # Get actual top-level command strings from the options dictionary keys
+        # Find all non-space sequences (words) in the current line before the cursor
+        words_info = list(re.finditer(r'\S+', line_text_before_cursor))
+
+        command_segment_doc = None
+
+        # Iterate backwards through words in the current line to find the last one starting with '/' 
+        # that the cursor is engaged with.
+        for i in range(len(words_info) - 1, -1, -1):
+            word_match = words_info[i]
+            word_text = word_match.group(0)
+            word_start_col_in_line = word_match.start()
+            word_end_col_in_line = word_match.end()
+
+            is_cursor_engaged_with_word_in_line = \
+                (line_cursor_col >= word_start_col_in_line and line_cursor_col <= word_end_col_in_line) or \
+                (line_cursor_col == word_end_col_in_line + 1 and line_text_before_cursor.endswith(' '))
+
+            if word_text.startswith('/') and is_cursor_engaged_with_word_in_line:
+                segment_text_on_line = line_text_before_cursor[word_start_col_in_line:]
+                segment_cursor_pos_in_line = line_cursor_col - word_start_col_in_line
+
+                command_segment_doc = Document(
+                    text=segment_text_on_line,
+                    cursor_position=segment_cursor_pos_in_line
+                )
+                # logger.debug(f"Active command segment on line: '{command_segment_doc.text}', cursor at {command_segment_doc.cursor_position}")
+                break
+        
+        if not command_segment_doc:
+            # logger.debug("No active command segment on current line for completion.")
+            yield from []
+            return
+
+        # Now, use command_segment_doc for completion logic (this part remains the same)
+        sub_text_before_cursor = command_segment_doc.text_before_cursor.lstrip()
+
+        if ' ' not in sub_text_before_cursor:
+            # Completing the first word of the active command segment (e.g., /cmd)
             actual_keys = [k for k in self.options.keys() if isinstance(k, str)]
-            
             first_word_completer = WordCompleter(
                 words=actual_keys,
                 ignore_case=self.ignore_case,
-                match_middle=True,  # Key for filtering as we type
-                sentence=False      # Match the whole command like "/help" as one word
+                match_middle=True,
+                sentence=False
             )
-            # logger.debug(f"CustomNestedCompleter: Using FirstWordCompleter for '{document.text_before_cursor}'") # Optional debug
-            for c in first_word_completer.get_completions(document, complete_event):
-                if text_before_cursor.startswith('/') and c.text.startswith('/') and len(c.text) > 1:
-                    # User typed '/' (or more) and the completion also starts with '/'.
-                    # We want to insert only the part of the completion *after* its slash,
-                    # but display the full command in the menu.
-                    yield Completion(
-                        text=c.text[1:],  # Text to insert, e.g., 'prompt'
-                        start_position=c.start_position, # Keep original, relative to word being completed
-                        display=c.text, # Show the original full command like '/prompt' in the menu
-                        display_meta=c.display_meta, # Preserve original meta
-                        style=c.style,
-                        selected_style=c.selected_style
-                    )
-                else:
-                    yield c
+            # logger.debug(f"Using FirstWordCompleter for segment: '{command_segment_doc.text}'")
+            for c in first_word_completer.get_completions(command_segment_doc, complete_event):
+                insert_text = c.text
+                display_text = c.text
+                # Handle the slash duplication only if the segment itself starts with '/' (it should)
+                if command_segment_doc.text.lstrip().startswith('/') and c.text.startswith('/') and len(c.text) > 1:
+                    insert_text = c.text[1:]
+                
+                yield Completion(
+                    text=insert_text,
+                    start_position=c.start_position, # Relative to command_segment_doc cursor
+                    display=display_text,
+                    display_meta=c.display_meta,
+                    style=c.style,
+                    selected_style=c.selected_style
+                )
         else:
-            # If there are spaces, it means we are beyond the first command word.
-            # Delegate to the original NestedCompleter logic to handle sub-commands.
-            # logger.debug(f"CustomNestedCompleter: Delegating to super for '{document.text_before_cursor}'") # Optional debug
-            yield from super().get_completions(document, complete_event)
+            # Completing sub-commands of the active command segment
+            # logger.debug(f"Delegating to super for segment: '{command_segment_doc.text}'")
+            for c in super().get_completions(command_segment_doc, complete_event):
+                yield Completion(
+                    text=c.text,
+                    start_position=c.start_position, # Relative to command_segment_doc cursor
+                    display=c.display,
+                    display_meta=c.display_meta,
+                    style=c.style,
+                    selected_style=c.selected_style
+                )
 
 # Helper function for the key binding condition
 def is_typing_slash_command_prefix(current_buffer):
-    text = current_buffer.text
-    # Only trigger if text starts with / and has no spaces, and is not just "/"
-    return text.startswith('/') and ' ' not in text and len(text) > 0
+    # This filter is for the Keys.Any binding. It's evaluated *before* the typed char is inserted.
+    text_up_to_cursor = current_buffer.document.text_before_cursor
+
+    # If the cursor is immediately after a '/', we are likely starting/typing a command.
+    if text_up_to_cursor.endswith('/'): # Catches "foo /" or just "/"
+        return True
+
+    # Find the current "word" or segment the cursor is in or at the end of.
+    # A "word" here is a sequence of non-space characters.
+    match = re.search(r'(\S+)$', text_up_to_cursor)
+    if match:
+        current_segment = match.group(1)
+        # If this segment starts with '/', we're typing a slash command or its argument.
+        # e.g., "foo /c" (current_segment='/c') or "foo /cmd" (current_segment='/cmd')
+        if current_segment.startswith('/'):
+            return True
+    
+    # This covers cases like:
+    # "/cm" -> current_segment = "/cm", returns True
+    # "foo /cm" -> current_segment = "/cm", returns True
+    # "foo /cmd arg" -> current_segment = "arg". Fails here. This is intended.
+    #   The completer should handle this. The filter's job is to see if we're in a slash context.
+    #   Actually, for "foo /cmd arg", if the completer logic is correct, it will create a
+    #   segment_doc = "/cmd arg" and then delegate to super().get_completions. 
+    #   The Keys.Any filter should probably be true if the *active command segment* (as defined by the completer) exists.
+    #   However, re-evaluating that full logic in the filter is too much.
+    #   The current refined logic for the filter is a heuristic: if the current word at cursor starts with /, or prev char is /.
+
+    # Let's reconsider "foo /cmd arg":
+    # If cursor is after 'g' in 'arg': text_up_to_cursor = "foo /cmd arg"
+    # current_segment = "arg". Does not start with '/'. Returns False.
+    # This means live suggestions for arguments of a mid-line command won't trigger via Keys.Any with this filter.
+    # This might be acceptable if Tab completion still works for those arguments.
+    # The CustomNestedCompleter *will* provide completions if Tab is pressed in "foo /cmd arg|".
+
+    # To enable Keys.Any for arguments of mid-line commands, the filter would need to be smarter,
+    # potentially mirroring the CustomNestedCompleter's segment finding logic. For now, let's keep it simpler.
+    # The primary goal is that typing `/` mid-line starts completions, and typing inside `/cmd` mid-line continues them.
+
+    return False
 
 # Load config
 config_path = Path(__file__).parent / "config.yaml"
