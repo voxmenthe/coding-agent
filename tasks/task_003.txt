@@ -1,0 +1,11 @@
+# Task ID: 3
+# Title: Implement `/sql` Command with Read-Only Security
+# Status: pending
+# Dependencies: None
+# Priority: high
+# Description: Implement `/sql` to allow users to run arbitrary read-only SQL queries against the paper metadata database specified in `database.py`.
+# Details:
+The command should accept the SQL query as an argument (e.g., `/sql "SELECT * FROM papers"`). Connect to the database (details from `database.py`). CRITICAL: Implement a strong mechanism to ensure only read-only queries (primarily `SELECT`) are permitted. This can involve parsing the SQL query to check for forbidden keywords (e.g., `INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`) before execution. Database user permissions for read-only access are a more secure alternative if feasible. Execute the query and display results in a formatted way (e.g., simple table). Handle SQL errors gracefully. Register in `slashcommands.py`.
+
+# Test Strategy:
+1. Setup a test database with sample data. 2. Execute valid `SELECT` queries (e.g., `SELECT * FROM table`, `SELECT col1, col2 FROM table WHERE condition`) and verify results are displayed correctly. 3. Attempt to execute non-read-only queries (`INSERT`, `UPDATE`, `DELETE`, `DROP TABLE`) and verify they are blocked with an error message and no changes occur in the database. 4. Test queries with SQL syntax errors and verify graceful error reporting.

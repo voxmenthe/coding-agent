@@ -1,11 +1,20 @@
 #!/bin/bash
 
 # Script to remove spaces from filenames in a specified directory.
-# Usage: ./remove_spaces.sh [directory_path]
+# Usage: ./remove_spaces.sh [options] [directory_path]
+#
+# Options:
+#   -n, --no-clobber    Do not overwrite existing files
+#   -h, --help          Show this help message
+#
 # If directory_path is omitted, it attempts to read the path from
 # src/config.yaml (relative to this script's location).
 # If that fails, it defaults to the current directory.
-# Warns and overwrites if the new filename already exists.
+# By default, warns and overwrites if the new filename already exists.
+
+# --- First copy over the files ---
+# Note: -mtime -8 means files modified in the last 8 days
+find /Volumes/bdrive/AA_TO_UPLOAD -name "*.pdf" -mtime -8 -exec cp -v {} PDFS/ \;
 
 # --- Configuration --- 
 # Get the absolute path of the directory containing this script
@@ -13,13 +22,44 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 CONFIG_FILE="$SCRIPT_DIR/src/config.yaml"
 CONFIG_KEY="PDFS_TO_CHAT_WITH_DIRECTORY"
 
-# --- Determine Target Directory --- 
-TARGET_DIR=""
+# Default behavior (can be overridden by command line options)
+NO_CLOBBER=false
 
-if [ -n "$1" ]; then
-  # Use provided argument if it exists
-  TARGET_DIR="$1"
+# --- Parse Command Line Arguments ---
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -n|--no-clobber)
+      NO_CLOBBER=true
+      shift
+      ;;
+    -h|--help)
+      echo "Usage: $0 [options] [directory_path]"
+      echo "Options:"
+      echo "  -n, --no-clobber    Do not overwrite existing files"
+      echo "  -h, --help          Show this help message"
+      exit 0
+      ;;
+    -*)
+      echo "Error: Unknown option $1" >&2
+      exit 1
+      ;;
+    *)
+      # First non-option argument is the directory
+      if [ -z "$TARGET_DIR" ]; then
+        TARGET_DIR="$1"
+        shift
+      else
+        echo "Error: Multiple directory arguments provided" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+# --- Determine Target Directory --- 
+if [ -n "$TARGET_DIR" ]; then
   echo "Using provided directory: '$TARGET_DIR'"
+  shift
 elif [ -f "$CONFIG_FILE" ]; then
   # Attempt to parse config file if no argument provided and file exists
   echo "No directory provided, attempting to read from '$CONFIG_FILE'..."
@@ -74,6 +114,9 @@ find "$TARGET_DIR" -maxdepth 1 -type f -print0 | while IFS= read -r -d $'\0' fil
     if [ -e "$new_filepath" ]; then
       # Ensure the existing item is a file before overwriting
       if [ -f "$new_filepath" ]; then
+        if [ "$NO_CLOBBER" = true ]; then
+          echo "Skipping '$filename' -> '$new_filename': File already exists (--no-clobber)"
+        else
           echo "Warning: Renaming '$filename' to '$new_filename'. Overwriting existing file."
           # Perform the rename, forcing overwrite
           mv -f "$file" "$new_filepath"
@@ -82,9 +125,10 @@ find "$TARGET_DIR" -maxdepth 1 -type f -print0 | while IFS= read -r -d $'\0' fil
           else
             echo "Error: Failed to rename '$filename' to '$new_filename'."
           fi
+        fi
       else
-          # Target exists but is not a regular file (e.g., a directory)
-          echo "Error: Cannot rename '$filename' to '$new_filename'. A non-file item with the target name already exists."
+        # Target exists but is not a regular file (e.g., a directory)
+        echo "Error: Cannot rename '$filename' to '$new_filename'. A non-file item with the target name already exists."
       fi
     else
       # Target path does not exist, proceed with normal rename

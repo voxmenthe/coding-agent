@@ -1,0 +1,11 @@
+# Task ID: 6
+# Title: Implement `/model` Command for Model Switching
+# Status: pending
+# Dependencies: None
+# Priority: high
+# Description: Implement a `/model` command to allow users to list available language models and switch the active model used by the agent.
+# Details:
+Implement sub-commands: `/model list` to display available models and the currently active one, and `/model set <model_name>` to change the active model. Model configurations (name, provider, API keys, endpoints) should be managed, potentially in `config.yaml`. The application needs to store the current model selection (runtime state or in config). The agent's API call logic must be updated to use the currently selected model's configuration. Example config structure: `models: [{name: 'gemini-pro', ...}, {name: 'gemini-1.5-flash', ...}], current_model: 'gemini-pro'`.
+
+# Test Strategy:
+1. Execute `/model list` and verify it shows available models from config and highlights the current one. 2. Execute `/model set <valid_model_name>`: verify success message. 3. Perform an action that uses the LLM and confirm (e.g., via logs or mocked API calls) that the newly set model is used. 4. Execute `/model set <invalid_model_name>` and verify an appropriate error message is shown. 5. Verify the agent uses the default model on startup.

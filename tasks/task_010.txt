@@ -1,0 +1,11 @@
+# Task ID: 10
+# Title: Implement `/arxiv_find` Command
+# Status: pending
+# Dependencies: 8
+# Priority: medium
+# Description: Implement `/arxiv_find` to find specific ArXiv papers based on a query (description or title keywords) and optionally download and load the top result.
+# Details:
+Command syntax: `/arxiv_find "query describing paper or title keywords" [--load]`. Use `argparse` or similar for argument parsing. Utilize `search_papers` from `arxiv_utils.py`. If multiple papers match, list them (e.g., title, authors, ArXiv ID). If `--load` is specified and results are found, download the top matching paper to `pdfs_dir` using `download_paper` and trigger PDF processing logic. If the query is very specific (e.g., an ArXiv ID) and returns a single high-confidence match, it could be directly downloaded/loaded if `--load` is present. For CLI simplicity, initially, `--load` might always act on the top result. Register in `slashcommands.py`.
+
+# Test Strategy:
+1. Test with a general query: verify a list of relevant papers is displayed. 2. Test with a specific query (e.g., paper title or ArXiv ID) that should yield one or few results. 3. Test with the `--load` flag: verify the top paper is downloaded and processed into context. 4. Test with a query that yields no results. 5. Test error handling for API issues or download failures.

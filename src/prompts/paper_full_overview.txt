@@ -3,6 +3,8 @@ Review the attached paper and provide a detailed overview.
 ### Overview & Context
 - Motivation and context?
 - Problem addressed and importance?
+- Key contributions and novelty?
+- Comparison to previous work? (methodology, results, performance, etc.)
 
 ### Methodology & Approach
 - Step-by-step methodology? (include high-level python-like pseudocode ONLY if appropriate)
@@ -10,6 +12,7 @@ Review the attached paper and provide a detailed overview.
 
 ### Results & Findings
 - Explain the top 6 most interesting and surprising insights from the paper.
+- Note that "better performance" or "improvement over previous methods" does not count as a particularly interesting or surprising insight.
 
 ### Limitations & Critiques
 - Potential limitations or weaknesses?

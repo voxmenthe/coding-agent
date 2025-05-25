@@ -1,0 +1,11 @@
+# Task ID: 11
+# Title: Research and POC for Structured ArXiv Search (DSPy/Similar)
+# Status: pending
+# Dependencies: 8
+# Priority: low
+# Description: Research and implement a proof-of-concept (POC) for using a structured output framework (e.g., DSPy, Instructor, Marvin) to improve ArXiv search query generation from natural language input.
+# Details:
+1. Research DSPy, Instructor, or Marvin for enforcing structured LLM outputs. 2. Define a Pydantic model or DSPy Signature for ArXiv search parameters (e.g., `keywords: List[str]`, `categories: Optional[List[str]]`, `date_start: Optional[str]`, `date_end: Optional[str]`). 3. Create a prompt that instructs the LLM to convert a complex natural language query (like the PRD example 4.6.3) into this structured schema. 4. Implement a POC function: takes NL query -> LLM (guided by DSPy/Instructor) generates structured query object -> system translates this object into an ArXiv API compatible query string -> calls `arxiv_utils.search_papers()`. Focus on the PRD example query. This task is primarily for demonstrating feasibility.
+
+# Test Strategy:
+1. Provide the complex natural language query from PRD section 4.6.3 to the POC. 2. Verify that the LLM generates a structured output (e.g., JSON or Pydantic object) matching the defined schema. 3. Verify this structured output is correctly translated into a valid ArXiv API query string. 4. Qualitatively compare the relevance of ArXiv search results from this structured query versus a naive keyword search of the original NL query.

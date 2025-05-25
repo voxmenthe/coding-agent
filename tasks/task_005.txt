@@ -1,0 +1,11 @@
+# Task ID: 5
+# Title: Implement "Send Message on Double Enter" Feature
+# Status: pending
+# Dependencies: None
+# Priority: medium
+# Description: Modify the CLI's main input loop to send the current message context to the agent if the user presses Enter twice on an empty line.
+# Details:
+Modify the main input loop in `main.py`. Implement logic to track if the previous input was also an empty line. If `user_input == ""` and the previous input was also empty, trigger the agent's message processing logic. This should send the current context, including any pending data like a PDF path set by `/pdf` that hasn't been processed yet. Reset the 'previous input was empty' state after sending or after non-empty input. Example logic: `main_loop(): prev_empty = False; while True: inp = input(); if inp == "" and prev_empty: send_context(); prev_empty = False; elif inp == "": prev_empty = True; else: process_input(inp); prev_empty = False;`
+
+# Test Strategy:
+1. Start CLI. Type text and press Enter (normal message sending). 2. Press Enter on an empty line (should do nothing or standard behavior). 3. Press Enter again on the still empty line: verify the current context (e.g., recent conversation, or a default greeting if context is empty) is sent to the agent. 4. Test with a pending PDF path (set via `/pdf` command but not yet sent with a message), then use double Enter; verify the PDF context is processed by the agent.

@@ -1,0 +1,11 @@
+# Task ID: 1
+# Title: Implement `/history` Command
+# Status: pending
+# Dependencies: None
+# Priority: high
+# Description: Implement a slash command `/history` that prints the current conversation history (`self.conversation_history`) to the CLI, formatted for readability.
+# Details:
+Access `self.conversation_history` from the main agent class (e.g., in `main.py`). Format the output to clearly distinguish user and agent messages, including timestamps if available. Register the command in `slashcommands.py`. Example entry format: `[YYYY-MM-DD HH:MM:SS] User: Hello`. If no timestamp, `User: Hello`.
+
+# Test Strategy:
+Execute `/history` with an empty conversation. Add several user/agent messages to the history. Execute `/history` again and verify the output matches the known conversation history, is correctly ordered, and well-formatted.

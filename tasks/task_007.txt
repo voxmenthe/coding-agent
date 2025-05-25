@@ -1,0 +1,11 @@
+# Task ID: 7
+# Title: Implement `/toggle_verbose` Command
+# Status: pending
+# Dependencies: None
+# Priority: medium
+# Description: Implement a `/toggle_verbose` command to switch verbose logging on or off and inform the user of the current setting.
+# Details:
+Implement a global state variable for verbosity (e.g., in `config` module or `main.py`). The `/toggle_verbose` command should flip this boolean state. Logging statements throughout the codebase (especially in `tools.py`, `main.py`) should conditionally execute based on this state. Standard Python `logging` library levels should be adjusted (e.g., switch application's root logger between `logging.INFO` and `logging.DEBUG`, or a more verbose level like `logging.INFO` if default is `logging.WARNING`). The command must print the new state to the user (e.g., "Verbose logging enabled."). Register in `slashcommands.py`.
+
+# Test Strategy:
+1. Execute `/toggle_verbose`. Verify the command output indicates the new state (e.g., "Verbose logging enabled."). 2. Execute it again; verify the state flips and is reported. 3. Observe application log output: when verbose is enabled, more detailed logs (e.g., DEBUG or INFO level) should appear. When disabled, log output should be less verbose (e.g., INFO or WARNING level).

@@ -28,8 +28,12 @@ def handle_help_command(agent: 'CodeAgent'):
     print("  /tasks                 - List active background tasks.")
     print("  /cancel <task_id>      - Attempt to cancel a background task.")
     print("  /run_script <py|sh> <path> [args...] - Run a script.")
-    print("  /history <mode> <n_tokens> - Display parts of the conversation history.")
+    print("  /history [--full|--head|--tail <n_tokens>] - Display conversation history")
     print("  /toggle_verbose        - Toggle verbose logging on/off.")
+    print("\nHistory command examples:")
+    print("  /history               - Show full conversation history")
+    print("  /history --head 500    - Show first ~500 tokens of history")
+    print("  /history --tail 500    - Show last ~500 tokens of history")
 
     # Potentially list dynamically discovered prompts or other contextual help.
 
@@ -355,90 +359,174 @@ def handle_list_tasks_command(agent: 'CodeAgent'):
 
 
 def handle_history_command(agent: 'CodeAgent', args: List[str]):
-    """Handles the /history command to display parts of the conversation history."""
-    if not agent.client or not hasattr(agent.client, 'models'):
-        print("\n⚠️ Gemini client not available for token counting. Cannot display history by token count.")
-        return
-
+    """Handles the /history command to display conversation history.
+    
+    Usage:
+      /history [--full]                 Show full conversation history
+      /history --head <n_tokens>        Show first N tokens of history
+      /history --tail <n_tokens>        Show last N tokens of history
+    """
     if not agent.conversation_history:
         print("\nℹ️ Conversation history is empty.")
         return
 
+    # Default to showing full history if no args
+    if not args:
+        return _display_full_history(agent)
+    
+    # Parse command line arguments
     mode = None
     num_tokens_target = 0
-
-    if len(args) == 2:
-        if args[0].lower() == '--head':
-            mode = 'head'
-        elif args[0].lower() == '--tail':
-            mode = 'tail'
-        
+    
+    if args[0] == '--full':
+        if len(args) > 1:
+            print("\n⚠️ --full flag doesn't take any arguments")
+            return
+        return _display_full_history(agent)
+    elif args[0] in ('--head', '--tail') and len(args) == 2:
+        mode = args[0][2:]  # Remove '--' prefix
         try:
             num_tokens_target = int(args[1])
             if num_tokens_target <= 0:
                 raise ValueError("Token count must be positive.")
-        except ValueError:
-            print("\n⚠️ Invalid number of tokens. Must be a positive integer.")
-            print("   Usage: /history --head <n_tokens> OR /history --tail <n_tokens>")
-            return
+            return _display_token_limited_history(agent, mode, num_tokens_target)
+        except ValueError as e:
+            print(f"\n⚠️ {e}")
     
-    if not mode or num_tokens_target == 0:
-        print("\n⚠️ Invalid usage.")
-        print("   Usage: /history --head <n_tokens> OR /history --tail <n_tokens>")
-        return
+    # If we get here, arguments were invalid
+    _print_history_usage()
 
-    print(f"\n📜 Displaying {mode} {num_tokens_target} tokens from history (approximate):")
+def _display_full_history(agent: 'CodeAgent'):
+    """Display the full conversation history in a readable format."""
+    print("\n📜 Full Conversation History:")
+    print("-" * 80)
     
-    history_to_scan = list(agent.conversation_history) # Make a copy
+    for i, msg in enumerate(agent.conversation_history, 1):
+        if not isinstance(msg, types.Content):
+            logger.warning(f"Skipping non-Content item in history: {type(msg)}")
+            continue
+            
+        # Get timestamp if available
+        timestamp = ""
+        if hasattr(msg, 'metadata') and hasattr(msg.metadata, 'get') and callable(msg.metadata.get):
+            timestamp_seconds = msg.metadata.get('created_at')
+            if timestamp_seconds:
+                try:
+                    timestamp_dt = datetime.datetime.fromtimestamp(timestamp_seconds, tz=datetime.timezone.utc)
+                    timestamp = timestamp_dt.strftime("[%H:%M:%S] ")
+                except (TypeError, OSError):
+                    pass
+        
+        # Get role and format message
+        role = getattr(msg, 'role', 'unknown').upper()
+        role_emoji = "👤" if role == "USER" else "🤖"
+        
+        # Extract text parts
+        text_parts = []
+        if hasattr(msg, 'parts'):
+            text_parts = [
+                part.text for part in msg.parts 
+                if hasattr(part, 'text') and part.text is not None
+            ]
+        
+        message_text = " ".join(text_parts).strip()
+        
+        # Print the message with formatting
+        print(f"{timestamp}{role_emoji} [{role}]: {message_text}")
+        print("-" * 80)
+    
+    print(f"\nTotal messages: {len(agent.conversation_history)}")
+
+def _display_token_limited_history(agent: 'CodeAgent', mode: str, num_tokens_target: int):
+    """Display history limited by token count (head or tail)."""
+    if not agent.client or not hasattr(agent.client, 'models'):
+        print("\n⚠️ Gemini client not available for token counting. Cannot filter history by token count.")
+        return _display_full_history(agent)
+    
+    print(f"\n📜 Displaying {mode} {num_tokens_target} tokens from history (approximate):")
+    print("-" * 80)
+    
+    history_to_scan = list(agent.conversation_history)
     if mode == 'tail':
-        history_to_scan.reverse() # Iterate from the end for tail
+        history_to_scan = history_to_scan[::-1]  # Reverse for tail mode
 
     tokens_counted = 0
     messages_to_display = []
 
-    for message_content in history_to_scan:
-        if not isinstance(message_content, types.Content):
-            logger.warning(f"Skipping non-Content item in history during /history: {type(message_content)}")
+    for msg in history_to_scan:
+        if not isinstance(msg, types.Content):
+            logger.warning(f"Skipping non-Content item in history: {type(msg)}")
             continue
 
+        # Count tokens for this message
         try:
             message_tokens = agent.client.models.count_tokens(
                 model=agent.model_name, 
-                contents=[message_content]
+                contents=[msg]
             ).total_tokens
         except Exception as e:
             logger.error(f"Error counting tokens for history message: {e}")
-            # Fallback: assign an average token count or skip
-            message_tokens = 75 # Arbitrary average
+            message_tokens = 75  # Fallback average
 
+        # If adding this message would exceed our token limit and we already have messages, stop
         if tokens_counted + message_tokens > num_tokens_target and messages_to_display:
-            # If adding this message exceeds target AND we already have some messages, stop.
-            # This ensures we don't add a very large message if it's the first one that fits.
             break
         
-        messages_to_display.append(message_content)
+        messages_to_display.append(msg)
         tokens_counted += message_tokens
-
+        
+        # If we've reached our token target, stop
         if tokens_counted >= num_tokens_target:
             break
-            
-    if mode == 'tail':
-        messages_to_display.reverse() # Reverse back to original order for printing
-
-    if not messages_to_display:
-        print("\n   No messages found within the specified token limit or history is effectively empty.")
-        return
-
-    for msg in messages_to_display:
-        role_emoji = "👤" if msg.role == "user" else "🤖"
-        # Assuming messages have a simple text part for this display
-        text_parts = [part.text for part in msg.parts if hasattr(part, 'text') and part.text is not None]
-        display_text = " ".join(text_parts)
-        # Truncate long messages for display here if necessary
-        # For now, printing full text of selected messages
-        print(f"  {role_emoji} [{msg.role.upper()}]: {display_text[:500]}{ '...' if len(display_text) > 500 else ''}")
     
-    print(f"\n(Displayed approx. {tokens_counted} tokens from {len(messages_to_display)} messages)")
+    # If we're in tail mode, we need to reverse back to original order
+    if mode == 'tail':
+        messages_to_display = messages_to_display[::-1]
+    
+    # Display the selected messages
+    for msg in messages_to_display:
+        # Get timestamp if available
+        timestamp = ""
+        if hasattr(msg, 'metadata') and hasattr(msg.metadata, 'get') and callable(msg.metadata.get):
+            timestamp_seconds = msg.metadata.get('created_at')
+            if timestamp_seconds:
+                try:
+                    timestamp_dt = datetime.datetime.fromtimestamp(timestamp_seconds, tz=datetime.timezone.utc)
+                    timestamp = timestamp_dt.strftime("[%H:%M:%S] ")
+                except (TypeError, OSError):
+                    pass
+        
+        # Get role and format message
+        role = getattr(msg, 'role', 'unknown').upper()
+        role_emoji = "👤" if role == "USER" else "🤖"
+        
+        # Extract text parts
+        text_parts = []
+        if hasattr(msg, 'parts'):
+            text_parts = [
+                part.text for part in msg.parts 
+                if hasattr(part, 'text') and part.text is not None
+            ]
+        
+        message_text = " ".join(text_parts).strip()
+        
+        # Print the message with formatting
+        print(f"{timestamp}{role_emoji} [{role}]: {message_text}")
+        print("-" * 80)
+    
+    print(f"\nDisplayed {len(messages_to_display)} messages (approx. {tokens_counted} tokens)")
+
+def _print_history_usage():
+    """Print usage instructions for the history command."""
+    print("\nUsage:")
+    print("  /history                 Show full conversation history")
+    print("  /history --full          Same as above")
+    print("  /history --head <tokens> Show first N tokens of history")
+    print("  /history --tail <tokens> Show last N tokens of history\n")
+    print("Examples:")
+    print("  /history                 # Show all messages")
+    print("  /history --head 500     # Show first ~500 tokens")
+    print("  /history --tail 500     # Show last ~500 tokens")
 
 
 def handle_toggle_verbose_command(agent: 'CodeAgent'):

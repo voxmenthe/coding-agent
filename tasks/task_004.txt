@@ -1,0 +1,11 @@
+# Task ID: 4
+# Title: Research and Document CLI Multi-line Input Methods
+# Status: pending
+# Dependencies: None
+# Priority: low
+# Description: Research and document methods for users to input multi-line text in the CLI and investigate libraries like `prompt_toolkit` for future advanced CLI editing capabilities.
+# Details:
+1. Research standard shell capabilities or workarounds for multi-line input with Python's `input()` (e.g., pasting, OS-specific terminal behavior). 2. Investigate the `prompt_toolkit` library for its features (multi-line input, history, syntax highlighting, autocompletion). 3. Create documentation (e.g., a markdown file or a section in existing docs) summarizing findings. This should include simple guidance for users on current multi-line input methods and their limitations. 4. The documentation should explicitly recommend `prompt_toolkit` for future enhancement, outlining its benefits for a richer CLI experience. This task fulfills the 'Initial Scope' for PRD section 4.3.1.
+
+# Test Strategy:
+Review the generated documentation for clarity, accuracy of described methods for multi-line input. Verify that the limitations of standard `input()` are mentioned and that `prompt_toolkit` is recommended with its benefits for future implementation.

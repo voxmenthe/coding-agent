@@ -526,31 +526,68 @@ class CodeAgent:
         return wrapper
 
     def _handle_pdf_command(self, args: list):
-        """Handles the /pdf command to asynchronously process a PDF file."""
+        """Handles the /pdf command to asynchronously process a PDF file.
+        
+        Args:
+            args: List of command arguments. Expected format:
+                 [filename] [--sort <field>] [--reverse] [arxiv_id]
+        """
         if not self.pdfs_dir_abs_path:
             print("\n⚠️ PDF directory not configured. Cannot process PDFs.")
             return
         
         # Use the connection established during initialization
         if not self.conn:
-             print("\n⚠️ Database connection not available. Cannot save PDF metadata.")
-             return
+            print("\n⚠️ Database connection not available. Cannot save PDF metadata.")
+            return
 
         # Async client check (used by _process_pdf_async_v2)
         if not self.async_client:
             print("\n⚠️ Async Gemini client not initialized. Cannot process PDF asynchronously.")
             return
 
-        if len(args) < 1:
-            print("\n⚠️ Usage: /pdf <filename> [optional: arxiv_id]")
+        if not args:
+            print("\n⚠️ Usage: /pdf <filename> [--sort <field>] [--reverse] [arxiv_id]")
+            print("       Available sort fields: name, time (default: name)")
             return
 
-        filename_arg = args[0]
+        # Parse command line arguments
+        sort_by = 'name'  # Default sort field
+        reverse_sort = False
+        arxiv_id = None
+        filename_arg = None
+        
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == '--sort':
+                if i + 1 < len(args) and not args[i + 1].startswith('-'):
+                    sort_by = args[i + 1]
+                    i += 1  # Skip the next argument as it's the sort field
+                    # Check if there's a sort direction (D for descending)
+                    if i + 1 < len(args) and args[i + 1] == 'D':
+                        reverse_sort = True
+                        i += 1  # Skip the direction argument
+            elif arg == '--reverse':
+                reverse_sort = True
+            elif not filename_arg and not arg.startswith('-'):
+                # First non-flag argument is treated as filename
+                filename_arg = arg
+            elif not arg.startswith('-'):
+                # Any subsequent non-flag argument is treated as arxiv_id
+                arxiv_id = arg
+            i += 1
+
+        if not filename_arg:
+            print("\n⚠️ Error: No filename provided.")
+            print("Usage: /pdf <filename> [--sort <field>] [--reverse] [arxiv_id]")
+            return
+
         # Basic security: Ensure filename doesn't contain path separators
         filename = Path(filename_arg).name
         if filename != filename_arg:
-             print(f"\n⚠️ Invalid filename '{filename_arg}'. Please provide only the filename, not a path.")
-             return
+            print(f"\n⚠️ Invalid filename '{filename_arg}'. Please provide only the filename, not a path.")
+            return
 
         pdf_path = self.pdfs_dir_abs_path / filename
 
