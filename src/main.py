@@ -77,7 +77,21 @@ class CustomNestedCompleter(NestedCompleter):
                 sentence=False      # Match the whole command like "/help" as one word
             )
             # logger.debug(f"CustomNestedCompleter: Using FirstWordCompleter for '{document.text_before_cursor}'") # Optional debug
-            yield from first_word_completer.get_completions(document, complete_event)
+            for c in first_word_completer.get_completions(document, complete_event):
+                if text_before_cursor.startswith('/') and c.text.startswith('/') and len(c.text) > 1:
+                    # User typed '/' (or more) and the completion also starts with '/'.
+                    # We want to insert only the part of the completion *after* its slash,
+                    # but display the full command in the menu.
+                    yield Completion(
+                        text=c.text[1:],  # Text to insert, e.g., 'prompt'
+                        start_position=c.start_position, # Keep original, relative to word being completed
+                        display=c.text, # Show the original full command like '/prompt' in the menu
+                        display_meta=c.display_meta, # Preserve original meta
+                        style=c.style,
+                        selected_style=c.selected_style
+                    )
+                else:
+                    yield c
         else:
             # If there are spaces, it means we are beyond the first command word.
             # Delegate to the original NestedCompleter logic to handle sub-commands.
@@ -469,7 +483,7 @@ class CodeAgent:
         slash_command_completer_map['/load'] = WordCompleter(saved_files, ignore_case=True)
 
         # Prompt name completer
-        # slash_command_completer_map['/prompt'] = WordCompleter(self._list_available_prompts(), ignore_case=True) # Temporarily disable for flat test
+        slash_command_completer_map['/prompt'] = WordCompleter(self._list_available_prompts(), ignore_case=True)
         
         # Add all command names from COMMAND_HANDLERS to the completer if not already specified
         for cmd_name in slashcommands.COMMAND_HANDLERS.keys():
