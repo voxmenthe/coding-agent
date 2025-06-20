@@ -28,7 +28,7 @@ import asyncio
 import argparse
 from langchain_google_genai import ChatGoogleGenerativeAI
 from browser_use import Agent, Browser, BrowserContextConfig, BrowserConfig
-from browser_use.browser.browser import BrowserContext
+from browser_use.browser.browser import BrowserConfig as ActualBrowserContext # Changed import
 from pydantic import SecretStr
 from dotenv import load_dotenv
 
@@ -45,7 +45,7 @@ async def setup_browser(headless: bool = False):
         highlight_elements=True,
         save_recording_path="./recordings",
     )
-    return browser, BrowserContext(browser=browser, config=context_config)
+    return browser, ActualBrowserContext(browser=browser, config=context_config) # Changed usage
 
 
 async def agent_loop(llm, browser_context, query, initial_url=None):

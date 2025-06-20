@@ -1,52 +1,51 @@
-from google import genai
-from google.genai import types
 import os
 import sys
 from pathlib import Path
 from . import database
 from . import tools
-from .autocomplete import PdfCompleter  # <-- Import PdfCompleter
+from .autocomplete import PdfCompleter
 import traceback
 import argparse
-import functools
+import functools # Keep for CodeAgent._make_verbose_tool if not fully removed, or for other potential uses
 import logging
-import asyncio, threading, uuid # Added uuid
-from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, TextColumn, BarColumn # Added TextColumn, BarColumn
-from prompt_toolkit.document import Document # For completer
-from prompt_toolkit.completion import Completer, Completion, NestedCompleter, WordCompleter, PathCompleter, FuzzyWordCompleter, CompleteEvent # For completer, Added CompleteEvent
+import asyncio, threading, uuid
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, TextColumn, BarColumn
+from prompt_toolkit.document import Document
+from prompt_toolkit.completion import Completer, Completion, NestedCompleter, WordCompleter, PathCompleter, FuzzyWordCompleter, CompleteEvent
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.filters import Condition # Added
-from prompt_toolkit.keys import Keys # Added
-from prompt_toolkit.application.current import get_app # Added
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.shortcuts import CompleteStyle # Added for complete_style argument
+from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-import re # For finding words in command input
-from typing import Iterable, Dict, Any, Optional, Set, Union # For completer and CustomNestedCompleter
-import bisect # Added for efficient searching
+import re
+from typing import Iterable, Dict, Any, Optional, Set, Union, List, Callable # Ensure List, Callable are here
+import bisect
 import yaml
 import sqlite3
-from typing import Optional, List, Dict, Callable 
-from dotenv import load_dotenv # Import dotenv
-from datetime import datetime, timezone # Added for processed_timestamp
-import sys # For sys.executable
-import subprocess # For running scripts
-# from google.generativeai import types as genai_types # This was incorrect for the new SDK as the `google.generativeai` SDK is deprecated and we should use `google.genai` SDK instead
+from dotenv import load_dotenv
+from datetime import datetime, timezone
+import subprocess
+
+# --- Import LLMAgentCore ---
+from .llm_agent_core import LLMAgentCore
+import google.generativeai as genai # Use the working import style
+from .async_task_manager import AsyncTaskManager # Import AsyncTaskManager
 
 # --- Import slash command handlers ---
-from . import slashcommands # Import the new module
+from . import slashcommands
 
 
 # Setup basic logging
-# Configure logging with a default of WARNING (less verbose)
-logging.basicConfig(level=logging.WARNING) # Default to less verbose logging
-logger = logging.getLogger(__name__) # Define module-level logger
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
 
 
 # --- Completer Logging Wrapper ---
-class LoggingCompleterWrapper(Completer):
+class LoggingCompleterWrapper(Completer): # Keep this class as it's UI related
     def __init__(self, wrapped_completer: Completer, name: str = "Wrapped"):
         self.wrapped_completer = wrapped_completer
         self.name = name
@@ -58,7 +57,7 @@ class LoggingCompleterWrapper(Completer):
         yield from raw_completions
 # --- End Completer Logging Wrapper ---
 
-class CustomNestedCompleter(NestedCompleter):
+class CustomNestedCompleter(NestedCompleter): # Keep this UI related class
     def __init__(self, options: Dict[str, Optional[Completer]], ignore_case: bool = True):
         super().__init__(options, ignore_case=ignore_case)
 
@@ -208,21 +207,43 @@ def load_config(config_path: Path):
     else:
         logger.info(f"No .env file found at {dotenv_home_path}, checking system environment variables.")
 
-    # 2. Check for API key in environment variables first
+    # 1. Load YAML file specified by config_path
+    try:
+        with open(config_path) as f_local:
+            loaded_yaml_config = yaml.safe_load(f_local) or {}
+    except Exception as e:
+        logger.error(f"Failed to load or parse YAML configuration at {config_path}: {e}", exc_info=True)
+        # Return a minimal config or raise error, depending on desired handling
+        # For now, return a dictionary that might miss keys, leading to later warnings/defaults.
+        loaded_yaml_config = {}
+
+    # 2. Load environment variables from ~/.env (if it exists)
+    dotenv_home_path = Path.home() / '.env'
+    if dotenv_home_path.is_file():
+        load_dotenv(dotenv_path=dotenv_home_path)
+        logger.info(f"Loaded environment variables from {dotenv_home_path}")
+    else:
+        logger.info(f"No .env file found at {dotenv_home_path}, checking system environment variables.")
+
+    # 3. Check for API key in environment variables first
     env_api_key = os.getenv('GEMINI_API_KEY')
 
     # 4. Prioritize environment variable for API key
     if env_api_key:
-        config['gemini_api_key'] = env_api_key
+        loaded_yaml_config['gemini_api_key'] = env_api_key
         logger.info("Using GEMINI_API_KEY from environment.")
-    elif 'gemini_api_key' in yaml_data and yaml_data['gemini_api_key']:
+    elif 'gemini_api_key' in loaded_yaml_config and loaded_yaml_config['gemini_api_key']:
         logger.info("Using gemini_api_key from config.yaml (environment variable not set).")
-        # It's already in config from the update() step
     else:
         logger.warning("GEMINI_API_KEY not found in environment or config.yaml.")
 
+    # Update MODEL_NAME based on the loaded config (or use its existing global default)
+    # This function will return a config dictionary, the caller should update global MODEL_NAME if needed,
+    # or better, MODEL_NAME should be sourced from this returned config by the caller.
+    # For now, just log based on what this function sees.
+    current_model_name = loaded_yaml_config.get('model_name', MODEL_NAME) # Use global MODEL_NAME as fallback for logging
+    logger.info(f"Model specified in config/default: {current_model_name}")
 
-    logger.info(f"Using model: {MODEL_NAME}")
 
     # 5. Resolve paths (relative to project root, which is parent of src/)
     project_root = Path(__file__).parent.parent 
@@ -230,26 +251,23 @@ def load_config(config_path: Path):
                 'SAVED_CONVERSATIONS_DIRECTORY', 
                 'PAPER_DB_PATH', 
                 'PAPER_BLOBS_DIR']:
-        if key in config and isinstance(config[key], str):
-            resolved_path = project_root / config[key]
+        if key in loaded_yaml_config and isinstance(loaded_yaml_config[key], str):
+            resolved_path = project_root / loaded_yaml_config[key]
             if key == 'PAPER_DB_PATH':
-                 # Ensure parent dir exists for DB path
                  resolved_path.parent.mkdir(parents=True, exist_ok=True)
             else:
-                 # Ensure the directory itself exists for others
                  resolved_path.mkdir(parents=True, exist_ok=True)
-            config[key] = resolved_path
-            logger.info(f"Resolved path for {key}: {config[key]}")
-        elif key in config and isinstance(config[key], Path):
-             # Path might already be resolved if loaded from previous runs/complex config
-             logger.info(f"Path for {key} already resolved: {config[key]}")
-             # Ensure directories exist even if path was pre-resolved
+            loaded_yaml_config[key] = resolved_path
+            logger.info(f"Resolved path for {key}: {loaded_yaml_config[key]}")
+        elif key in loaded_yaml_config and isinstance(loaded_yaml_config[key], Path):
+             logger.info(f"Path for {key} already resolved: {loaded_yaml_config[key]}")
              if key == 'PAPER_DB_PATH':
-                  config[key].parent.mkdir(parents=True, exist_ok=True)
+                  loaded_yaml_config[key].parent.mkdir(parents=True, exist_ok=True)
              else:
-                  config[key].mkdir(parents=True, exist_ok=True)
+                  loaded_yaml_config[key].mkdir(parents=True, exist_ok=True)
+        # If key is missing or not a string/Path, it will be handled by downstream code using .get() with defaults
 
-    return config
+    return loaded_yaml_config
 
 def print_welcome_message(config):
     """Prints the initial welcome and help message."""
@@ -261,118 +279,110 @@ class CodeAgent:
     def __init__(self, config: dict, conn: Optional[sqlite3.Connection]):
         """Initializes the CodeAgent."""
         self.config = config
-        self.api_key = config.get('gemini_api_key') # Correct key name
-        self.model_name = MODEL_NAME
-        self.pdf_processing_method = config.get('pdf_processing_method', 'Gemini') # Default method
-        self.client = None
-        self.chat = None
-        self.db_path_str = str(config.get('PAPER_DB_PATH')) if config.get('PAPER_DB_PATH') else None # Store DB path string
-        self.prefill_prompt_content: Optional[str] = None # For pre-filling the next prompt
-        
-        # Background asyncio loop (daemon so app exits cleanly)
-        self.loop = asyncio.new_event_loop()
-        threading.Thread(target=self.loop.run_forever, daemon=True).start()
-        # Async GenAI client that lives on that loop
-        if self.api_key: # Ensure API key exists before creating async client
-            self.async_client = genai.Client(api_key=self.api_key).aio
-        else:
-            self.async_client = None
-            logger.warning("GEMINI_API_KEY not found. Async GenAI client not initialized.")
+        self.api_key = config.get('gemini_api_key')
+        # LLMAgentCore now manages its own model_name, client, chat, thinking_budget, etc.
 
-        # Collection to keep track of active background tasks (Future objects and metadata)
-        self.active_background_tasks = {}
-        self.pending_script_output: Optional[str] = None # For output from /run_script
+        # Initialize AsyncTaskManager first, as it's needed by LLMAgentCore
+        self.task_manager = AsyncTaskManager(main_app_handler=self)
         
-        self.conversation_history = [] # Manual history for token counting ONLY
-        self.current_token_count = 0 # Store token count for the next prompt
-        self.active_files = [] # List to store active File objects
-        self.prompt_time_counts = [0] # Stores total tokens just before prompt
-        self.messages_per_interval = [0] # Stores # messages added in the last interval
-        self._messages_this_interval = 0 # Temporary counter
-        self.thinking_budget = config.get('default_thinking_budget', DEFAULT_THINKING_BUDGET)
-        self.thinking_config = None # Will be set in start_interaction
-        self.pdfs_dir_rel_path = config.get('PDFS_TO_CHAT_WITH_DIRECTORY') # Relative path from config
+        self.llm_core = LLMAgentCore(
+            config=config,
+            api_key=self.api_key,
+            model_name=MODEL_NAME,
+            task_manager=self.task_manager # Pass the initialized task manager
+        )
+
+        self.pdf_processing_method = config.get('pdf_processing_method', 'Gemini')
+        self.db_path_str = str(config.get('PAPER_DB_PATH')) if config.get('PAPER_DB_PATH') else None
+        self.prefill_prompt_content: Optional[str] = None
+
+        # Async client for PDF processing is now accessed via self.llm_core.async_client
+
+        # active_background_tasks is now managed by self.task_manager
+        self.pending_script_output: Optional[str] = None # Script output callback will set this
+
+        # active_files are GenAI File objects, managed by CodeAgent (UI layer)
+        self.active_files: List[genai.types.File] = [] # Changed genai_types.File to genai.types.File
+
+        # UI-related stats, keep them here
+        self.prompt_time_counts = [0]
+        self.messages_per_interval = [0]
+        self._messages_this_interval = 0
+        
+        # PDF and Blob directories remain relevant for CodeAgent's handling of files
+        self.pdfs_dir_rel_path = config.get('PDFS_TO_CHAT_WITH_DIRECTORY')
         self.pdfs_dir_abs_path = Path(self.pdfs_dir_rel_path).resolve() if self.pdfs_dir_rel_path else None
         self.blob_dir_rel_path = config.get('PAPER_BLOBS_DIR')
         self.blob_dir = Path(self.blob_dir_rel_path).resolve() if self.blob_dir_rel_path else None
-        # Store the database connection passed from main
-        self.conn = conn 
-        # Use imported tool functions
-        self.tool_functions = [
-            tools.read_file,
-            tools.list_files,
-            tools.edit_file,
-            tools.execute_bash_command,
-            tools.run_in_sandbox,
-            tools.find_arxiv_papers,
-            tools.download_arxiv_paper,
-            tools.get_current_date_and_time,
-            tools.google_search,
-            tools.open_url,
-            tools.upload_pdf_for_gemini,
-            tools.run_sql_query
+        self.conn = conn
+
+        # Define the list of tool functions that CodeAgent makes available
+        original_tool_functions = [
+            tools.read_file, tools.list_files, tools.edit_file,
+            tools.execute_bash_command, tools.run_in_sandbox,
+            tools.find_arxiv_papers, tools.download_arxiv_paper,
+            tools.get_current_date_and_time, tools.google_search, # Re-enabled
+            tools.open_url, # Re-enabled
+            tools.upload_pdf_for_gemini, tools.run_sql_query
         ]
-        if self.config.get('verbose', config.get('verbose', False)):
-            self.tool_functions = [self._make_verbose_tool(f) for f in self.tool_functions]
+
+        # Register tools with LLMAgentCore
+        # LLMAgentCore's register_tools now handles verbose wrapping internally.
+        if self.llm_core:
+            self.llm_core.register_tools(
+                original_tool_functions,
+                verbose=self.config.get('verbose', False)
+            )
+
         if self.pdfs_dir_abs_path:
             self.pdfs_dir_abs_path.mkdir(parents=True, exist_ok=True)
             logger.info(f"PDF directory set to: {self.pdfs_dir_abs_path}")
         else:
-            logger.warning("PDF directory not configured in config.yaml. /pdf command will be disabled.")
+            logger.warning("PDF directory not configured. /pdf command will be disabled.")
 
         if self.blob_dir:
             self.blob_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Blob directory set to: {self.blob_dir}")
         else:
-            logger.warning("Blob directory not configured in config.yaml. Saving extracted text will be disabled.")
+            logger.warning("Blob directory not configured. Saving extracted text will be disabled.")
 
         if not self.conn:
-             logger.warning("Database connection not established. Database operations will be disabled.")
+             logger.warning("DB connection not established. DB operations will be disabled.")
 
-        if not self.api_key:
-            logger.warning("GEMINI_API_KEY not found in config or environment. Gemini features disabled.")
-        else:
-            self._configure_client()
-            if self.client:
-                self._initialize_chat()
+        # LLMAgentCore handles its own client/chat initialization and warnings.
+        # No need for direct calls to self._configure_client() or self._initialize_chat() here.
 
-        self.pending_pdf_context: Optional[str] = None # For prepending PDF context
+        self.pending_pdf_context: Optional[str] = None
         self.prompts_dir = Path('src/prompts').resolve()
+        self.prompts_dir.mkdir(parents=True, exist_ok=True) # Ensure prompts dir exists
 
-        # Ensure directories exist (moved from load_config for clarity)
-        if self.pdfs_dir_abs_path:
-            self.pdfs_dir_abs_path.mkdir(parents=True, exist_ok=True)
-        if self.blob_dir:
-            self.blob_dir.mkdir(parents=True, exist_ok=True)
-        if self.prompts_dir:
-            self.prompts_dir.mkdir(parents=True, exist_ok=True)
+    # _configure_client, _initialize_chat, _make_verbose_tool are removed from CodeAgent
+    # _on_task_done, _launch_background_task are also removed (moved to AsyncTaskManager)
 
-    def _configure_client(self):
-        """Configures the Google Generative AI client."""
-        print("\n\u2692\ufe0f Configuring genai client...")
-        try:
-            # Configure the client with our API key
-            self.client = genai.Client(api_key=self.api_key)
-            print("\u2705 Client configured successfully.")
-        except Exception as e:
-            print(f"\u274c Error configuring genai client: {e}")
-            traceback.print_exc()
-            sys.exit(1)
+    def handle_script_completion(self, task_id: str, task_name: str, script_output: str):
+        """Callback for AsyncTaskManager to set script output."""
+        logger.info(f"CodeAgent: Script task '{task_name}' (ID: {task_id}) completed. Output received.")
+        self.pending_script_output = script_output
+        output_summary = (script_output[:100] + '...') if len(script_output) > 103 else script_output
+        # This print might be better handled by a UI update method if using a more complex UI
+        print(f"\n📄 Output from '{task_name}' is ready and will be included in the next context. Output preview:\n{output_summary}")
+        self.refresh_prompt_display() # Example: if prompt needs to be re-rendered
 
-    def _initialize_chat(self):
-        """Initializes the chat session."""
-        print("\n\u2692\ufe0f Initializing chat session...")
-        try:
-            # Create a chat session using the client
-            self.chat = self.client.chats.create(model=self.model_name, history=[])
-            print("\u2705 Chat session initialized.")
-        except Exception as e:
-            print(f"\u274c Error initializing chat session: {e}")
-            traceback.print_exc()
-            sys.exit(1)
+    def refresh_prompt_display(self):
+        """Placeholder for refreshing the prompt_toolkit display if needed after async updates."""
+        # In a real prompt_toolkit app, this might involve app.invalidate() or similar
+        app = get_app()
+        if app:
+            app.invalidate()
+            logger.debug("CodeAgent: Prompt display invalidated for refresh.")
 
-    # --- Prompt Helper Methods ---
-    def _list_available_prompts(self) -> list[str]:
+    def update_task_status_display(self, task_id: str, message: str):
+        """Placeholder for updating task status in a more integrated UI."""
+        # This could update a Rich Panel, status bar, etc. For now, just prints.
+        print(message) # Rich progress is handled by AsyncTaskManager for now
+
+    # --- Prompt Helper Methods (UI related, stay in CodeAgent) ---
+    def _list_available_prompts(self) -> List[str]:
         """Lists available prompt names from the prompts directory."""
         if not self.prompts_dir.is_dir():
             return []
@@ -408,7 +418,9 @@ class CodeAgent:
     def _get_dynamic_prompt_message(self):
         """Returns the dynamic prompt message with status indicators."""
         active_files_info = f" [{len(self.active_files)} files]" if self.active_files else ""
-        token_info = f"({self.current_token_count})"
+        # Get token count from LLMAgentCore
+        token_count = self.llm_core.current_token_count if self.llm_core else 0
+        token_info = f"({token_count})"
         
         return HTML(
             f'<ansiblue>🔵 You</ansiblue> '
@@ -416,7 +428,7 @@ class CodeAgent:
             f'<ansigreen>{active_files_info}</ansigreen>: '
         )
 
-    def _get_continuation_prompt(self, width, line_number, is_soft_wrap):
+    def _get_continuation_prompt(self, width, line_number, is_soft_wrap): # UI related
         """Returns the continuation prompt for multi-line input."""
         if is_soft_wrap:
             return ' ' * 2  # Indent for soft wraps
@@ -496,23 +508,22 @@ class CodeAgent:
             # input_processors=None, 
         )
 
-    def print_initial_help(self):
+    def print_initial_help(self): # UI related
         """Prints the initial brief help message."""
         print("\n\u2692\ufe0f Agent ready. Ask me anything or type '/help' for commands.")
         print("   Type '/exit' or '/q' to quit.")
-        # Key commands can be highlighted if desired, but /help is the main source.
 
     def start_interaction(self):
         """Starts the main interaction loop with enhanced multi-line editing."""
-        if not self.client:
-            print("\n\u274c Client not configured. Exiting.")
+        if not self.llm_core or not self.llm_core.client or not self.llm_core.chat:
+            logger.error("LLMAgentCore not initialized properly. Exiting.")
+            print("\n\u274c LLM Core not configured (API key or model issue likely). Exiting.")
             return
 
-        self.print_initial_help() # Use the new brief help message
+        self.print_initial_help()
 
-        # Set initial thinking budget from default/config
-        self.thinking_config = types.ThinkingConfig(thinking_budget=self.thinking_budget)
-        print(f"\n🧠 Initial thinking budget set to: {self.thinking_budget} tokens.")
+        # thinking_budget is now managed by llm_core, display it
+        print(f"\n🧠 Initial thinking budget set to: {self.llm_core.thinking_budget} tokens.")
 
         # Print multi-line editing instructions
         print("\n📝 Multi-line editing enabled:")
@@ -585,12 +596,13 @@ class CodeAgent:
 
         while True:
             try:
-                # ─── 1 · house‑keeping before we prompt ──────────────────────────
-                self.prompt_time_counts.append(self.current_token_count)
+                # --- House-keeping before prompt ---
+                # Use token count from llm_core for UI stats if needed by prompt_time_counts
+                self.prompt_time_counts.append(self.llm_core.current_token_count if self.llm_core else 0)
                 self.messages_per_interval.append(self._messages_this_interval)
                 self._messages_this_interval = 0
 
-                # Get multi-line input with the enhanced session
+                # --- Get multi-line input ---
                 # The prompt message is now handled by _get_dynamic_prompt_message
                 # Prefill logic needs to be integrated with PromptSession's `default` if needed, or handled before prompt.
                 # For now, we simplify and remove direct prefill_text here as the plan's session.prompt() is simpler.
@@ -654,131 +666,44 @@ class CodeAgent:
                     continue # Command handled, loop to next prompt
                 
                 # --- If not a known slash command, proceed as LLM message ---
-                self._messages_this_interval += 1 
-                message_to_send = user_input 
+                self._messages_this_interval += 1
 
-                pdf_context_was_included = False
-                script_output_was_included = False # New flag
-                 
-                # Check for PDF context AFTER prompt (so prompt comes first)
+                # Combine pending PDF context and script output for the message
+                combined_pending_context = ""
                 if self.pending_pdf_context:
+                    combined_pending_context += self.pending_pdf_context + "\n\n"
                     print("[Including context from previously processed PDF in this message.]\n")
-                    message_to_send = f"{self.pending_pdf_context}\n\n{message_to_send}"
-                    pdf_context_was_included = True
-                
-                # Prepend script output AFTER PDF but BEFORE loaded prompt
                 if self.pending_script_output:
+                    combined_pending_context += f"OUTPUT FROM EXECUTED SCRIPT:\n---\n{self.pending_script_output}\n---\n\n"
                     print("[Including output from previously run script in this message.]\n")
-                    # Task name might not be easily available here, use a generic header
-                    message_to_send = f"OUTPUT FROM EXECUTED SCRIPT:\n---\n{self.pending_script_output}\n---\n\n{message_to_send}"
-                    script_output_was_included = True
                 
-                # --- Log message details before sending --- 
-                pdf_context_len_before_send = len(self.pending_pdf_context) if self.pending_pdf_context and pdf_context_was_included else 0
-                script_output_len_before_send = len(self.pending_script_output) if self.pending_script_output and script_output_was_included else 0
-                final_message_len = len(message_to_send)
-                logger.info(f"Preparing to send message.")
-                logger.info(f"  - Original user input length: {len(user_input)}")
-                logger.info(f"  - Included pending PDF context length: {pdf_context_len_before_send}")
-                logger.info(f"  - Included pending script output length: {script_output_len_before_send}")
-                logger.info(f"  - Final message_to_send length: {final_message_len}")
-                # Log snippets for verification
-                if final_message_len > 200:
-                    logger.info(f"  - Final message start: {message_to_send[:100]}...")
-                    logger.info(f"  - Final message end: ...{message_to_send[-100:]}")
-
-                # --- Prepare message content (Text + Files) ---
-                message_content = [message_to_send]
+                # Log message details before sending
+                logger.info(f"Preparing to send message to LLMAgentCore.")
+                logger.info(f"  - Original user input: '{user_input}'")
+                if combined_pending_context:
+                     logger.info(f"  - Combined pending context length: {len(combined_pending_context)}")
                 if self.active_files:
-                    message_content.extend(self.active_files)
-                    if self.config.get('verbose', False):
-                        print(f"\n📎 Attaching {len(self.active_files)} files to the prompt:")
-                        for f in self.active_files:
-                            print(f"   - {f.display_name} ({f.name})")
+                     logger.info(f"  - Active files: {[f.name for f in self.active_files]}")
 
-                # --- Update manual history (for token counting ONLY - Use Text Only) --- 
-                new_user_content =types.Content(parts=[types.Part(text=message_to_send)], role="user")
-                self.conversation_history.append(new_user_content)
-
-                # --- Send Message --- 
-                print("\n⏳ Sending message and processing...")
-                # Prepare tool configuration **inside the loop** to use the latest budget
-                tool_config = types.GenerateContentConfig(
-                    tools=self.tool_functions, 
-                    thinking_config=self.thinking_config
+                print("\n⏳ Sending message to LLM Core and processing...")
+                agent_response_text = self.llm_core.send_message(
+                    user_message_text=user_input,
+                    active_files=self.active_files, # Pass the list of genai.File objects
+                    pending_context=combined_pending_context.strip() if combined_pending_context else None
                 )
-
-                # Send message using the chat object's send_message method
-                # Pass the potentially combined list of text and files
-                response = self.chat.send_message(
-                    message=message_content, # Pass the list here
-                    config=tool_config
-                )
-
-                agent_response_text = ""
-                if response.candidates and response.candidates[0].content:
-                    agent_parts = response.candidates[0].content.parts
-                    agent_response_text = " ".join(p.text for p in agent_parts
-                                                   if hasattr(p, "text"))
-
-                if agent_response_text:
-                    hist_agent_content = types.Content(role="model",
-                                                     parts=[types.Part(text=agent_response_text)])
-                    self.conversation_history.append(hist_agent_content)
 
                 print(f"\n🟢 \x1b[92mAgent:\x1b[0m {agent_response_text or '[No response text]'}")
 
-                # --- Detailed History Logging Before Token Count --- 
-                logger.debug(f"Inspecting conversation_history (length: {len(self.conversation_history)}) before count_tokens:")
-                history_seems_ok = True
-                for i, content in enumerate(self.conversation_history):
-                    logger.debug(f"  [{i}] Role: {getattr(content, 'role', 'N/A')}")
-                    if hasattr(content, 'parts'):
-                        for j, part in enumerate(content.parts):
-                            part_type = type(part)
-                            part_info = f"Part {j}: Type={part_type.__name__}"
-                            if hasattr(part, 'text'):
-                                part_info += f", Text='{part.text[:50]}...'"
-                            elif hasattr(part, 'file_data'):
-                                part_info += f", FileData URI='{getattr(part.file_data, 'file_uri', 'N/A')}'"
-                                history_seems_ok = False # Found a file part!
-                                logger.error(f"    🚨 ERROR: Found unexpected file_data part in history for token counting: {part_info}")
-                            elif hasattr(part, 'function_call'):
-                                part_info += f", FunctionCall Name='{getattr(part.function_call, 'name', 'N/A')}'"
-                                history_seems_ok = False # Found a function call part!
-                                logger.error(f"    🚨 ERROR: Found unexpected function_call part in history for token counting: {part_info}")
-                            else:
-                                # Log other unexpected part types
-                                history_seems_ok = False
-                                logger.error(f"    🚨 ERROR: Found unexpected part type in history for token counting: {part_info}")
-                            logger.debug(f"    {part_info}")
-                    else:
-                        logger.warning(f"  [{i}] Content object has no 'parts' attribute.")
-                if history_seems_ok:
-                    logger.debug("History inspection passed: Only text parts found.")
-                else:
-                    logger.error("History inspection FAILED: Non-text parts found. Token counting will likely fail.")
-                # --- End Detailed History Logging --- 
+                # Display token count from LLMAgentCore
+                print(f"\n[Token Count: {self.llm_core.current_token_count}]")
 
-                # Calculate and display token count using client.models
-                try:
-                    token_info = self.client.models.count_tokens(
-                        model=self.model_name,
-                        contents=self.conversation_history
-                    )
-                    self.current_token_count = token_info.total_tokens
-                    print(f"\n[Token Count: {self.current_token_count}]")
-                except Exception as count_err:
-                    logger.error(f"Error calculating token count: {count_err}", exc_info=True)
-                    print("🚨 Error: Failed to calculate token count.")
-
-                # --- NOW clear contexts that were actually sent --- 
-                if pdf_context_was_included:
+                # Clear contexts now that they've been sent
+                if self.pending_pdf_context:
                     self.pending_pdf_context = None
-                    logger.info("Cleared pending_pdf_context after sending to LLM.")
-                if script_output_was_included:
+                    logger.info("Cleared pending_pdf_context in CodeAgent after sending to LLM Core.")
+                if self.pending_script_output:
                     self.pending_script_output = None
-                    logger.info("Cleared pending_script_output after sending to LLM.")
+                    logger.info("Cleared pending_script_output in CodeAgent after sending to LLM Core.")
 
             except KeyboardInterrupt:
                 print("\n👋 Goodbye!")
@@ -786,19 +711,10 @@ class CodeAgent:
             except Exception as e:
                 print(f"\n🔴 An error occurred during interaction: {e}")
                 traceback.print_exc()
-                # Potentially add a small delay or a prompt to continue/exit here
 
-    def _make_verbose_tool(self, func):
-        """Wrap tool function to print verbose info when called."""
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            print(f"\n🔧 Tool called: {func.__name__}, args: {args}, kwargs: {kwargs}")
-            result = func(*args, **kwargs)
-            print(f"\n▶️ Tool result ({func.__name__}): {result}")
-            return result
-        return wrapper
+    # _make_verbose_tool is removed, LLMAgentCore handles verbose tool logging.
 
-    def _handle_pdf_command(self, args: list):
+    def _handle_pdf_command(self, args: list): # UI related, but calls core async client
         """Handles the /pdf command to asynchronously process a PDF file.
         
         Args:
@@ -814,9 +730,9 @@ class CodeAgent:
             print("\n⚠️ Database connection not available. Cannot save PDF metadata.")
             return
 
-        # Async client check (used by _process_pdf_async_v2)
-        if not self.async_client:
-            print("\n⚠️ Async Gemini client not initialized. Cannot process PDF asynchronously.")
+        # Async client check (used by _process_pdf_async_v2, now from llm_core)
+        if not self.llm_core or not self.llm_core.async_client:
+            print("\n⚠️ Async Gemini client (via LLM Core) not initialized. Cannot process PDF asynchronously.")
             return
 
         if not args:
@@ -894,7 +810,7 @@ class CodeAgent:
                         
                         # Optionally, if you want to also add the GenAI file to active_files if available
                         genai_uri = cached_paper_info.get("genai_file_uri")
-                        if genai_uri and self.client:
+                        if genai_uri and self.llm_core and self.llm_core.client: # Check llm_core.client
                             try:
                                 # We need to "reconstruct" a File object or decide if it's needed
                                 # For now, we focus on context. If direct file interaction is needed,
@@ -957,15 +873,26 @@ class CodeAgent:
         # and we add pdf_path, arxiv_id_arg, and paper_id via partial.
         specific_pdf_task_coro_creator = functools.partial(self._process_pdf_async_v2,
                                                        pdf_path=pdf_path,
-                                                       arxiv_id=arxiv_id_arg,
-                                                       paper_id=paper_id) # _process_pdf_async_v2 will access self.db_path_str
+                                                       arxiv_id=arxiv_id_arg, # This was arxiv_id_arg before, ensure consistency
+                                                       paper_id=paper_id)
 
-        self._launch_background_task(specific_pdf_task_coro_creator, task_name=f"PDF-{pdf_path.name}")
-        # The _launch_background_task will print a message like:
-        # "⏳ 'PDF-mypaper.pdf' (ID: <uuid>) started in background – you can keep chatting."
-        # The actual result/feedback will come from the _on_task_done callback via prints.
+        self.task_manager.submit_task(
+            specific_pdf_task_coro_creator,
+            task_name=f"PDF-{pdf_path.name}",
+            task_meta={"type": "pdf_processing", "original_filename": pdf_path.name}
+        )
 
-    def _finalize_pdf_ingest(self, pdf_file_resource: types.File, arxiv_id: Optional[str], original_pdf_path: Path, paper_id: Optional[int], db_path_str: Optional[str]):
+    def handle_pdf_completion(self, task_id: str, task_name: str, result: Any):
+        """Callback for AsyncTaskManager upon PDF processing completion."""
+        # Result might be a status message or the genai.File object if processing was successful
+        # The _process_pdf_async_v2 already sets self.pending_pdf_context via _finalize_pdf_ingest
+        logger.info(f"CodeAgent: PDF Processing task '{task_name}' (ID: {task_id}) completed by manager. Result: {result}")
+        # Further actions can be taken here based on the result if needed.
+        # For example, if result indicates success, print a specific message to user.
+        # The _on_task_done in AsyncTaskManager already prints a generic completion message.
+        # self.pending_pdf_context is set within _finalize_pdf_ingest, called by the async task.
+
+    def _finalize_pdf_ingest(self, pdf_file_resource: genai.types.File, arxiv_id: Optional[str], original_pdf_path: Path, paper_id: Optional[int], db_path_str: Optional[str]):
         """Synchronous method for final PDF ingestion steps after GenAI processing is ACTIVE.
         This method is called via asyncio.to_thread() from an async task.
         It handles text extraction (potentially blocking), blob saving (blocking), 
@@ -994,16 +921,17 @@ class CodeAgent:
                 logger.error(f"Finalize Thread Paper ID {paper_id}: Could not establish new DB connection. Aborting.")
                 return # Cannot update status without DB connection
 
-            # Ensure synchronous GenAI client is available (it's on self, created in main thread, typically fine for read-only attributes or creating new requests)
-            if not self.client:
-                logger.error(f"Finalize Thread Paper ID {paper_id}: Synchronous GenAI client (self.client) not available. Aborting text extraction.")
+            # Ensure synchronous GenAI client is available via llm_core
+            if not self.llm_core or not self.llm_core.client:
+                logger.error(f"Finalize Thread Paper ID {paper_id}: Synchronous GenAI client (self.llm_core.client) not available. Aborting text extraction.")
                 database.update_paper_field(local_conn, paper_id, 'status', 'error_extraction_final_no_client')
                 return
 
             extracted_text: Optional[str] = None
             try:
                 logger.info(f"Finalize Thread Paper ID {paper_id}: Extracting text from '{original_pdf_path.name}'.")
-                extracted_text = tools.extract_text_from_pdf_gemini(original_pdf_path, self.client, self.model_name)
+                # Use client and model_name from llm_core
+                extracted_text = tools.extract_text_from_pdf_gemini(original_pdf_path, self.llm_core.client, self.llm_core.model_name)
                 if not extracted_text:
                     logger.warning(f"Finalize Thread Paper ID {paper_id}: Text extraction returned no content for '{original_pdf_path.name}'.")
                     database.update_paper_field(local_conn, paper_id, 'status', 'error_extraction_final_empty')
@@ -1072,25 +1000,26 @@ class CodeAgent:
         Processes a PDF file asynchronously using client.aio.files: uploads to GenAI, monitors processing,
         and finalizes ingestion. Designed for cooperative cancellation.
         """
-        if not self.async_client:
-            error_message = f"Task {task_id}: Async client not available. Cannot process {pdf_path.name}."
-            logging.error(error_message)
-            progress_bar.update(rich_task_id, description=f"❌ {pdf_path.name} failed: Async client missing", completed=100, total=100)
+        # progress_bar and rich_task_id are now passed by AsyncTaskManager.submit_task
+        if not self.llm_core or not self.llm_core.async_client:
+            error_message = f"Task {task_id}: Async client (via LLM Core) not available. Cannot process {pdf_path.name}."
+            logger.error(error_message)
+            if progress_bar: progress_bar.update(rich_task_id, description=f"❌ {pdf_path.name} failed: Async client missing", completed=True)
             raise RuntimeError(error_message)
 
-        client = self.async_client
+        async_genai_client = self.llm_core.async_client
         pdf_file_display_name = pdf_path.name
         progress_bar.update(rich_task_id, description=f"Starting {pdf_file_display_name}…")
 
-        genai_file_resource: Optional[types.File] = None
+        genai_file_resource: Optional[genai.types.File] = None # Changed types.File to genai.types.File
 
         try:
             progress_bar.update(rich_task_id, description=f"Uploading {pdf_file_display_name}…")
             # TODO: Add timeout for upload if necessary, e.g., asyncio.timeout(60, ...)
-            upload_config = types.UploadFileConfig(
-                display_name=pdf_path.name # Use the original PDF filename as the display name
+            upload_config = genai.types.UploadFileConfig( # Changed genai_types to genai.types
+                display_name=pdf_path.name
             )
-            genai_file_resource = await client.files.upload(
+            genai_file_resource = await async_genai_client.files.upload( # Use the alias
                 file=pdf_path, 
                 config=upload_config
             )
@@ -1098,13 +1027,11 @@ class CodeAgent:
 
             progress_bar.update(rich_task_id, description=f"Processing {genai_file_resource.display_name} with GenAI…")
             while genai_file_resource.state.name == "PROCESSING":
-                await asyncio.sleep(5) # Non-blocking poll interval
-                # Refresh file state using its unique resource name (genai_file_resource.name)
-                # TODO: Add timeout for get if necessary
-                genai_file_resource = await client.files.get(name=genai_file_resource.name)
+                await asyncio.sleep(5)
+                genai_file_resource = await async_genai_client.files.get(name=genai_file_resource.name) # Use the alias
                 logger.debug(f"Task {task_id}: Polled {genai_file_resource.name}, state: {genai_file_resource.state.name}")
 
-            if genai_file_resource.state.name != "ACTIVE": # Check for "ACTIVE" as the desired terminal success state
+            if genai_file_resource.state.name != "ACTIVE":
                 error_message = f"Task {task_id}: PDF {genai_file_resource.display_name} processing failed or unexpected state: {genai_file_resource.state.name}"
                 logging.error(error_message)
                 if genai_file_resource.state.name == "FAILED" and hasattr(genai_file_resource, 'error') and genai_file_resource.error:
@@ -1154,132 +1081,31 @@ class CodeAgent:
             if genai_file_resource and genai_file_resource.name:
                 try:
                     logger.info(f"Task {task_id} ({display_name}): Attempting to delete GenAI file {genai_file_resource.name} due to error.")
-                    await client.files.delete(name=genai_file_resource.name)
+                    await async_genai_client.files.delete(name=genai_file_resource.name) # Use the alias
                     logger.info(f"Task {task_id} ({display_name}): Successfully deleted GenAI file {genai_file_resource.name} after error.")
                 except Exception as del_e:
                     logger.error(f"Task {task_id} ({display_name}): Failed to delete GenAI file {genai_file_resource.name} after error: {del_e}")
             raise
 
         finally:
-            # Ensure progress bar always stops if not already explicitly marked completed/failed by an update.
-            # This check might be overly cautious if all paths correctly update and stop the bar.
-            # progress_bar.stop() # This is handled by _on_task_done
+            # The AsyncTaskManager._on_task_done will handle stopping the progress bar.
             pass
 
-    def _on_task_done(self, task_id: str, task_name: str, future: asyncio.Future):
-        """Callback executed when a background task finishes."""
-        try:
-            result = future.result() # Raise exception if task failed
-            print(f"\n✅ Task '{task_name}' (ID: {task_id}) completed successfully. Result: {result}")
-            logging.info(f"Task '{task_name}' (ID: {task_id}) completed successfully. Result: {result}")
-        except asyncio.CancelledError:
-            print(f"\n🚫 Task '{task_name}' (ID: {task_id}) was cancelled.")
-            logging.warning(f"Task '{task_name}' (ID: {task_id}) was cancelled.")
-        except Exception as e:
-            print(f"\n❌ Task '{task_name}' (ID: {task_id}) failed: {type(e).__name__}: {e}")
-            logging.error(f"Task '{task_name}' (ID: {task_id}) failed.", exc_info=True)
-        finally:
-            # Remove task from active list
-            task_info = self.active_background_tasks.pop(task_id, None)
-            # Stop progress bar if it exists and task_info is not None
-            if task_info and "progress_bar" in task_info:
-                task_info["progress_bar"].stop()
-            # Potentially refresh prompt or UI
-            # Check task_meta for script execution output
-            if task_info and future.exception() is None and not future.cancelled():
-                meta = task_info.get("meta", {})
-                if meta.get("type") == "script_execution":
-                    script_output = future.result() # This is the string output from _execute_script_async
-                    self.pending_script_output = script_output
-                    original_command = meta.get("original_command", "Unknown script")
-                    # Truncate for print message if too long
-                    output_summary = (script_output[:100] + '...') if len(script_output) > 103 else script_output
-                    print(f"\n📄 Output from '{original_command}' is ready and will be included in the next context. Output preview:\n{output_summary}")
-                    logger.info(f"Task '{task_name}' (ID: {task_id}) was a script execution. Output stored in pending_script_output.")
-
-    def _launch_background_task(self, coro_func, task_name: str, progress_total: float = 100.0, task_meta: Optional[dict] = None):
-        """
-        Launches a coroutine as a background task with progress display.
-        `coro_func` should be a functools.partial or lambda that creates the coroutine,
-        and the coroutine it creates should accept (task_id, progress_bar, rich_task_id) as arguments.
-        `task_meta` is an optional dictionary to store extra info about the task.
-        """
-        task_id = str(uuid.uuid4())
-
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            # transient=True # Consider if progress should disappear after completion
-        )
-        rich_task_id = progress.add_task(description=f"Initializing {task_name}...", total=progress_total)
-
-        # The coroutine (created by coro_func) must accept these specific arguments.
-        task_coro = coro_func(task_id=task_id, progress_bar=progress, rich_task_id=rich_task_id)
-
-        fut = asyncio.run_coroutine_threadsafe(task_coro, self.loop)
-        self.active_background_tasks[task_id] = {
-            "future": fut,
-            "name": task_name,
-            "progress_bar": progress, # Store to stop it in _on_task_done
-            "rich_task_id": rich_task_id,
-            "meta": task_meta if task_meta else {} # Store metadata
-        }
-
-        fut.add_done_callback(
-            lambda f: self._on_task_done(task_id, task_name, f)
-        )
-
-        print(f"⏳ '{task_name}' (ID: {task_id}) started in background – you can keep chatting.")
-        # The Progress object itself will be updated by the task coroutine.
-        # How it's displayed (e.g., via rich.Live or direct printing) will be
-        # handled by the calling environment or a dedicated UI management part.
-        return task_id # Return task_id along with progress for better management if needed in future
+    # _on_task_done and _launch_background_task are now part of AsyncTaskManager.
 
     def _handle_cancel_command(self, task_id_str: str):
-        """Attempts to cancel an active background task."""
-        task_info = self.active_background_tasks.get(task_id_str)
-        if not task_info:
-            print(f"\n❌ Task ID '{task_id_str}' not found or already completed.")
+        """Delegates task cancellation to AsyncTaskManager."""
+        if not task_id_str: # Basic validation, though slashcommands.py should ensure arg
+            print("\n⚠️ Usage: /cancel <task_id>")
             return
-
-        future = task_info.get("future")
-        task_name = task_info.get("name", "Unnamed Task")
-
-        if future and not future.done():
-            cancelled = future.cancel()
-            if cancelled:
-                print(f"\n➡️ Cancellation request sent for task '{task_name}' (ID: {task_id_str}).")
-                # The _on_task_done callback will eventually report it as cancelled.
-            else:
-                print(f"\n❌ Failed to send cancellation request for task '{task_name}' (ID: {task_id_str}). It might be already completing or uncancelable.")
-        elif future and future.done():
-            print(f"\nℹ️ Task '{task_name}' (ID: {task_id_str}) has already completed.")
-        else:
-            print(f"\n⚠️ Could not cancel task '{task_name}' (ID: {task_id_str}). Future object missing or invalid state.")
+        self.task_manager.cancel_task(task_id_str)
 
     def _handle_list_tasks_command(self):
-        """Lists active background tasks."""
-        if not self.active_background_tasks:
-            print("\nℹ️ No active background tasks.")
-            return
-
-        print("\n📋 Active Background Tasks:")
-        for task_id, info in self.active_background_tasks.items():
-            future = info.get("future")
-            name = info.get("name", "Unnamed Task")
-            status = "Running"
-            if future:
-                if future.cancelled():
-                    status = "Cancelling"
-                elif future.done(): # Should ideally be removed by _on_task_done, but check just in case
-                    status = "Completed (Pending Removal)"
-            print(f"  - ID: {task_id}, Name: {name}, Status: {status}")
+        """Delegates listing tasks to AsyncTaskManager."""
+        self.task_manager.list_tasks()
 
     def _handle_run_script_command(self, script_type: str, script_path: str, script_args: list[str]):
-        """Handles the /run_script command to execute a script asynchronously."""
+        """Submits a script execution task to AsyncTaskManager."""
         logger.info(f"Received /run_script command: type={script_type}, path={script_path}, args={script_args}")
         
         # Basic validation for script_path to prevent execution of arbitrary system commands if script_type is 'shell'
@@ -1294,16 +1120,19 @@ class CodeAgent:
         original_full_command = f"{script_type} {script_path} {' '.join(script_args)}".strip()
         task_meta = {"type": "script_execution", "original_command": original_full_command}
 
-        script_coro_creator = functools.partial(self._execute_script_async,
+        script_coro_creator = functools.partial(self._execute_script_async, # _execute_script_async is now part of CodeAgent
                                               script_type=script_type,
                                               script_path_str=script_path,
                                               script_args=script_args)
         
-        self._launch_background_task(script_coro_creator, task_name=task_name, task_meta=task_meta)
+        self.task_manager.submit_task(script_coro_creator, task_name=task_name, task_meta=task_meta)
 
-    async def _execute_script_async(self, task_id: str, progress_bar: Progress, rich_task_id, script_type: str, script_path_str: str, script_args: list[str]):
-        """Asynchronously executes a python or shell script and captures its output."""
-        progress_bar.update(rich_task_id, description=f"Preparing {script_type} script: {Path(script_path_str).name}")
+    async def _execute_script_async(self, task_id: str, progress_bar: Progress, rich_task_id: Any, script_type: str, script_path_str: str, script_args: list[str]):
+        """Asynchronously executes a python or shell script and captures its output.
+        This method is now a coroutine that will be run by AsyncTaskManager.
+        """
+        # progress_bar and rich_task_id are passed by the AsyncTaskManager
+        if progress_bar: progress_bar.update(rich_task_id, description=f"Preparing {script_type} script: {Path(script_path_str).name}", start=True)
         
         # Define a scripts directory (e.g., project_root / 'scripts')
         # For now, let's assume scripts are relative to the workspace_root (agent's CWD)
@@ -1412,21 +1241,29 @@ def main():
         print("\n⚠️ Warning: 'PAPER_DB_PATH' not specified in config.yaml. Proceeding without database features.")
     # --- End Database Setup ---
 
+    agent = None  # Initialize agent to None for the finally block
     try:
         # Pass the established connection (or None) to the agent
         agent = CodeAgent(config=config, conn=conn)
         agent.start_interaction()
     except KeyboardInterrupt:
-        print("\nExiting...")
+        print("\nExiting...") # User interruption
     except Exception as e:
         logger.error(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
         print(f"\n❌ An unexpected error occurred: {e}")
     finally:
         # Ensure database connection is closed on exit
         if conn:
-             logger.info("Closing database connection...")
-             database.close_db_connection(conn)
-             logger.info("Database connection closed.")
+            logger.info("Closing database connection...")
+            database.close_db_connection(conn)
+            logger.info("Database connection closed.")
+
+        # Shutdown async task manager if agent was initialized
+        if agent and hasattr(agent, 'task_manager') and agent.task_manager:
+            logger.info("Shutting down AsyncTaskManager from main...")
+            agent.task_manager.shutdown()
+            logger.info("AsyncTaskManager shutdown complete from main.")
+
         print("\nGoodbye!")
 
 if __name__ == "__main__":

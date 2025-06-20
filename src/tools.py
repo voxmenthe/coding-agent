@@ -10,7 +10,7 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from src.find_arxiv_papers import build_query, fetch_entries # build_query now in find_arxiv_papers.py
-from google import genai
+import google.generativeai as genai # Changed import style
 from pypdf import PdfReader
 import yaml
 
@@ -18,7 +18,8 @@ import time
 import asyncio
 from pydantic import SecretStr
 from dotenv import load_dotenv
-from src.agent_browser_utils import setup_browser, agent_loop
+from src.agent_browser_utils import setup_browser, agent_loop # Uncommented
+from langchain_google_genai import ChatGoogleGenerativeAI # Added import
 import logging
 import sqlite3
 
@@ -77,9 +78,11 @@ def _check_docker_running() -> tuple[bool, docker.DockerClient | None, str]:
 
 # --- Gemini PDF Processing --- 
 
+from typing import Any # Add Any for temporary type hint
+
 def extract_text_from_pdf_gemini(
     pdf_path: Path,
-    genai_client: genai.client.Client,
+    genai_client: Any, # Temporarily changed type hint from genai.Client to Any
     model_name: str,
 ) -> str | None:
     """
@@ -88,7 +91,7 @@ def extract_text_from_pdf_gemini(
 
     Args:
         pdf_path: Path to the local PDF file.
-        genai_client: An initialized google.genai.client.Client instance.
+        genai_client: An initialized google.generativeai.Client instance.
         model_name: The name of the Gemini model to use (e.g., 'gemini-1.5-flash-latest').
 
     Returns:
@@ -99,7 +102,7 @@ def extract_text_from_pdf_gemini(
          return None
 
     logger.info(f"Uploading PDF {pdf_path.name} to Gemini...")
-    uploaded_file: genai.types.File | None = None 
+    uploaded_file: genai.types.File | None = None  # genai.types is correct with new import
     try:
         # 1. Upload the file synchronously
         uploaded_file = genai_client.files.upload(
@@ -588,7 +591,7 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> genai.types.File | None:
                  print(f"⚠️ Could not delete file during error cleanup: {delete_e}")
         return None
 
-def google_search(query: str, num_results: int = 10) -> str:
+async def google_search(query: str, num_results: int = 10) -> str:
     """Search Google for the given query using browser-use and return JSON-formatted results.
     Args:
         query: The search query.
@@ -601,31 +604,31 @@ def google_search(query: str, num_results: int = 10) -> str:
             model=MODEL_NAME,
             api_key=SecretStr(os.getenv("GEMINI_API_KEY"))
         )
-        browser, context = asyncio.run(setup_browser(headless=True))
-        result = asyncio.run(agent_loop(
+        browser, context = await setup_browser(headless=True)
+        result = await agent_loop(
             llm,
             context,
             f"Search Google for '{query}' and extract the first {num_results} results as JSON list of {{'title','url'}}.",
             initial_url=f"https://www.google.com/search?q={query}"
-        ))
+        )
         return result or "No results."
     except Exception as e:
         return f"Error during google_search: {e}"
 
-def open_url(url: str) -> str:
+async def open_url(url: str) -> str: # Changed to async def
     """Open a URL using browser-use and return the page's visible text content."""
     try:
         llm = ChatGoogleGenerativeAI(
             model=MODEL_NAME,
             api_key=SecretStr(os.getenv("GEMINI_API_KEY"))
         )
-        browser, context = asyncio.run(setup_browser(headless=True))
-        result = asyncio.run(agent_loop(
+        browser, context = await setup_browser(headless=True) # Changed to await
+        result = await agent_loop( # Changed to await
             llm,
             context,
             f"Extract and return visible text content from the page at: {url}.",
             initial_url=url
-        ))
+        )
         return result or "No content."
     except Exception as e:
         return f"Error during open_url: {e}"
