@@ -3,7 +3,7 @@ from pathlib import Path
 import json
 import datetime
 import logging
-from google.genai import types # Assuming types will be needed
+import google.generativeai as genai # Changed import
 from prompt_toolkit import PromptSession # Add this import
 from prompt_toolkit.document import Document # Add this import
 
@@ -34,10 +34,10 @@ def handle_help_command(agent: 'CodeAgent'):
     print("   /pdf <filename> [id]   - Process a PDF file")
     print("   /prompt <name>         - Load a system prompt")
     print("   /reset                 - Clear chat history")
-    print("   /clear <n_tokens>      - Remove tokens from history")
+    print("   /clear <n_tokens>      - Remove tokens from history (experimental with LLMAgentCore)")
     print("   /save [filename]       - Save conversation")
     print("   /load <filename>       - Load conversation")
-    print(f"   /thinking_budget <val> - Set thinking budget (current: {agent.thinking_budget})")
+    print(f"   /thinking_budget <val> - Set thinking budget (current: {agent.llm_core.thinking_budget if agent.llm_core else 'N/A'})")
     print("   /tasks                 - List background tasks")
     print("   /cancel <task_id>      - Cancel background task")
     print("   /run_script <py|sh>    - Run a script")
@@ -104,29 +104,38 @@ def handle_save_command(agent: 'CodeAgent', args: List[str]):
     save_path = save_path_base / filename
 
     save_state = {
-        'conversation_history': [],
-        'current_token_count': agent.current_token_count,
+        # CLI-specific states from CodeAgent
         'prompt_time_counts': agent.prompt_time_counts,
         'messages_per_interval': agent.messages_per_interval,
         '_messages_this_interval': agent._messages_this_interval,
-        'active_files': [getattr(f, 'name', str(f)) for f in agent.active_files], # Ensure files are serializable
-        'thinking_budget': agent.thinking_budget,
+        'active_files': [getattr(f, 'name', str(f)) for f in agent.active_files],
         'pending_pdf_context': agent.pending_pdf_context,
-        'model_name': agent.model_name, # Save the model name used for this conversation
-        'saved_at': now_str # Add a timestamp for when it was saved
+        'saved_at': now_str
     }
-    serializable_history = []
-    for content in agent.conversation_history: # Access via agent instance
-        if hasattr(content, 'parts') and hasattr(content, 'role'):
-            parts_text = [part.text for part in content.parts if hasattr(part, 'text') and part.text is not None]
-            serializable_history.append({
-                'role': content.role,
-                'parts': parts_text
-            })
-        else:
-            logger.warning(f"Skipping non-standard content object during save: {content}")
 
-    save_state['conversation_history'] = serializable_history
+    if agent.llm_core:
+        # LLM-specific states from LLMAgentCore
+        serializable_history = []
+        for content in agent.llm_core.conversation_history:
+            if hasattr(content, 'parts') and hasattr(content, 'role'):
+                parts_text = [part.text for part in content.parts if hasattr(part, 'text') and part.text is not None]
+                serializable_history.append({
+                    'role': content.role,
+                    'parts': parts_text
+                })
+            else:
+                logger.warning(f"Skipping non-standard content object during save: {content}")
+        save_state['conversation_history'] = serializable_history
+        save_state['current_token_count'] = agent.llm_core.current_token_count
+        save_state['model_name'] = agent.llm_core.model_name
+        save_state['thinking_budget'] = agent.llm_core.thinking_budget
+    else:
+        # Fallback if llm_core is not available (should not happen in normal operation)
+        save_state['conversation_history'] = []
+        save_state['current_token_count'] = 0
+        save_state['model_name'] = "unknown"
+        save_state['thinking_budget'] = agent.config.get('default_thinking_budget', 256)
+
     try:
         with open(save_path, 'w') as f:
             json.dump(save_state, f, indent=2)
@@ -167,9 +176,9 @@ def handle_load_command(agent: 'CodeAgent', args: List[str]):
             for item in load_state['conversation_history']:
                 if isinstance(item, dict) and 'role' in item and 'parts' in item and isinstance(item['parts'], list):
                     # Ensure parts are correctly formed for google.genai.types.Content
-                    valid_parts = [types.Part(text=part_text) for part_text in item['parts'] if isinstance(part_text, str)]
-                    if valid_parts: # Only create content if there are valid parts
-                        content = types.Content(role=item['role'], parts=valid_parts)
+                    valid_parts = [genai.types.Part(text=part_text) for part_text in item['parts'] if isinstance(part_text, str)]
+                    if valid_parts:
+                        content = genai.types.Content(role=item['role'], parts=valid_parts)
                         reconstructed_history.append(content)
                     else:
                         logger.warning(f"Skipping history item with no valid text parts: {item}")
@@ -178,33 +187,36 @@ def handle_load_command(agent: 'CodeAgent', args: List[str]):
         else:
             logger.warning(f"'conversation_history' key missing or not a list in {filename}")
 
-        agent.conversation_history = reconstructed_history
-        agent.current_token_count = load_state.get('current_token_count', 0)
+        # Load into LLMAgentCore
+        if agent.llm_core:
+            agent.llm_core.conversation_history = reconstructed_history
+            agent.llm_core.current_token_count = load_state.get('current_token_count', 0)
+
+            loaded_model_name = load_state.get('model_name', agent.llm_core.model_name)
+            if agent.llm_core.model_name != loaded_model_name:
+                logger.info(f"Loaded conversation used model '{loaded_model_name}'. Agent's current model is '{agent.llm_core.model_name}'. Re-initializing chat with loaded model.")
+                agent.llm_core.model_name = loaded_model_name # Update model name in core
+
+            agent.llm_core.thinking_budget = load_state.get('thinking_budget', agent.config.get('default_thinking_budget', 256))
+            # Update generation_config in llm_core (currently GenerationConfig() is simple, but if it had params from thinking_budget)
+            agent.llm_core.generation_config = genai.types.GenerationConfig() # Re-init; add params if any depend on thinking_budget
+
+            if agent.llm_core.client:
+                # Re-initialize chat session in LLMCore with loaded history and model
+                agent.llm_core._initialize_chat() # This now uses self.conversation_history
+                print(f"\n📂 Loaded conversation into LLM Core from: {filename} (using model {agent.llm_core.model_name})")
+            else:
+                print("\n❌ LLM Core client not configured. Cannot fully restore chat session.")
+        else:
+            print("\n❌ LLM Core not available. Cannot load conversation state.")
+
+        # Load/reset CodeAgent (CLI) specific states
         agent.prompt_time_counts = load_state.get('prompt_time_counts', [0])
         agent.messages_per_interval = load_state.get('messages_per_interval', [0])
         agent._messages_this_interval = load_state.get('_messages_this_interval', 0)
-        agent.active_files = [] # Files are not restored from save, user needs to re-add
-        
-        # Restore thinking budget and pending states
-        agent.thinking_budget = load_state.get('thinking_budget', agent.config.get('default_thinking_budget', 256))
-        agent.thinking_config = types.ThinkingConfig(thinking_budget=agent.thinking_budget) # Re-apply thinking config
+        agent.active_files = []
         agent.pending_pdf_context = load_state.get('pending_pdf_context')
-        
-        # Restore model name if available, otherwise use current agent's default
-        loaded_model_name = load_state.get('model_name', agent.model_name)
-        if agent.model_name != loaded_model_name:
-            logger.info(f"Loaded conversation used model '{loaded_model_name}'. Current agent model is '{agent.model_name}'.")
-            # For simplicity, we'll use the agent's current model for the new chat session.
-            # If strict model adherence from save file is needed, agent.model_name would need to be updated
-            # and potentially the client/chat re-initialized if the model change is significant.
-
-        if agent.client:
-            agent.chat = agent.client.chats.create(model=agent.model_name, history=agent.conversation_history)
-            print(f"\n📂 Loaded conversation from: {filename} (using model {agent.model_name})")
-            if agent.pending_pdf_context: print("   Loaded pending PDF context is active.")
-        else:
-            print("\n❌ Client not configured. Cannot fully restore chat session from load.")
-            # History and pending states are loaded, but chat object isn't live.
+        if agent.pending_pdf_context: print("   Loaded pending PDF context is active for next prompt.")
 
     except json.JSONDecodeError as e:
         print(f"\n❌ Failed to load conversation: Invalid JSON in {filename}. Error: {e}")
@@ -219,12 +231,16 @@ def handle_thinking_budget_command(agent: 'CodeAgent', args: List[str]):
     if len(args) == 1:
         try:
             new_budget = int(args[0])
-            if 0 <= new_budget <= 24000: 
-                agent.thinking_budget = new_budget
-                agent.thinking_config = types.ThinkingConfig(thinking_budget=agent.thinking_budget)
-                print(f"\n🧠 Thinking budget updated to: {agent.thinking_budget} tokens.")
+            if agent.llm_core:
+                agent.llm_core.set_thinking_budget(new_budget) # Delegate to LLMAgentCore
+                # The set_thinking_budget method in LLMAgentCore will log the effect.
+                # We still update CodeAgent's thinking_budget for display in /help if needed.
+                agent.thinking_budget = agent.llm_core.thinking_budget
+                print(f"\n🧠 Thinking budget value set to: {agent.llm_core.thinking_budget} tokens. Note: Effect on LLM generation behavior via GenerationConfig is pending specific SDK mapping.")
             else:
-                print("\n⚠️ Thinking budget must be between 0 and 24000.")
+                print("\n❌ LLM Core not available. Cannot set thinking budget.")
+        except ValueError:
+            print("\n⚠️ Invalid number format for thinking budget.")
         except ValueError:
             print("\n⚠️ Invalid number format for thinking budget.")
     else:
@@ -232,113 +248,53 @@ def handle_thinking_budget_command(agent: 'CodeAgent', args: List[str]):
 
 
 def handle_reset_command(agent: 'CodeAgent'):
-    """Handles the /reset command to clear chat history."""
-    print("\n🎯 Resetting context and starting a new chat session...")
-    if agent.client:
-        agent.chat = agent.client.chats.create(model=agent.model_name, history=[])
+    """Handles the /reset command to clear chat history and CLI state."""
+    print("\n🎯 Resetting LLM chat session and CLI state...")
+    if agent.llm_core:
+        agent.llm_core.reset_chat()
+        print("   LLM Core chat session reset.")
     else:
-        agent.chat = None 
-        print("\n⚠️ Client not configured, cannot create new chat session. History cleared locally.")
+        print("   LLM Core not available.")
 
-    agent.conversation_history = []
-    agent.current_token_count = 0
+    # Clear CodeAgent specific states
     agent.active_files = [] 
-    agent.prompt_time_counts = [0]
+    agent.prompt_time_counts = [0] # Reset UI stats
     agent.messages_per_interval = [0]
     agent._messages_this_interval = 0
     agent.pending_pdf_context = None
     agent.pending_script_output = None 
-    print("\n✅ Chat session and history cleared.")
+    print("   CodeAgent CLI state (active files, pending contexts, stats) cleared.")
+    print("\n✅ Reset complete.")
 
 
 def handle_clear_command(agent: 'CodeAgent', args: List[str]):
-    """Handles the /clear command to remove tokens from history."""
+    """Handles the /clear command to remove tokens from LLMAgentCore's history."""
     if not args:
-        print("\n⚠️ Usage: /clear <number_of_tokens>")
+        print("\n⚠️ Usage: /clear <number_of_tokens_to_clear>")
         return
+
+    if not agent.llm_core:
+        print("\n❌ LLM Core not available. Cannot clear history.")
+        return
+
     try:
         tokens_to_clear_target = int(args[0])
         if tokens_to_clear_target <= 0:
             print("\n⚠️ Number of tokens must be positive.")
             return
 
-        if not agent.conversation_history:
-            print("Chat history is already empty.")
-            return
+        messages_removed, tokens_cleared = agent.llm_core.clear_history_by_tokens(tokens_to_clear_target)
 
-        if not agent.client: 
-            print("\n⚠️ Gemini client not available. Cannot accurately clear tokens by count.")
-            return
-
-        logger.info(f"Attempting to clear approx. {tokens_to_clear_target} tokens from history.")
-        
-        new_history = list(agent.conversation_history)
-        tokens_counted_for_removal = 0
-        messages_removed_count = 0
-        history_modified_by_clear = False
-
-        while tokens_counted_for_removal < tokens_to_clear_target and new_history:
-            first_message = new_history[0]
-            message_tokens = 0
-            try:
-                if isinstance(first_message, types.Content):
-                    message_tokens = agent.client.models.count_tokens(model=agent.model_name, contents=[first_message]).total_tokens
-                else:
-                    logger.warning(f"Skipping non-Content item in history for token counting: {type(first_message)}")
-                    message_tokens = 75 
-            except Exception as e_count:
-                logger.error(f"Could not count tokens for a message during /clear: {e_count}. Using estimate.", exc_info=True)
-                message_tokens = 75 
-
-            tokens_counted_for_removal += message_tokens
-            new_history.pop(0)
-            messages_removed_count += 1
-            history_modified_by_clear = True
-        
-        logger.info(f"After initial pass, {messages_removed_count} messages ({tokens_counted_for_removal} tokens) selected for removal.")
-
-        additional_messages_removed_for_role = 0
-        while new_history and new_history[0].role != "user":
-            logger.warning("History after initial clear pass starts with a model turn. Removing additional leading model messages.")
-            new_history.pop(0)
-            messages_removed_count += 1
-            additional_messages_removed_for_role += 1
-            history_modified_by_clear = True
-        if additional_messages_removed_for_role > 0:
-            logger.info(f"Removed {additional_messages_removed_for_role} additional model messages to ensure user turn start.")
-
-        if not history_modified_by_clear:
-             print(f"No messages were cleared. Requested {tokens_to_clear_target} tokens might be less than the first message(s), history is empty, or history is too short.")
-             return
-
-        agent.conversation_history = new_history
-
-        if not agent.conversation_history:
-            agent.current_token_count = 0
-            agent.prompt_time_counts = [0]
-            agent.messages_per_interval = [0]
+        if messages_removed > 0:
+            print(f"\n✅ Cleared {messages_removed} message(s) (approx. {tokens_cleared} tokens counted for removal).")
+            print(f"   New total LLM history tokens: {agent.llm_core.current_token_count if agent.llm_core.current_token_count != -1 else 'Error counting'}")
         else:
-            try:
-                agent.current_token_count = agent.client.models.count_tokens(
-                    model=agent.model_name,
-                    contents=agent.conversation_history
-                ).total_tokens
-            except Exception as e_recount:
-                logger.error(f"Error recounting tokens after /clear: {e_recount}. Token count may be inaccurate.", exc_info=True)
-                agent.current_token_count = -1 # Indicate error
-            agent.prompt_time_counts = [0, agent.current_token_count if agent.current_token_count != -1 else 0] 
-            agent.messages_per_interval = [0, len(agent.conversation_history)]
-        
-        agent._messages_this_interval = 0 
+            print("\nℹ️ No messages were cleared. History might be empty or target tokens too low.")
 
-        try:
-            agent.chat = agent.client.chats.create(model=agent.model_name, history=agent.conversation_history)
-            logger.info("Chat session re-initialized after /clear operation.")
-            print(f"\n✅ Cleared {messages_removed_count} message(s) (approx. {tokens_counted_for_removal} tokens counted). "
-                  f"New total tokens: {agent.current_token_count if agent.current_token_count != -1 else 'Error counting'}")
-        except Exception as e_chat_reinit:
-            logger.error(f"Error re-initializing chat after /clear: {e_chat_reinit}", exc_info=True)
-            print(f"\n⚠️ Error re-initializing chat session: {e_chat_reinit}. History updated, but chat object may be stale.")
+        # Reset CLI-specific history tracking stats on CodeAgent
+        agent.prompt_time_counts = [0, agent.llm_core.current_token_count if agent.llm_core.current_token_count != -1 else 0]
+        agent.messages_per_interval = [0, len(agent.llm_core.conversation_history)] # Assuming direct access for length, or add a getter
+        agent._messages_this_interval = 0
             
     except ValueError:
         print("\n⚠️ Invalid number format for tokens.")
@@ -418,7 +374,7 @@ def _display_full_history(agent: 'CodeAgent'):
     print("-" * 80)
     
     for i, msg in enumerate(agent.conversation_history, 1):
-        if not isinstance(msg, types.Content):
+        if not isinstance(msg, genai.types.Content): # Changed types to genai.types
             logger.warning(f"Skipping non-Content item in history: {type(msg)}")
             continue
             
@@ -470,7 +426,7 @@ def _display_token_limited_history(agent: 'CodeAgent', mode: str, num_tokens_tar
     messages_to_display = []
 
     for msg in history_to_scan:
-        if not isinstance(msg, types.Content):
+        if not isinstance(msg, genai.types.Content): # Changed types to genai.types
             logger.warning(f"Skipping non-Content item in history: {type(msg)}")
             continue
 
