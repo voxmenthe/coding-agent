@@ -1,10 +1,15 @@
 import os
 import logging
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any, Callable, TYPE_CHECKING
 import functools # Added for _make_verbose_tool
+import inspect # Added for checking async tools
+import asyncio # Added for async tool execution
 
 import google.generativeai as genai
+
+if TYPE_CHECKING:
+    from .async_task_manager import AsyncTaskManager # For type hinting
 # types will be accessed via genai.types
 
 # Assuming tools.py might be needed later, add a placeholder import
@@ -16,10 +21,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_THINKING_BUDGET_FALLBACK = 256
 
 class LLMAgentCore:
-    def __init__(self, config: dict, api_key: Optional[str], model_name: str):
+    def __init__(self, config: dict, api_key: Optional[str], model_name: str, task_manager: 'Optional[AsyncTaskManager]' = None):
         self.config = config
         self.api_key = api_key
-        self.model_name = model_name # Ensure this is passed and used
+        self.model_name = model_name
+        self.task_manager = task_manager # Store the task manager
 
         self.client: Optional[genai.client.Client] = None
         # Async client part is derived from the main client
@@ -123,45 +129,95 @@ class LLMAgentCore:
         self.conversation_history.append(new_user_content)
         logger.info(f"LLMAgentCore: Sending message to LLM. History length: {len(self.conversation_history)}")
 
-        # Prepare tool configuration for the send_message call
-        # Prepare tool configuration for the send_message call
-        # The ChatSession.send_message method takes tools and generation_config directly.
-
         try:
-            # Pass new_user_content directly as 'content'.
-            # Pass tool_functions directly to 'tools'.
-            # Pass self.generation_config (now an instance of GenerationConfig) to 'generation_config'.
+            # Initial message to the LLM
             response = self.chat.send_message(
                 content=new_user_content,
                 tools=self.tool_functions,
                 generation_config=self.generation_config
             )
 
+            # Check for function call
+            candidate = response.candidates[0]
+            if candidate.content and candidate.content.parts and candidate.content.parts[0].function_call:
+                # Model wants to call a tool
+                logger.info("LLMAgentCore: Function call requested by LLM.")
+                # Append the model's response (which includes the function call) to history
+                self.conversation_history.append(candidate.content)
+
+                function_call_part = candidate.content.parts[0]
+                tool_func_name = function_call_part.function_call.name
+                args_dict = {key: value for key, value in function_call_part.function_call.args.items()}
+
+                tool_func = next((f for f in self.tool_functions if f.__name__ == tool_func_name), None)
+
+                tool_output = None
+                tool_had_error = False
+                if tool_func:
+                    logger.info(f"LLMAgentCore: Executing tool: {tool_func_name} with args: {args_dict}")
+                    try:
+                        if inspect.iscoroutinefunction(tool_func):
+                            if self.task_manager and self.task_manager.loop.is_running():
+                                future = asyncio.run_coroutine_threadsafe(tool_func(**args_dict), self.task_manager.loop)
+                                tool_output = future.result()  # Blocking call to get async result
+                                logger.info(f"LLMAgentCore: Async tool {tool_func_name} executed. Output (first 100 chars): {str(tool_output)[:100]}")
+                            else:
+                                tool_output = "Error: AsyncTaskManager not available or loop not running for async tool."
+                                tool_had_error = True
+                                logger.error(f"LLMAgentCore: AsyncTaskManager not available/running for async tool: {tool_func_name}")
+                        else: # Synchronous tool
+                            tool_output = tool_func(**args_dict)
+                            logger.info(f"LLMAgentCore: Sync tool {tool_func_name} executed. Output (first 100 chars): {str(tool_output)[:100]}")
+                    except Exception as e:
+                        tool_output = f"Error executing tool {tool_func_name}: {str(e)}"
+                        tool_had_error = True
+                        logger.error(f"LLMAgentCore: Error executing tool {tool_func_name}: {e}", exc_info=True)
+                else:
+                    tool_output = f"Error: Tool '{tool_func_name}' not found."
+                    tool_had_error = True
+                    logger.error(f"LLMAgentCore: Tool '{tool_func_name}' requested by LLM not found.")
+
+                # Construct the function response part
+                function_response_content = genai.types.Content(
+                    parts=[genai.types.Part(
+                        function_response=genai.types.FunctionResponse(
+                            name=tool_func_name,
+                            response={'output': tool_output, 'error': tool_had_error}
+                        )
+                    )],
+                    role="tool" # Using "tool" role for function/tool responses
+                )
+                self.conversation_history.append(function_response_content) # Add tool response to history
+
+                # Send the tool's response back to the model
+                logger.info(f"LLMAgentCore: Sending tool response for {tool_func_name} back to LLM.")
+                response = self.chat.send_message(
+                    content=function_response_content,
+                    # No tools needed when sending back a tool response usually
+                )
+                # This 'response' is now the model's textual reply AFTER considering the tool output.
+
+            # Extract final text response
             agent_response_text = ""
-            # Process response: extract text, handle tool calls if any
             if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                # Ensure we only join text parts for the final response
                 text_parts = [p.text for p in response.candidates[0].content.parts if hasattr(p, "text") and p.text]
                 agent_response_text = " ".join(text_parts).strip()
 
-                # Check for function calls if no direct text
-                if not agent_response_text:
-                    if any(hasattr(p, "function_call") for p in response.candidates[0].content.parts):
-                        # If there was a function call, the text might be empty or just confirmation.
-                        # The actual tool execution and result handling happens outside LLMAgentCore,
-                        # driven by the main application loop which checks for FunctionCall parts.
-                        agent_response_text = "[Tool call requested by LLM]"
-                        logger.info("LLMAgentCore: LLM requested a tool call.")
-                    else:
-                        agent_response_text = "[No textual response from LLM]"
-            elif not agent_response_text: # Fallback if structure is unexpected
-                agent_response_text = "[Empty or malformed response from LLM]"
+            if not agent_response_text: # If after tool call, response is empty (e.g. only another tool call)
+                 if any(hasattr(p, "function_call") for p in response.candidates[0].content.parts):
+                     agent_response_text = "[Tool call requested by LLM after previous tool execution]"
+                     logger.info("LLMAgentCore: LLM requested another tool call.")
+                 else:
+                    agent_response_text = "[No textual response from LLM after processing tool output or message]"
 
-            # Append agent's response to our managed history
-            # Even if it's a tool call message, we record it.
-            hist_agent_content = genai.types.Content(role="model", parts=[genai.types.Part(text=agent_response_text)]) # Changed from genai_types
-            self.conversation_history.append(hist_agent_content)
 
-            # Calculate token count based on the updated self.conversation_history
+            # Append final model's response to our managed history
+            # This should be the text response or a message indicating another tool call
+            final_model_content = genai.types.Content(role="model", parts=[genai.types.Part(text=agent_response_text)])
+            self.conversation_history.append(final_model_content)
+
+            # Calculate token count based on the updated (complete turn) self.conversation_history
             if self.client:
                 try:
                     # Ensure history for token counting contains only compatible parts (text/file data)

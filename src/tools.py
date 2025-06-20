@@ -591,7 +591,7 @@ def upload_pdf_for_gemini(pdf_path_str: str) -> genai.types.File | None:
                  print(f"⚠️ Could not delete file during error cleanup: {delete_e}")
         return None
 
-def google_search(query: str, num_results: int = 10) -> str:
+async def google_search(query: str, num_results: int = 10) -> str:
     """Search Google for the given query using browser-use and return JSON-formatted results.
     Args:
         query: The search query.
@@ -604,31 +604,31 @@ def google_search(query: str, num_results: int = 10) -> str:
             model=MODEL_NAME,
             api_key=SecretStr(os.getenv("GEMINI_API_KEY"))
         )
-        browser, context = asyncio.run(setup_browser(headless=True))
-        result = asyncio.run(agent_loop(
+        browser, context = await setup_browser(headless=True)
+        result = await agent_loop(
             llm,
             context,
             f"Search Google for '{query}' and extract the first {num_results} results as JSON list of {{'title','url'}}.",
             initial_url=f"https://www.google.com/search?q={query}"
-        ))
+        )
         return result or "No results."
     except Exception as e:
         return f"Error during google_search: {e}"
 
-def open_url(url: str) -> str: # Uncommented
+async def open_url(url: str) -> str: # Changed to async def
     """Open a URL using browser-use and return the page's visible text content."""
     try:
         llm = ChatGoogleGenerativeAI(
             model=MODEL_NAME,
             api_key=SecretStr(os.getenv("GEMINI_API_KEY"))
         )
-        browser, context = asyncio.run(setup_browser(headless=True))
-        result = asyncio.run(agent_loop(
+        browser, context = await setup_browser(headless=True) # Changed to await
+        result = await agent_loop( # Changed to await
             llm,
             context,
             f"Extract and return visible text content from the page at: {url}.",
             initial_url=url
-        ))
+        )
         return result or "No content."
     except Exception as e:
         return f"Error during open_url: {e}"

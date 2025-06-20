@@ -281,19 +281,20 @@ class CodeAgent:
         self.config = config
         self.api_key = config.get('gemini_api_key')
         # LLMAgentCore now manages its own model_name, client, chat, thinking_budget, etc.
+
+        # Initialize AsyncTaskManager first, as it's needed by LLMAgentCore
+        self.task_manager = AsyncTaskManager(main_app_handler=self)
         
         self.llm_core = LLMAgentCore(
             config=config,
             api_key=self.api_key,
-            model_name=MODEL_NAME # Pass MODEL_NAME loaded from top of main.py
+            model_name=MODEL_NAME,
+            task_manager=self.task_manager # Pass the initialized task manager
         )
 
         self.pdf_processing_method = config.get('pdf_processing_method', 'Gemini')
         self.db_path_str = str(config.get('PAPER_DB_PATH')) if config.get('PAPER_DB_PATH') else None
         self.prefill_prompt_content: Optional[str] = None
-
-        # Initialize AsyncTaskManager, it handles its own loop and thread
-        self.task_manager = AsyncTaskManager(main_app_handler=self)
 
         # Async client for PDF processing is now accessed via self.llm_core.async_client
 
